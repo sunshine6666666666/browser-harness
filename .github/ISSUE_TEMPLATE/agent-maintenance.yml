@@ -1,0 +1,76 @@
+name: Agent maintenance report
+description: Report a verified problem, upstream change, or local enhancement for maintainer triage.
+title: "[agent] "
+labels: [agent-report, needs-triage]
+body:
+  - type: input
+    id: agent
+    attributes:
+      label: Agent / profile
+      description: Identify the agent and Hermes profile that observed this.
+      placeholder: devkeeper / devkeeper
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Request type
+      options:
+        - Reproducible bug
+        - Upstream update review
+        - Local workflow patch
+        - Domain skill improvement
+        - Upstream contribution candidate
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Observed evidence
+      description: Actual output, screenshots, affected URL, and exact version. Redact secrets and private browser data.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Minimal numbered steps. State whether this is read-only.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Affected layer and user impact
+      placeholder: core / helper / domain skill / Agent Chrome / documentation
+    validations:
+      required: true
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Side-effect risk
+      options:
+        - Read-only / none
+        - Local reversible change
+        - Browser or login-state change
+        - External write / publish / auth / destructive action
+        - Unknown
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Proposed acceptance test
+      description: What result proves the Issue is fixed without widening scope?
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I searched for duplicates.
+          required: true
+        - label: I included real evidence rather than an assumption.
+          required: true
+        - label: I did not include tokens, cookies, auth files, or private browser data.
+          required: true
