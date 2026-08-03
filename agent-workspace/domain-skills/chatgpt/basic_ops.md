@@ -20,6 +20,10 @@ send_message("hello")
 PY
 ```
 
+`basic_ops.py` is a library when loaded with `exec(...)`; it does not
+auto-open a tab. Call the desired helper explicitly. This prevents a smoke
+script from opening an extra ChatGPT home tab before its own setup.
+
 Smoke runner (pipe-delimited actions):
 
 ```bash
@@ -49,6 +53,7 @@ PY
 | `toggle_user_message_expand(i=0)` | Expand/collapse long user prompt (`collapsible-user-message-toggle`) |
 | `expand_all_user_messages()` | Expand every collapsed long prompt; returns count |
 | `send_and_wait(text, timeout=180)` | Send message and poll until reply finishes; returns last assistant text |
+| `switch_header_tab('聊天'\|'工作')` | Toggle the top header 聊天/工作 (chat/workspace) radio tabs. Named to avoid shadowing the harness's built-in `switch_tab` (browser tab switcher) |
 
 ## UI facts / selectors (Chinese UI)
 
@@ -90,8 +95,9 @@ PY
 
 - Opening the picker twice in a row can fail (closing-animation overlay
   swallows the click). `open_model_picker` retries with Escape to clear.
-- `_composer_state` must only look inside the composer zone (y > 80% of
-  viewport): a bare `GPT-5\.|5\.\d` regex matches price text like
+- `_composer_state` prefers the visible model pill inside
+  `form[data-type="unified-composer"]`; only the legacy fallback uses the
+  lower viewport zone. A bare `GPT-5\.|5\.\d` regex matches price text like
   `US$25.99` inside messages.
 - Effort/model radios also appear in the capability slider with the same
   text (e.g. `中`, `高`, `极高`); always pick the rightmost submenu radio.

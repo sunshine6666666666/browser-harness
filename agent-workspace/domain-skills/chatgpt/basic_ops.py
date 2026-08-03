@@ -56,7 +56,11 @@ def _composer_state() -> str:
         const t = norm(b.innerText || b.textContent);
         if (!b.offsetParent) return false;
         const r = b.getBoundingClientRect();
-        if (r.width < 20 || r.y < innerHeight * 0.8) return false; // composer zone only
+        if (r.width < 20) return false;
+        const inComposer = !!b.closest('form[data-type="unified-composer"]');
+        const isPicker = b.matches('[aria-haspopup="menu"]') || b.classList.contains('__composer-pill');
+        if (inComposer && isPicker) return true;
+        if (r.y < innerHeight * 0.8) return false; // legacy fallback outside composer form
         return /^5\.\d\s+\S+/.test(t) || /^GPT-5\./.test(t) ||
                ['极速', '轻度', '中', '高', '极高', '最高', '超高', 'Pro'].includes(t);
       });
@@ -70,7 +74,10 @@ def _find_composer_picker() -> dict[str, Any]:
     r = js(r"""
     (() => {
       const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-      const btns = [...document.querySelectorAll('button')].filter(b => {
+      const scoped = [...document.querySelectorAll('form[data-type="unified-composer"] button')].filter(b =>
+        b.offsetParent && (b.matches('[aria-haspopup="menu"]') || b.classList.contains('__composer-pill'))
+      );
+      const btns = scoped.length ? scoped : [...document.querySelectorAll('button')].filter(b => {
         const t = norm(b.innerText || b.textContent);
         if (!b.offsetParent) return false;
         const r = b.getBoundingClientRect();
@@ -781,6 +788,45 @@ def send_and_wait(text: str, timeout: int = 180) -> str:
     raise RuntimeError(f"send_and_wait: reply not finished within {timeout}s")
 
 
+def switch_header_tab(tab: str) -> str:
+    """Switch the top header tab between 聊天 (chat) and 工作 (workspace).
+
+    Accepts '聊天'/'chat' or '工作'/'work' (case-insensitive). The header
+    renders two `role="radio"` buttons; selection is tracked by aria-checked.
+    Returns the now-selected tab label.
+
+    NOTE: named switch_header_tab on purpose — browser-harness already exports
+    a `switch_tab` helper for switching browser tabs; this would shadow it.
+    """
+    target = '聊天' if tab.strip().lower() in ('聊天', 'chat') else '工作'
+    r = js(r"""
+    (() => {
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+      const radios = [...document.querySelectorAll('[role="radio"]')].filter(r =>
+        norm(r.innerText || r.textContent) === %r);
+      const el = radios.find(r => r.offsetParent);
+      if (!el) return {found: false};
+      if (el.getAttribute('aria-checked') === 'true') return {found: true, already: true};
+      el.click();
+      return {found: true, already: false};
+    })()
+    """ % target)
+    if not r or not r.get("found"):
+        raise RuntimeError(f"switch_tab: {target!r} radio button not found")
+    wait(1.5)
+    check = js(r"""
+    (() => {
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+      const el = [...document.querySelectorAll('[role="radio"]')].find(r =>
+        norm(r.innerText || r.textContent) === %r);
+      return el ? el.getAttribute('aria-checked') : null;
+    })()
+    """ % target)
+    if check != "true":
+        raise RuntimeError(f"switch_tab: {target!r} not selected after click (aria-checked={check})")
+    return target
+
+
 def run(script: str | None = None) -> None:
     """CLI entry for smoke tests. Pass a pipe-delimited action string, e.g.:
 
@@ -814,5 +860,6 @@ def run(script: str | None = None) -> None:
             raise RuntimeError(f"run: unknown action {name}")
 
 
-if __name__ == "__main__":
-    run()
+# This file is a library when loaded with exec(...) inside browser-harness.
+# Call run() explicitly for the pipe-delimited smoke runner; do not auto-open
+# ChatGPT merely because an agent loaded the domain skill.
