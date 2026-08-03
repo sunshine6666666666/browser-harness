@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Question or how-to
-    url: https://github.com/browser-use/browser-harness/discussions/categories/q-a
-    about: Ask in Discussions Q&A, not Issues.
-  - name: Install or setup troubleshooting
-    url: https://github.com/browser-use/browser-harness/blob/main/install.md
-    about: Most install and "DevTools not live" errors are covered here.
+  - name: Maintained fork policy
+    url: https://github.com/sunshine6666666666/browser-harness/blob/main/docs/maintained-fork.md
+    about: Read the upstream-sync, patch, Issue, PR, and approval rules.
+  - name: Official upstream issue tracker
+    url: https://github.com/browser-use/browser-harness/issues
+    about: Use upstream for confirmed general Browser Harness problems after local triage.

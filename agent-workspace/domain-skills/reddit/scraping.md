@@ -14,11 +14,12 @@ Use the browser when you're logged in (private subreddits, NSFW gates, rate-limi
 ## Path 1: JSON API (fastest for public posts)
 
 ```python
-from helpers import http_get
-import json
+import json, urllib.request
 
 url = "https://www.reddit.com/r/cursor/comments/1l0u9y7/claude_code_prompt_to_autogenerate_full_cursor/.json"
-data = json.loads(http_get(url, headers={"User-Agent": "Mozilla/5.0"}))
+req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+with urllib.request.urlopen(req, timeout=25) as resp:
+    data = json.loads(resp.read().decode("utf-8"))
 post = data[0]["data"]["children"][0]["data"]
 # post fields: title, selftext, author, score, num_comments, created_utc, url, permalink
 comments = data[1]["data"]["children"]  # list of { kind: "t1", data: {...} } or { kind: "more" }

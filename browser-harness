@@ -2,7 +2,6 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-DEV_ID="$(printf '%s' "$ROOT" | cksum | awk '{print $1}')"
 NAME="${BU_NAME:-default}"
 
 case "$NAME" in
@@ -13,9 +12,11 @@ case "$NAME" in
 esac
 
 export BH_HOME="${BH_HOME:-$ROOT/.browser-harness-dev}"
+export BH_AGENT_WORKSPACE="${BH_AGENT_WORKSPACE:-$ROOT/agent-workspace}"
+export BH_DOMAIN_SKILLS="${BH_DOMAIN_SKILLS:-1}"
 if [ -z "${BH_RUNTIME_DIR:-}" ]; then
-  export BH_RUNTIME_DIR="/tmp/bh-dev-$DEV_ID/runtime"
-  export BH_RUNTIME_DIR_SHARED="${BH_RUNTIME_DIR_SHARED:-1}"
+  export BH_RUNTIME_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/browser-harness/runtime"
+  export BH_RUNTIME_DIR_SHARED=1
 fi
 if [ -z "${BH_TMP_DIR:-}" ]; then
   export BH_TMP_DIR="$BH_HOME/tmp"
