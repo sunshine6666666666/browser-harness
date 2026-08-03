@@ -11,9 +11,9 @@ Direct browser control via CDP. For task-specific edits, use `agent-workspace/ag
 
 A basic fetch of public information needs no browser. If a plain HTTP request can read it — a public page, an API, docs — use `curl` or your fetch tool, and leave the browser alone. Use browser-harness when the task needs interaction (click, type, navigate), the user's logged-in session, JS rendering, or a bot-protected page. If a direct fetch fails or returns a shell page, then escalate to the browser.
 
-Domain skills are off by default. Set `BH_DOMAIN_SKILLS=1` to enable them; see the bottom section.
+Domain skills are enabled in Ye Lin's managed shared workspace. Both the global CLI and this repository launcher resolve the canonical `agent-workspace/domain-skills/` tree.
 
-**If `BH_DOMAIN_SKILLS=1` and the task is site-specific, read every file in the matching `$BH_AGENT_WORKSPACE/domain-skills/<site>/` directory before inventing an approach.**
+**After `new_tab(url)` or `goto_url(url)`, print/inspect `page_info()`. If it returns `domain_skill_files`, read every listed Markdown file before site-specific actions and reuse its scripts/helpers. `registry.json` maps hostnames to skill directories, including aliases and multi-site skills.**
 
 ## Usage
 
@@ -168,6 +168,4 @@ If you get stuck on a browser mechanic, check https://github.com/browser-use/bro
 
 ## Domain Skills
 
-Only applies when `BH_DOMAIN_SKILLS=1`. Otherwise ignore domain skills.
-
-When enabled, search `$BH_AGENT_WORKSPACE/domain-skills/<host>/` before inventing an approach. `goto_url(...)` returns up to 10 skill filenames for the navigated host.
+Domain skills are enabled in Ye Lin's managed workspace. `domain-skills/registry.json` maps exact/wildcard hosts to one or more skill directories. Both `goto_url(...)` and `page_info()` return `domain_skill_files`, `domain_skill_directories`, and a read-before-action instruction when a match exists; no-skill sites return no discovery fields. Run `python3 scripts/verify_domain_skills.py` after every domain-skill or wiring change.

@@ -50,7 +50,45 @@ def test_goto_url_includes_domain_skills_when_enabled(tmp_path, monkeypatch):
     _seed_skill(tmp_path)
     with patch("browser_harness.helpers.cdp", return_value={"frameId": "f"}):
         result = helpers.goto_url("https://www.example.com/")
-    assert result == {"frameId": "f", "domain_skills": ["scraping.md"]}
+    assert result["frameId"] == "f"
+    assert result["domain_skills"] == ["scraping.md"]
+    assert result["domain_skill_files"] == [str((tmp_path / "domain-skills" / "example" / "scraping.md").resolve())]
+    assert "Read every" in result["domain_skill_instruction"]
+
+
+def test_registry_resolves_alias_and_multiple_skills(tmp_path, monkeypatch):
+    monkeypatch.setenv("BH_DOMAIN_SKILLS", "1")
+    monkeypatch.setattr(helpers, "AGENT_WORKSPACE", tmp_path)
+    root = tmp_path / "domain-skills"
+    for name in ("primary", "secondary"):
+        site = root / name
+        site.mkdir(parents=True)
+        (site / f"{name}.md").write_text(name)
+    (root / "registry.json").write_text(
+        '{"version":1,"skills":{"primary":["*.example.org"],"secondary":["docs.example.org"]}}'
+    )
+    result = helpers._domain_skill_context("https://docs.example.org/path")
+    assert result["domain_skills"] == ["primary.md", "secondary.md"]
+    assert len(result["domain_skill_directories"]) == 2
+
+
+def test_page_info_includes_domain_skills_after_new_tab_flow(tmp_path, monkeypatch):
+    monkeypatch.setenv("BH_DOMAIN_SKILLS", "1")
+    monkeypatch.setattr(helpers, "AGENT_WORKSPACE", tmp_path)
+    _seed_skill(tmp_path)
+    raw = '{"url":"https://example.com/","title":"Example","w":100,"h":100,"sx":0,"sy":0,"pw":100,"ph":100}'
+    with patch("browser_harness.helpers._send", return_value={}), \
+         patch("browser_harness.helpers._runtime_evaluate", return_value=raw):
+        result = helpers.page_info()
+    assert result["title"] == "Example"
+    assert result["domain_skills"] == ["scraping.md"]
+
+
+def test_unregistered_site_has_no_false_match(tmp_path, monkeypatch):
+    monkeypatch.setenv("BH_DOMAIN_SKILLS", "1")
+    monkeypatch.setattr(helpers, "AGENT_WORKSPACE", tmp_path)
+    _seed_skill(tmp_path)
+    assert helpers._domain_skill_context("https://unrelated.invalid/") == {}
 
 
 def test_page_info_raises_clear_error_on_js_exception():

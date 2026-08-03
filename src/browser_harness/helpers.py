@@ -127,15 +127,63 @@ def _is_illegal_return_error(exc):
 
 
 # --- navigation / page ---
+def _host_matches(host, pattern):
+    pattern = pattern.lower().removeprefix("www.")
+    if pattern.startswith("*."):
+        base = pattern[2:]
+        return host == base or host.endswith("." + base)
+    return host == pattern
+
+
+def _domain_skill_dirs(url):
+    """Resolve all registered domain-skill directories for a URL."""
+    host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    root = AGENT_WORKSPACE / "domain-skills"
+    if not host or not root.is_dir():
+        return []
+
+    resolved = []
+    registry_path = root / "registry.json"
+    if registry_path.is_file():
+        try:
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"invalid domain-skill registry: {registry_path}: {exc}") from exc
+        for skill_dir, patterns in registry.get("skills", {}).items():
+            if any(_host_matches(host, pattern) for pattern in patterns):
+                path = root / skill_dir
+                if path.is_dir():
+                    resolved.append(path)
+
+    # Backwards-compatible fallback for unregistered upstream skills.
+    fallback = root / host.split(".")[0]
+    if fallback.is_dir() and fallback not in resolved:
+        resolved.append(fallback)
+    return resolved
+
+
+def _domain_skill_context(url):
+    if os.environ.get("BH_DOMAIN_SKILLS") != "1":
+        return {}
+    dirs = _domain_skill_dirs(url)
+    files = sorted({p.resolve() for d in dirs for p in d.rglob("*.md")})
+    if not files:
+        return {}
+    return {
+        "domain_skills": [p.name for p in files],
+        "domain_skill_files": [str(p) for p in files],
+        "domain_skill_directories": [str(d.resolve()) for d in dirs],
+        "domain_skill_instruction": "Read every domain_skill_files document before site-specific actions; reuse its scripts/helpers instead of rediscovering the UI.",
+    }
+
+
 def goto_url(url):
     r = cdp("Page.navigate", url=url)
-    if os.environ.get("BH_DOMAIN_SKILLS") != "1":
-        return r
-    d = (AGENT_WORKSPACE / "domain-skills" / (urlparse(url).hostname or "").removeprefix("www.").split(".")[0])
-    return {**r, "domain_skills": sorted(p.name for p in d.rglob("*.md"))[:10]} if d.is_dir() else r
+    return {**r, **_domain_skill_context(url)}
+
 
 def page_info():
-    """{url, title, w, h, sx, sy, pw, ph} — viewport + scroll + page size.
+    """Viewport/page state, plus registered domain skills for the current URL.
 
     If a native dialog (alert/confirm/prompt/beforeunload) is open, returns
     {dialog: {type, message, ...}} instead — the page's JS thread is frozen
@@ -144,7 +192,11 @@ def page_info():
     if dialog:
         return {"dialog": dialog}
     expression = "JSON.stringify({url:location.href,title:document.title,w:innerWidth,h:innerHeight,sx:scrollX,sy:scrollY,pw:document.documentElement.scrollWidth,ph:document.documentElement.scrollHeight})"
-    return json.loads(_runtime_evaluate(expression))
+    raw = _runtime_evaluate(expression)
+    if not isinstance(raw, str):
+        raise RuntimeError(f"page_info expected JSON text, got {type(raw).__name__}")
+    info = json.loads(raw)
+    return {**info, **_domain_skill_context(info.get("url", ""))}
 
 # --- input ---
 _debug_click_counter = 0
