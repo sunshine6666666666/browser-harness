@@ -40,6 +40,27 @@ def _norm(s: str | None) -> str:
     return " ".join((s or "").replace("\xa0", " ").split())
 
 
+def _sent_message_match(expected: str, rendered: str) -> str | None:
+    """Classify full or safely collapsed evidence for the newly added user turn."""
+    rendered = _norm(rendered)
+    if expected and expected in rendered:
+        return "full"
+    if len(expected) > 240 and rendered.startswith(expected[:160]):
+        return "collapsed_prefix"
+    return None
+
+
+def _is_canonical_conversation_url(url: str) -> bool:
+    """Reject transient ChatGPT routes such as `/c/WEB:<temporary-id>`."""
+    parsed = urlparse(url or "")
+    return bool(
+        parsed.scheme == "https" and
+        parsed.hostname == "chatgpt.com" and
+        re.fullmatch(r"/c/[A-Za-z0-9-]{8,}", parsed.path) and
+        not parsed.query and not parsed.fragment
+    )
+
+
 def _click_element_center(js_find: str, expect: str = "element") -> dict[str, Any]:
     """Run a JS snippet that returns {found, x, y} (center of target)."""
     r = js(js_find)
@@ -532,7 +553,11 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
       const form = document.querySelector('form[data-type="unified-composer"]');
       const editor = form && (form.querySelector('[contenteditable="true"]') ||
                               form.querySelector('textarea, [role="textbox"]'));
-      const existing_user_messages = document.querySelectorAll('[data-message-author-role="user"]').length;
+      const users = [...document.querySelectorAll('[data-message-author-role="user"]')];
+      const existing_user_messages = users.length;
+      const last_user = users.length ? users[users.length - 1] : null;
+      const last_turn_testid = last_user?.closest('[data-testid^="conversation-turn-"]')?.getAttribute('data-testid') || '';
+      const last_turn_match = last_turn_testid.match(/conversation-turn-(\d+)/);
       if (!form || !editor || !editor.offsetParent) return {found: false};
       const r = editor.getBoundingClientRect();
       if (r.width <= 0 || r.height <= 0 || r.x < 0 || r.y < 0 ||
@@ -543,7 +568,10 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
         found: true,
         empty: content === '',
         url: location.href,
-        user_count: existing_user_messages
+        user_count: existing_user_messages,
+        user_message_ids: users.map(el => el.getAttribute('data-message-id')).filter(Boolean),
+        last_user_message_id: last_user?.getAttribute('data-message-id') || null,
+        last_user_turn: last_turn_match ? Number(last_turn_match[1]) : -1
       };
     })()
     """)
@@ -616,35 +644,55 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
 
     deadline = time.time() + evidence_timeout
     latest: dict[str, Any] = {}
+    evidence_read_failed = False
     while time.time() < deadline:
         wait(0.5)
-        latest = js(r"""
-        (() => {
-          const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-          const form = document.querySelector('form[data-type="unified-composer"]');
-          const editor = form && (form.querySelector('[contenteditable="true"]') ||
-                                  form.querySelector('textarea, [role="textbox"]'));
-          const users = [...document.querySelectorAll('[data-message-author-role="user"]')];
-          const last_user_message = users.length ? norm(users[users.length - 1].innerText || users[users.length - 1].textContent) : '';
-          return {
-            url: location.href,
-            composer_empty: !!editor && norm(editor.innerText || editor.value) === '',
-            user_count: users.length,
-            last_user_message: last_user_message
-          };
-        })()
-        """) or {}
-        found = expected in _norm(latest.get("last_user_message"))
-        if ("/c/" in latest.get("url", "") and
-                latest.get("user_count", 0) > before.get("user_count", 0) and found):
+        try:
+            latest = js(r"""
+            (() => {
+              const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+              const form = document.querySelector('form[data-type="unified-composer"]');
+              const editor = form && (form.querySelector('[contenteditable="true"]') ||
+                                      form.querySelector('textarea, [role="textbox"]'));
+              const users = [...document.querySelectorAll('[data-message-author-role="user"]')];
+              const last_user = users.length ? users[users.length - 1] : null;
+              const last_user_message = last_user ? norm(last_user.innerText || last_user.textContent) : '';
+              const last_turn_testid = last_user?.closest('[data-testid^="conversation-turn-"]')?.getAttribute('data-testid') || '';
+              const last_turn_match = last_turn_testid.match(/conversation-turn-(\d+)/);
+              return {
+                url: location.href,
+                composer_empty: !!editor && norm(editor.innerText || editor.value) === '',
+                user_count: users.length,
+                last_user_message_id: last_user?.getAttribute('data-message-id') || null,
+                last_user_turn: last_turn_match ? Number(last_turn_match[1]) : -1,
+                last_user_message: last_user_message
+              };
+            })()
+            """) or {}
+        except Exception:
+            evidence_read_failed = True
+            continue
+        message_match = _sent_message_match(expected, latest.get("last_user_message", ""))
+        before_ids = set(before.get("user_message_ids") or [])
+        message_id = latest.get("last_user_message_id")
+        new_turn = (
+            message_id and message_id not in before_ids and
+            latest.get("last_user_turn", -1) > before.get("last_user_turn", -1)
+        )
+        if (_is_canonical_conversation_url(latest.get("url", "")) and
+                latest.get("composer_empty") and new_turn and message_match):
             return {
                 "status": "definitely_sent",
                 "url": latest.get("url"),
                 "composer_empty": bool(latest.get("composer_empty")),
                 "expected_user_message_found": True,
+                "message_match": message_match,
+                "message_id": message_id,
+                "message_turn": latest.get("last_user_turn"),
             }
     return {
         "status": "unknown",
+        "reason": "post_send_evidence_unavailable" if evidence_read_failed else "post_send_evidence_inconclusive",
         "url": latest.get("url", before.get("url")),
         "composer_empty": bool(latest.get("composer_empty")),
         "expected_user_message_found": False,
@@ -869,6 +917,69 @@ def conversation_text(limit: int = 4000) -> str:
       return parts.slice(-20).join('\n').slice(-%d);
     })()
     """ % (limit, limit))
+
+
+def _conversation_scroll_state() -> dict[str, Any]:
+    """Focus the main virtualized conversation scroller and return live evidence."""
+    return js(r"""
+    (() => {
+      const els = [...document.querySelectorAll('div')].filter(el =>
+        el.scrollHeight > el.clientHeight + 50 &&
+        ['auto', 'scroll'].includes(getComputedStyle(el).overflowY));
+      if (!els.length) return {found: false};
+      els.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+      const el = els[0];
+      if (!el.hasAttribute('tabindex')) el.setAttribute('tabindex', '-1');
+      el.focus({preventScroll: true});
+      return {
+        found: true,
+        scroll_top: el.scrollTop,
+        scroll_height: el.scrollHeight,
+        client_height: el.clientHeight,
+        message_count: document.querySelectorAll('[data-message-author-role]').length
+      };
+    })()
+    """) or {"found": False}
+
+
+def page_conversation(direction: str = "down", steps: int = 1, wait_s: float = 0.8) -> dict[str, Any]:
+    """Page a virtualized long chat with real PageUp/PageDown key events."""
+    direction = direction.lower().strip()
+    if direction not in {"up", "down"}:
+        raise ValueError("page_conversation: direction must be 'up' or 'down'")
+    if steps < 1:
+        raise ValueError("page_conversation: steps must be at least 1")
+    before = _conversation_scroll_state()
+    if not before.get("found"):
+        raise RuntimeError("page_conversation: no scrollable main container")
+    key = "PageDown" if direction == "down" else "PageUp"
+    for _ in range(steps):
+        press_key(key)
+        wait(wait_s)
+    after = _conversation_scroll_state()
+    if not after.get("found"):
+        raise RuntimeError("page_conversation: conversation scroller disappeared")
+    after["moved"] = after.get("scroll_top") != before.get("scroll_top")
+    return after
+
+
+def read_markdown_block_summary(index: int = -1) -> str:
+    """Return the full text of a ChatGPT writing/Markdown editor block."""
+    blocks = js(r"""
+    (() => [...document.querySelectorAll(
+      '[data-writing-block-fullscreen-editor], .writing-block-editor, .mt4SwW_editor'
+    )].filter((el, i, all) => !all.some((other, j) => j !== i && other.contains(el)))
+      .map(el => {
+        const text = (el.innerText || el.textContent || '').trim();
+        return {text: text, chars: text.length};
+      }).filter(item => item.chars > 0))()
+    """) or []
+    if not blocks:
+        raise RuntimeError("read_markdown_block_summary: no Markdown editor block found")
+    try:
+        return blocks[index]["text"]
+    except IndexError as exc:
+        raise RuntimeError(f"read_markdown_block_summary: block index {index} is out of range") from exc
 
 
 def _conversation_id(conversation: str) -> str:

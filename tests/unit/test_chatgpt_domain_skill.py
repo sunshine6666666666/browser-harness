@@ -233,6 +233,8 @@ def test_send_message_returns_definite_live_evidence_from_unified_composer():
                 "empty": True,
                 "url": "https://chatgpt.com/",
                 "user_count": 0,
+                "user_message_ids": [],
+                "last_user_turn": -1,
             }
         if "activate_send_button" in script:
             assert "pointerdown" in script
@@ -244,6 +246,8 @@ def test_send_message_returns_definite_live_evidence_from_unified_composer():
                 "url": "https://chatgpt.com/c/test-chat",
                 "composer_empty": True,
                 "user_count": 1,
+                "last_user_message_id": "new-short-message",
+                "last_user_turn": 1,
                 "last_user_message": "hello from regression test",
             }
         raise AssertionError(f"unexpected JS: {script[:120]}")
@@ -257,6 +261,157 @@ def test_send_message_returns_definite_live_evidence_from_unified_composer():
     assert evidence["url"] == "https://chatgpt.com/c/test-chat"
     assert evidence["expected_user_message_found"] is True
     assert all("form[data-type=\"unified-composer\"]" in script for script in calls[:2])
+
+
+def test_send_message_accepts_a_collapsed_long_message_prefix_as_evidence():
+    marker = "MAINTENANCE-LONG-SEND-2026-08-04"
+    message = marker + " " + ("validated role artifact " * 300)
+    rendered_prefix = " ".join(message.split())[:180] + " 展开"
+
+    def fake_js(script):
+        if "existing_user_messages" in script:
+            return {
+                "found": True,
+                "empty": True,
+                "url": "https://chatgpt.com/",
+                "user_count": 0,
+                "user_message_ids": [],
+                "last_user_turn": -1,
+            }
+        if "activate_send_button" in script:
+            return {"found": True, "clicked": True}
+        if "send_button" in script:
+            return {"found": True}
+        if "last_user_message" in script:
+            return {
+                "url": "https://chatgpt.com/c/long-send-test",
+                "composer_empty": True,
+                "user_count": 1,
+                "last_user_message_id": "new-long-message",
+                "last_user_turn": 1,
+                "last_user_message": rendered_prefix,
+            }
+        raise AssertionError(f"unexpected JS: {script[:120]}")
+
+    ops = load_ops(fake_js)
+    evidence = ops["send_message"](message)
+
+    assert evidence["status"] == "definitely_sent"
+    assert evidence["expected_user_message_found"] is True
+    assert evidence["message_match"] == "collapsed_prefix"
+
+
+def test_send_message_waits_for_a_canonical_conversation_url():
+    post_send_states = iter([
+        {
+            "url": "https://chatgpt.com/c/WEB:temporary-id",
+            "composer_empty": True,
+            "user_count": 1,
+            "last_user_message_id": "canonical-message",
+            "last_user_turn": 1,
+            "last_user_message": "canonical url regression",
+        },
+        {
+            "url": "https://chatgpt.com/c/6a71b7a7-3c8c-83ea-a7b2-a8b07df96fd6",
+            "composer_empty": True,
+            "user_count": 1,
+            "last_user_message_id": "canonical-message",
+            "last_user_turn": 1,
+            "last_user_message": "canonical url regression",
+        },
+    ])
+
+    def fake_js(script):
+        if "existing_user_messages" in script:
+            return {
+                "found": True,
+                "empty": True,
+                "url": "https://chatgpt.com/",
+                "user_count": 0,
+                "user_message_ids": [],
+                "last_user_turn": -1,
+            }
+        if "activate_send_button" in script:
+            return {"found": True, "clicked": True}
+        if "send_button" in script:
+            return {"found": True}
+        if "last_user_message" in script:
+            return next(post_send_states)
+        raise AssertionError(f"unexpected JS: {script[:120]}")
+
+    ops = load_ops(fake_js)
+    evidence = ops["send_message"]("canonical url regression")
+
+    assert evidence["status"] == "definitely_sent"
+    assert evidence["url"] == "https://chatgpt.com/c/6a71b7a7-3c8c-83ea-a7b2-a8b07df96fd6"
+
+
+def test_send_message_accepts_a_new_message_id_when_virtualized_count_is_fixed():
+    def fake_js(script):
+        if "existing_user_messages" in script:
+            return {
+                "found": True,
+                "empty": True,
+                "url": "https://chatgpt.com/c/existing-chat",
+                "user_count": 4,
+                "user_message_ids": ["old-1", "old-2", "old-3", "old-4"],
+                "last_user_message_id": "old-4",
+                "last_user_turn": 7,
+            }
+        if "activate_send_button" in script:
+            return {"found": True, "clicked": True}
+        if "send_button" in script:
+            return {"found": True}
+        if "last_user_message" in script:
+            return {
+                "url": "https://chatgpt.com/c/existing-chat",
+                "composer_empty": True,
+                "user_count": 4,
+                "last_user_message_id": "new-5",
+                "last_user_turn": 9,
+                "last_user_message": "fixed virtual window send",
+            }
+        raise AssertionError(f"unexpected JS: {script[:120]}")
+
+    ops = load_ops(fake_js)
+    evidence = ops["send_message"]("fixed virtual window send")
+
+    assert evidence["status"] == "definitely_sent"
+    assert evidence["message_id"] == "new-5"
+
+
+def test_send_message_rejects_duplicate_old_turn_and_nonempty_composer_after_noop():
+    def fake_js(script):
+        if "existing_user_messages" in script:
+            return {
+                "found": True,
+                "empty": True,
+                "url": "https://chatgpt.com/c/existing-chat",
+                "user_count": 1,
+                "user_message_ids": ["old-continue"],
+                "last_user_message_id": "old-continue",
+                "last_user_turn": 1,
+            }
+        if "activate_send_button" in script:
+            return {"found": True, "clicked": True}
+        if "send_button" in script:
+            return {"found": True}
+        if "last_user_message" in script:
+            return {
+                "url": "https://chatgpt.com/c/existing-chat",
+                "composer_empty": False,
+                "user_count": 2,
+                "last_user_message_id": "old-continue",
+                "last_user_turn": 1,
+                "last_user_message": "continue",
+            }
+        raise AssertionError(f"unexpected JS: {script[:120]}")
+
+    ops = load_ops(fake_js)
+    evidence = ops["send_message"]("continue", evidence_timeout=0.01)
+
+    assert evidence["status"] == "unknown"
+    assert evidence["expected_user_message_found"] is False
 
 
 def test_send_message_returns_unknown_after_click_without_post_send_evidence():
@@ -292,6 +447,71 @@ def test_send_message_converts_activation_exception_to_unknown_without_retry_sig
 
     assert evidence["status"] == "unknown"
     assert evidence["reason"] == "send_activation_exception"
+
+
+def test_send_message_tolerates_a_transient_post_send_evidence_exception():
+    evidence_reads = 0
+
+    def fake_js(script):
+        nonlocal evidence_reads
+        if "existing_user_messages" in script:
+            return {
+                "found": True,
+                "empty": True,
+                "url": "https://chatgpt.com/",
+                "user_count": 0,
+                "user_message_ids": [],
+                "last_user_turn": -1,
+            }
+        if "activate_send_button" in script:
+            return {"found": True, "clicked": True}
+        if "send_button" in script:
+            return {"found": True}
+        if "last_user_message" in script:
+            evidence_reads += 1
+            if evidence_reads == 1:
+                raise RuntimeError("execution context destroyed after navigation")
+            return {
+                "url": "https://chatgpt.com/c/transient-recovered",
+                "composer_empty": True,
+                "user_count": 1,
+                "last_user_message_id": "recovered-message",
+                "last_user_turn": 1,
+                "last_user_message": "recover evidence",
+            }
+        raise AssertionError(f"unexpected JS: {script[:120]}")
+
+    ops = load_ops(fake_js)
+    evidence = ops["send_message"]("recover evidence")
+
+    assert evidence["status"] == "definitely_sent"
+    assert evidence["message_id"] == "recovered-message"
+
+
+def test_send_message_returns_unknown_when_post_send_evidence_keeps_raising():
+    def fake_js(script):
+        if "existing_user_messages" in script:
+            return {
+                "found": True,
+                "empty": True,
+                "url": "https://chatgpt.com/",
+                "user_count": 0,
+                "user_message_ids": [],
+                "last_user_turn": -1,
+            }
+        if "activate_send_button" in script:
+            return {"found": True, "clicked": True}
+        if "send_button" in script:
+            return {"found": True}
+        if "last_user_message" in script:
+            raise RuntimeError("execution context destroyed after navigation")
+        raise AssertionError(f"unexpected JS: {script[:120]}")
+
+    ops = load_ops(fake_js)
+    evidence = ops["send_message"]("uncertain after click", evidence_timeout=0.01)
+
+    assert evidence["status"] == "unknown"
+    assert evidence["reason"] == "post_send_evidence_unavailable"
 
 
 def test_send_message_rejects_nonempty_composer_before_typing_or_clicking():
@@ -388,3 +608,37 @@ def test_send_and_wait_stops_on_unknown_send_without_retrying():
 
     with pytest.raises(RuntimeError, match="unknown.*do not retry"):
         ops["send_and_wait"]("hello", timeout=0)
+
+
+def test_page_conversation_uses_real_page_keys_and_returns_virtualizer_state():
+    states = iter([
+        {"found": True, "scroll_top": 0, "scroll_height": 68000, "client_height": 800, "message_count": 19},
+        {"found": True, "scroll_top": 760, "scroll_height": 68000, "client_height": 800, "message_count": 25},
+    ])
+    pressed = []
+
+    def fake_js(script):
+        if "message_count" in script:
+            return next(states)
+        raise AssertionError(f"unexpected JS: {script[:120]}")
+
+    ops = load_ops(fake_js, press_impl=pressed.append)
+    evidence = ops["page_conversation"]("down", steps=1)
+
+    assert pressed == ["PageDown"]
+    assert evidence["scroll_top"] == 760
+    assert evidence["message_count"] == 25
+    assert evidence["moved"] is True
+
+
+def test_read_markdown_block_summary_returns_the_full_editor_text():
+    full_markdown = "# 今日英语训练总结\n\n" + ("完整内容 " * 700)
+
+    def fake_js(script):
+        if "writing-block-editor" in script:
+            return [{"text": full_markdown, "chars": len(full_markdown)}]
+        raise AssertionError(f"unexpected JS: {script[:120]}")
+
+    ops = load_ops(fake_js)
+
+    assert ops["read_markdown_block_summary"]() == full_markdown
