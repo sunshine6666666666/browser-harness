@@ -53,6 +53,30 @@ def test_new_chat_rejects_unchanged_existing_conversation():
         ops["new_chat"]()
 
 
+def test_new_chat_rejects_different_existing_conversation_with_empty_composer():
+    old_url = "https://chatgpt.com/c/existing-conversation"
+    different_old_url = "https://chatgpt.com/c/different-existing-conversation"
+
+    def fake_js(script):
+        if script == "location.href":
+            return old_url
+        if "const links" in script:
+            return {"found": True, "clicked": True}
+        if "form[data-type=\"unified-composer\"]" in script:
+            return {
+                "url": different_old_url,
+                "path": "/c/different-existing-conversation",
+                "composer_found": True,
+                "composer_empty": True,
+            }
+        raise AssertionError(f"unexpected JS: {script[:100]}")
+
+    ops = load_ops(fake_js)
+
+    with pytest.raises(RuntimeError, match="fresh home"):
+        ops["new_chat"]()
+
+
 def test_new_chat_uses_dom_click_and_returns_fresh_home_evidence():
     old_url = "https://chatgpt.com/c/existing-conversation"
 

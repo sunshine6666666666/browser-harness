@@ -38,7 +38,7 @@ PY
 | Function | Behavior |
 |---|---|
 | `open_chatgpt(url)` | New tab to chatgpt.com, wait for load |
-| `new_chat()` | Click sidebar 新聊天; reject an unchanged `/c/<id>` and require a visible empty unified composer |
+| `new_chat()` | Click sidebar 新聊天; require the exact fresh-home path `/` and a visible empty unified composer; any `/c/<id>` is rejected |
 | `switch_chat(fragment)` | Click sidebar item whose visible title contains fragment; verify `/c/` URL |
 | `delete_chat(fragment, confirm=True)` | Hover item → options (history-item-N-options) → 删除 → confirm dialog (`delete-conversation-confirm-button`). **Destructive — requires confirm=True** |
 | `select_model(name)` | Open the advanced or direct model submenu, select an exact visible radio, then reopen and require `aria-checked="true"` |
