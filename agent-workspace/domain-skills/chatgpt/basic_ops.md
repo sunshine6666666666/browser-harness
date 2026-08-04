@@ -1,6 +1,6 @@
 # ChatGPT domain skill — basic conversation lifecycle
 
-Target: `chatgpt.com` (logged-in Agent Chrome, Chinese UI). Verified 2026-08-03
+Target: `chatgpt.com` (logged-in Agent Chrome, Chinese UI). Verified 2026-08-04
 on ChatGPT Pro account (model picker shows `5.6 Sol 中` style).
 
 Scope: the full "create a conversation" lifecycle — open site, new chat,
@@ -38,21 +38,21 @@ PY
 | Function | Behavior |
 |---|---|
 | `open_chatgpt(url)` | New tab to chatgpt.com, wait for load |
-| `new_chat()` | Click sidebar 新聊天; verify home/composer |
+| `new_chat()` | Click sidebar 新聊天; reject an unchanged `/c/<id>` and require a visible empty unified composer |
 | `switch_chat(fragment)` | Click sidebar item whose visible title contains fragment; verify `/c/` URL |
 | `delete_chat(fragment, confirm=True)` | Hover item → options (history-item-N-options) → 删除 → confirm dialog (`delete-conversation-confirm-button`). **Destructive — requires confirm=True** |
-| `select_model(name)` | Open picker → 模型 submenu → exact radio (`GPT-5.6 Sol` / `Terra` / `Luna`); verifies composer text |
-| `set_reasoning_effort(level)` | Open picker → 推理强度 submenu → 轻度/中/高/极高/最高/超高; verifies composer text |
-| `send_message(text)` | Focus composer → type → click 发送提示 button (Return alone did NOT send in verified UI) |
+| `select_model(name)` | Open the advanced or direct model submenu, select an exact visible radio, then reopen and require `aria-checked="true"` |
+| `set_reasoning_effort(level)` | Select the exact reasoning radio in either UI variant, then reopen and require `aria-checked="true"` |
+| `send_message(text)` | Require an initially empty unified composer, send once, and return `definitely_sent` or non-retryable `unknown` evidence, including activation exceptions |
 | `scroll_conversation(direction, amount)` | Wheel on the main `overflowY:auto` container; returns scrollTop |
 | `conversation_text(limit)` | Read last user/assistant turns from `[data-message-author-role]` nodes |
 | `close_extra_tab(fragment=None)` | Close most recently opened content tab; option to protect tabs by URL fragment |
 | `export_share_link(fragment=None)` | Export conversation as public link. Header `share-chat-button` copies conversation-level `/share/` link to clipboard directly (toast, no dialog). Fallback: message-level share → `/s/p_...` single-message link. **Link is public on the internet** |
 | `read_shared_conversation(url)` | Open share link in new tab, return visible conversation text, close tab |
-| `rename_chat(fragment, new_title)` | Rename conversation: options menu → 重命名 → type → save (blur+Enter) |
+| `rename_chat(url_or_id, new_title)` | Require the exact conversation URL/ID, edit only `input[aria-label="聊天标题"]`, explicitly blur the controlled input, then leave/reopen and verify that exact `/c/<id>` row persisted |
 | `toggle_user_message_expand(i=0)` | Expand/collapse long user prompt (`collapsible-user-message-toggle`) |
 | `expand_all_user_messages()` | Expand every collapsed long prompt; returns count |
-| `send_and_wait(text, timeout=180)` | Send message and poll until reply finishes; returns last assistant text |
+| `send_and_wait(text, timeout=180)` | Require `definitely_sent`, then poll until reply finishes; an unknown send stops without retrying |
 | `switch_header_tab('聊天'\|'工作')` | Toggle the top header 聊天/工作 (chat/workspace) radio tabs. Named to avoid shadowing the harness's built-in `switch_tab` (browser tab switcher) |
 
 ## UI facts / selectors (Chinese UI)
@@ -67,28 +67,24 @@ PY
   options (`aria-label` contains 对话选项, `data-testid="history-item-N-options"`).
 - Options menu: 分享 / 重命名 / 移至项目 / 置顶聊天 / 归档 / 删除.
 - Delete confirm: `[data-testid="delete-conversation-confirm-button"]`.
-- Composer model picker: a `button` whose span text is like `5.6 Sol` + effort
-  (`中`). Click at `span.x + span.width + 20` (clicking the span text alone may
-  land between the two segments — verified pitfall).
-- Picker panel: simple view = capability slider (5 levels); advanced view items
-  are `[role="menuitem"]` with text starting 模型 / 推理强度 / 速度. Model list
-  entries are `[role="menuitemradio"]`; effort list likewise (轻度/中/高/极高/最高/超高).
+- Composer model picker: a composer-scoped `button[aria-haspopup="menu"]`. The current Radix trigger requires a full pointerdown/mousedown/pointerup/mouseup/click sequence; a bare DOM click or Escape-only cleanup may leave the menu unchanged.
+- Picker panel has two live variants. The advanced variant exposes 模型 / 推理强度 / 速度 menu items. The current direct variant exposes reasoning radios at the top level and a current-model `[role="menuitem"][aria-haspopup="menu"]` that opens exact model radios. Both must be verified by reopening and reading `aria-checked`.
 - Send button: `aria-label="发送提示"` (do not rely on Return).
 - Main scroll container: the largest `div` with `overflowY:auto` and
   `scrollHeight > clientHeight + 50`. Note: the side "输出内容" pane is
   `overflowY:clip` (custom scroll) — not scrollable via wheel.
-- Title normalization: ChatGPT may auto-rename a new chat (e.g. the sent
-  message becomes the title, possibly truncated/rewritten). Match sidebar
-  items by substring, not equality.
+- ChatGPT may auto-rename a new chat. Title fragments are acceptable for read-only discovery. `rename_chat` requires an exact ChatGPT conversation URL/path/ID; `delete_chat` still accepts a title fragment but requires exactly one matching row and never falls back to another row's options button.
 - New chats only appear in the sidebar after the first message is sent.
 
 ## Safety rules
 
 - `delete_chat` is destructive: never call it without an explicit
-  confirm=True from the caller, and prefer testing against throwaway chats.
+  confirm=True from the caller; its title fragment must resolve to one row, and prefer testing against throwaway chats.
 - `select_model` / `set_reasoning_effort` change the composer state: restore
   the previous model/effort after a test (verified pattern: switch then switch
-  back and re-check composer text).
+  back and re-check the exact radio's `aria-checked` state).
+- `send_message()` may return `status="unknown"` after a click. Never resend an unknown result; inspect the returned URL and conversation before deciding what happened.
+- Sidebar mutation helpers must never fall back to another row's options button. An absent or ambiguous exact target is a hard failure.
 - Login walls/payment UI: stop and ask Ye Lin; never type credentials.
 
 ## Pitfalls (verified 2026-08-03)
@@ -118,8 +114,7 @@ PY
   this page (~30s ipc timeout). Prefer JS `el.click()` + synthetic
   mouseover/mouseenter for hover-dependent buttons (sidebar options, menu
   items, confirm dialogs).** Keep CDP events only for wheel scrolling.
-- Rename save: pressing Return did NOT commit the rename input; blur + a
-  synthetic Enter keydown/keyup event does.
+- Rename uses the controlled native value setter plus bubbling `input`/`change`, then a real click outside the title field; synthetic Enter is not proof of persistence.
 - Sidebar item options button lives inside `a[href*="/c/"]`'s `li`; match by
   `history-item-N-options` testid. Never fall back to the FIRST options button
   globally — it may belong to a different conversation.

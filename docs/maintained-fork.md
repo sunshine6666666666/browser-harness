@@ -47,4 +47,4 @@ The maintainer triages each Issue as one of:
 
 ## PR review gate
 
-A PR must link an Issue, stay within the approved scope, list files and behavior changed, include tests and rollback, pass CI, and contain no secrets. Browser/auth/config/publishing changes require a real smoke and explicit approval where the side effect is sensitive. Agents may prepare Issues and PRs; only the maintainer merges. High-blast-radius, irreversible, auth, or low-confidence changes are blocked for Ye Lin's decision.
+A PR must link an Issue, stay within the approved scope, list files and behavior changed, include tests and rollback, pass CI, and contain no secrets. Browser/auth/config/publishing changes require a real smoke and explicit approval where the side effect is sensitive. Consumer Hermes Agents only submit Issues and must not edit the checkout or create branches, commits, PRs, or pushes. Devkeeper first reproduces browser-behavior claims in the isolated Agent Chrome, then prepares and merges an accepted maintainer PR. High-blast-radius, irreversible, auth, or low-confidence changes are blocked for Ye Lin's decision.
