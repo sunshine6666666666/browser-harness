@@ -2,8 +2,8 @@
 
 Runs inside browser-harness (heredoc: `browser-harness <<'PY'` then
 `exec(open("<repo>/agent-workspace/domain-skills/chatgpt/basic_ops.py").read())`
-and call the functions below). Verified 2026-08-03 against chatgpt.com
-Chinese UI (model picker "5.6 Sol 中" style, sidebar history items).
+and call the functions below). Verified 2026-08-04 against chatgpt.com
+Chinese UI (direct capability radios + current-model submenu, sidebar history items).
 
 Covered lifecycle: open site, new chat, switch chat, delete chat,
 select model, set reasoning effort, send message, scroll conversation,
@@ -15,7 +15,9 @@ at runtime via getBoundingClientRect, never hardcoded.
 
 from __future__ import annotations
 
+import re
 import time
+from urllib.parse import urlparse
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -103,21 +105,46 @@ def open_chatgpt(url: str = "https://chatgpt.com/") -> None:
         raise RuntimeError(f"open_chatgpt: landed on unexpected URL {st}")
 
 
-def new_chat() -> None:
-    """Click sidebar '新聊天' and verify we land on the chatgpt.com home/composer."""
-    _click_element_center(r"""
+def new_chat() -> dict[str, Any]:
+    """Click sidebar '新聊天' and prove a fresh, empty composer is active."""
+    before_url = js("location.href")
+    clicked = js(r"""
     (() => {
       const norm = s => (s || '').replace(/\s+/g, ' ').trim();
       const links = [...document.querySelectorAll('a')].filter(a =>
         /新聊天|New chat/i.test(norm(a.innerText || a.textContent)) && a.offsetParent);
       if (!links.length) return {found: false};
-      const b = links[0].getBoundingClientRect();
-      return {found: true, x: Math.round(b.x + b.width / 2), y: Math.round(b.y + b.height / 2)};
+      links[0].click();
+      return {found: true, clicked: true};
     })()
-    """, expect="new-chat link")
+    """)
+    if not clicked or not clicked.get("found"):
+        raise RuntimeError("new_chat: new-chat link not found")
     wait(2.0)
-    if not js("location.href.endsWith('/') || /\\/c\\//.test(location.href)"):
-        raise RuntimeError("new_chat: unexpected URL after click")
+    state = js(r"""
+    (() => {
+      const form = document.querySelector('form[data-type="unified-composer"]');
+      const editor = form && (form.querySelector('[contenteditable="true"]') ||
+                              form.querySelector('textarea, [role="textbox"]'));
+      const visible = !!(editor && editor.offsetParent);
+      const text = editor ? ((editor.innerText || editor.value || '').trim()) : '';
+      return {
+        url: location.href,
+        path: location.pathname,
+        composer_found: visible,
+        composer_empty: visible && text === ''
+      };
+    })()
+    """)
+    if not state or not state.get("composer_found") or not state.get("composer_empty"):
+        raise RuntimeError("new_chat: fresh chat composer is missing or non-empty")
+    after_url = state.get("url", "")
+    if "/c/" in before_url and after_url == before_url:
+        raise RuntimeError("new_chat: unchanged existing conversation is not a fresh chat")
+    path = state.get("path") or ""
+    if path != "/" and "/c/" not in path:
+        raise RuntimeError(f"new_chat: unexpected URL after click ({after_url})")
+    return state
 
 
 def switch_chat(title_fragment: str) -> None:
@@ -153,9 +180,10 @@ def _hover_and_get_options_button(title_fragment: str) -> dict[str, Any]:
     (() => {
       const norm = s => (s || '').replace(/\s+/g, ' ').trim();
       const frag = %r;
-      const a = [...document.querySelectorAll('a[href*="/c/"]')].find(x =>
+      const matches = [...document.querySelectorAll('a[href*="/c/"]')].filter(x =>
         x.offsetParent && norm(x.innerText).includes(frag));
-      if (!a) return {found: false};
+      if (matches.length !== 1) return {found: false, ambiguous: matches.length > 1, count: matches.length};
+      const a = matches[0];
       // synthetic hover so the trailing options button becomes active
       for (const type of ['mouseover', 'mouseenter', 'mousemove', 'pointerover']) {
         a.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true}));
@@ -163,13 +191,7 @@ def _hover_and_get_options_button(title_fragment: str) -> dict[str, Any]:
       const item = a.closest('li') || a.parentElement;
       const btn = [...item.querySelectorAll('button')].find(b =>
         /history-item-\d+-options/i.test(b.getAttribute('data-testid') || ''));
-      if (!btn) {
-        const alt = [...document.querySelectorAll('button')].find(b =>
-          /history-item-\d+-options/i.test(b.getAttribute('data-testid') || ''));
-        if (!alt) return {found: false};
-        alt.click();
-        return {found: true};
-      }
+      if (!btn) return {found: false};
       btn.click();
       return {found: true};
     })()
@@ -235,24 +257,91 @@ def delete_chat(title_fragment: str, confirm: bool = True) -> None:
         raise RuntimeError(f"delete_chat: {title_fragment!r} still present after delete")
 
 
+def _visible_menu_count() -> int:
+    """Count only rendered menu layers; hidden Radix mounts do not count."""
+    return int(js(r"""
+    (() => {
+      const visibleMenus = [...document.querySelectorAll('[role="menu"]')].filter(el => {
+        if (!el.offsetParent) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && r.x < innerWidth && r.y < innerHeight &&
+               r.right > 0 && r.bottom > 0;
+      });
+      return visibleMenus.length;
+    })()
+    """) or 0)
+
+
+def _activate_composer_picker() -> dict[str, Any]:
+    """Use the full pointer sequence required by the current Radix trigger."""
+    return js(r"""
+    (() => {
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+      const form = document.querySelector('form[data-type="unified-composer"]');
+      const buttons = form ? [...form.querySelectorAll('button')] : [];
+      const visible = buttons.filter(b => {
+        if (!b.offsetParent || b.disabled) return false;
+        const r = b.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && r.x >= 0 && r.y >= 0 &&
+               r.right <= innerWidth && r.bottom <= innerHeight;
+      });
+      const el = visible.find(b => b.getAttribute('aria-haspopup') === 'menu' &&
+        !/添加文件|attach|语音|voice|听写|dictation/i.test(norm((b.innerText || '') + ' ' + (b.getAttribute('aria-label') || '')))) ||
+        visible.find(b => /GPT|推理|Reasoning|快速|Fast|极高|High|中|Medium|低|Low/i.test(
+          norm((b.innerText || '') + ' ' + (b.getAttribute('aria-label') || ''))));
+      if (!el) return {found: false};
+      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+        const event = type.startsWith('pointer')
+          ? new PointerEvent(type, {bubbles: true, cancelable: true, pointerId: 1,
+              pointerType: 'mouse', isPrimary: true, button: 0,
+              buttons: type.endsWith('down') ? 1 : 0})
+          : new MouseEvent(type, {bubbles: true, cancelable: true, button: 0,
+              buttons: type.endsWith('down') ? 1 : 0});
+        el.dispatchEvent(event);
+      }
+      return {found: true, text: norm(el.innerText || el.getAttribute('aria-label'))};
+    })()
+    """) or {"found": False}
+
+
+def _close_visible_menus(max_layers: int = 4) -> None:
+    """Close all visible picker layers, preferring the Radix trigger toggle."""
+    if _visible_menu_count() == 0:
+        return
+    toggled = _activate_composer_picker()
+    if toggled.get("found"):
+        wait(0.5)
+        if _visible_menu_count() == 0:
+            return
+    for _ in range(max_layers):
+        press_key("Escape")
+        wait(0.35)
+        if _visible_menu_count() == 0:
+            return
+    raise RuntimeError("picker menus remained visible after trigger/Escape cleanup")
+
+
 def open_model_picker() -> None:
     """Click the composer model/effort picker button to open the model panel.
 
     Handles both UI styles: model+effort (e.g. '5.6 Sol 中') and capability
     slider (e.g. '极高'). Then ensures the advanced view is expanded.
     """
+    _close_visible_menus()
     r = _find_composer_picker()
     if not r or not r.get("found"):
         raise RuntimeError("open_model_picker: composer model button not found")
     for attempt in range(2):
-        click_at_xy(r["x"], r["y"])
+        clicked = _activate_composer_picker()
+        if not clicked or not clicked.get("found"):
+            raise RuntimeError("open_model_picker: composer model button disappeared")
         wait(1.4)
-        if js("!!document.querySelector('[role=\"menu\"]')"):
+        if _visible_menu_count() > 0:
             break
         # panel did not open — likely a leftover closing overlay; clear and retry
         press_key("Escape")
         wait(0.8)
-    if not js("!!document.querySelector('[role=\"menu\"]')"):
+    if _visible_menu_count() == 0:
         raise RuntimeError("open_model_picker: model panel did not open")
     # If the panel is in simple/capability view, expand advanced view first.
     has_advanced = js(r"""
@@ -263,137 +352,303 @@ def open_model_picker() -> None:
     })()
     """)
     if not has_advanced:
-        adv = js(r"""
-        (() => {
-          const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-          const el = [...document.querySelectorAll('[role="menuitem"], button')].find(i => {
-            const t = norm(i.innerText || i.textContent);
-            return (t === '高级' || t === 'Advanced') && i.offsetParent;
-          });
-          if (!el) return {found: false};
-          const b = el.getBoundingClientRect();
-          return {found: true, x: Math.round(b.x + b.width / 2), y: Math.round(b.y + b.height / 2)};
-        })()
-        """)
-        if adv and adv.get("found"):
-            click_at_xy(adv["x"], adv["y"])
-            wait(1.0)
+        if not _click_advanced_item("高级", required=False):
+            _click_advanced_item("Advanced", required=False)
 
 
-def _click_advanced_item(prefix: str) -> None:
-    """Click an advanced-view menu item whose text starts with prefix (模型/推理强度/速度)."""
+def _click_advanced_item(prefix: str, required: bool = True) -> bool:
+    """Click an advanced-view menu item when that UI variant is present."""
     r = js(r"""
     (() => {
       const norm = s => (s || '').replace(/\s+/g, ' ').trim();
       const pre = %r;
-      const el = [...document.querySelectorAll('[role="menuitem"]')].find(i =>
-        norm(i.innerText || i.textContent).startsWith(pre));
+      const el = [...document.querySelectorAll('[role="menuitem"], button')].find(i => {
+        if (!i.offsetParent || !norm(i.innerText || i.textContent).startsWith(pre)) return false;
+        const b = i.getBoundingClientRect();
+        return b.width > 0 && b.height > 0 && b.x >= 0 && b.y >= 0 &&
+               b.right <= innerWidth && b.bottom <= innerHeight;
+      });
       if (!el) return {found: false};
-      const b = el.getBoundingClientRect();
-      return {found: true, x: Math.round(b.x + b.width / 2), y: Math.round(b.y + b.height / 2)};
+      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+        const event = type.startsWith('pointer')
+          ? new PointerEvent(type, {bubbles: true, cancelable: true, pointerId: 1,
+              pointerType: 'mouse', isPrimary: true, button: 0,
+              buttons: type.endsWith('down') ? 1 : 0})
+          : new MouseEvent(type, {bubbles: true, cancelable: true, button: 0,
+              buttons: type.endsWith('down') ? 1 : 0});
+        el.dispatchEvent(event);
+      }
+      return {found: true, clicked: true};
     })()
     """ % prefix)
     if not r or not r.get("found"):
-        raise RuntimeError(f"advanced item {prefix!r} not found in model panel")
-    click_at_xy(r["x"], r["y"])
+        if required:
+            raise RuntimeError(f"advanced item {prefix!r} not found in model panel")
+        return False
+    if not r.get("clicked"):
+        raise RuntimeError(f"advanced item {prefix!r} was not activated")
     wait(1.0)
+    return True
 
 
-def select_model(model_name: str) -> None:
-    """Select a model from the picker, e.g. 'GPT-5.6 Sol', 'GPT-5.6 Terra', 'GPT-5.6 Luna'.
-
-    Opens the picker, expands the model submenu, clicks the radio with the
-    exact label, and verifies the composer picker shows the new model.
-    """
-    open_model_picker()
-    _click_advanced_item("模型")
+def _open_model_choices() -> None:
+    """Open model radios in either the advanced or current direct-submenu UI."""
+    if _click_advanced_item("模型", required=False):
+        return
     r = js(r"""
     (() => {
       const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-      const name = %r;
-      const els = [...document.querySelectorAll('[role="menuitemradio"]')].filter(e =>
-        norm(e.innerText || e.textContent) === name);
-      if (!els.length) return {found: false};
-      // rightmost submenu wins (avoids same-named entries in the capability slider)
-      els.sort((a, b) => b.getBoundingClientRect().x - a.getBoundingClientRect().x);
-      const el = els[0];
-      const b = el.getBoundingClientRect();
-      return {found: true, x: Math.round(b.x + b.width / 2), y: Math.round(b.y + b.height / 2)};
-    })()
-    """ % model_name)
-    if not r or not r.get("found"):
-        raise RuntimeError(f"select_model: model {model_name!r} not in list")
-    click_at_xy(r["x"], r["y"])
-    wait(1.2)
-    st = _composer_state()
-    if model_name.replace("GPT-", "").split(" ")[0] not in st and model_name not in st:
-        raise RuntimeError(f"select_model: composer shows {st!r}, expected {model_name!r}")
-
-
-def set_reasoning_effort(level: str) -> None:
-    """Set reasoning effort. Chinese UI levels: 轻度/中/高/极高/最高/超高."""
-    open_model_picker()
-    _click_advanced_item("推理强度")
-    r = js(r"""
-    (() => {
-      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-      const lvl = %r;
-      const els = [...document.querySelectorAll('[role="menuitemradio"]')].filter(e =>
-        norm(e.innerText || e.textContent).split(/\s+/)[0] === lvl);
-      if (!els.length) return {found: false};
-      // rightmost submenu wins (avoids same-named entries in the capability slider)
-      els.sort((a, b) => b.getBoundingClientRect().x - a.getBoundingClientRect().x);
-      const el = els[0];
-      const b = el.getBoundingClientRect();
-      return {found: true, x: Math.round(b.x + b.width / 2), y: Math.round(b.y + b.height / 2)};
-    })()
-    """ % level)
-    if not r or not r.get("found"):
-        raise RuntimeError(f"set_reasoning_effort: level {level!r} not found")
-    click_at_xy(r["x"], r["y"])
-    wait(1.0)
-    st = _composer_state()
-    if level not in st:
-        raise RuntimeError(f"set_reasoning_effort: composer shows {st!r}, expected {level!r}")
-
-
-def send_message(text: str) -> None:
-    """Focus composer, type a message and click the send button (aria-label 发送提示).
-
-    Note: pressing Return alone did NOT send in the verified UI; the explicit
-    send button is the reliable path.
-    """
-    foc = js(r"""
-    (() => {
-      const el = document.querySelector('[contenteditable="true"]') || document.querySelector('textarea, [role="textbox"]');
+      const el = [...document.querySelectorAll('[role="menuitem"][aria-haspopup="menu"], [role="menuitem"][data-has-submenu]')]
+        .find(i => {
+          if (!i.offsetParent) return false;
+          const t = norm(i.innerText || i.textContent);
+          const b = i.getBoundingClientRect();
+          return (/^GPT-|^o\d|模型|Model/i.test(t)) && b.width > 0 && b.height > 0 &&
+                 b.x >= 0 && b.y >= 0 && b.right <= innerWidth && b.bottom <= innerHeight;
+        });
       if (!el) return {found: false};
-      el.focus();
-      return {found: true};
+      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+        const event = type.startsWith('pointer')
+          ? new PointerEvent(type, {bubbles: true, cancelable: true, pointerId: 1,
+              pointerType: 'mouse', isPrimary: true, button: 0,
+              buttons: type.endsWith('down') ? 1 : 0})
+          : new MouseEvent(type, {bubbles: true, cancelable: true, button: 0,
+              buttons: type.endsWith('down') ? 1 : 0});
+        el.dispatchEvent(event);
+      }
+      return {found: true, clicked: true};
     })()
     """)
-    if not foc or not foc.get("found"):
-        raise RuntimeError("send_message: composer not found")
+    if not r or not r.get("found") or not r.get("clicked"):
+        raise RuntimeError("select_model: model submenu not found")
+    wait(1.0)
+
+
+def _radio_target(name: str, first_token: bool = False, activate: bool = False) -> dict[str, Any]:
+    """Find an exact hit-test-safe radio and optionally activate it once."""
+    r = js(r"""
+    (() => {
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+      const expected = %r;
+      const firstToken = %s;
+      const activate = %s;
+      const els = [...document.querySelectorAll('[role="menuitemradio"]')].filter(e => {
+        if (!e.offsetParent) return false;
+        const text = norm(e.innerText || e.textContent);
+        const matches = firstToken ? text.split(/\s+/)[0] === expected : text === expected;
+        if (!matches) return false;
+        const b = e.getBoundingClientRect();
+        if (b.width <= 0 || b.height <= 0 || b.x < 0 || b.y < 0 ||
+            b.right > innerWidth || b.bottom > innerHeight) return false;
+        const hit = document.elementFromPoint(b.x + b.width / 2, b.y + b.height / 2);
+        return !!hit && (hit === e || e.contains(hit));
+      });
+      if (!els.length) return {found: false};
+      els.sort((a, b) => b.getBoundingClientRect().x - a.getBoundingClientRect().x);
+      const el = els[0];
+      const b = el.getBoundingClientRect();
+      const checked = el.getAttribute('aria-checked') === 'true';
+      let activated = false;
+      if (activate && !checked) {
+        for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+          const event = type.startsWith('pointer')
+            ? new PointerEvent(type, {bubbles: true, cancelable: true, pointerId: 1,
+                pointerType: 'mouse', isPrimary: true, button: 0,
+                buttons: type.endsWith('down') ? 1 : 0})
+            : new MouseEvent(type, {bubbles: true, cancelable: true, button: 0,
+                buttons: type.endsWith('down') ? 1 : 0});
+          el.dispatchEvent(event);
+        }
+        activated = true;
+      }
+      return {
+        found: true,
+        x: Math.round(b.x + b.width / 2),
+        y: Math.round(b.y + b.height / 2),
+        checked: checked,
+        activated: activated
+      };
+    })()
+    """ % (name, "true" if first_token else "false", "true" if activate else "false"))
+    return r or {"found": False}
+
+
+def _verify_radio_after_reopen(name: str, *, model: bool, first_token: bool = False) -> dict[str, Any]:
+    open_model_picker()
+    if model:
+        _open_model_choices()
+    elif not _click_advanced_item("推理强度", required=False):
+        pass  # current UI exposes reasoning radios directly in the top-level menu
+    check = _radio_target(name, first_token=first_token)
+    _close_visible_menus()
+    if not check.get("found") or not check.get("checked"):
+        raise RuntimeError(f"picker radio {name!r} is not aria-checked after selection")
+    return {"name": name, "checked": True}
+
+
+def select_model(model_name: str) -> dict[str, Any]:
+    """Select an exact model radio and re-open the picker to prove aria-checked."""
+    open_model_picker()
+    _open_model_choices()
+    target = _radio_target(model_name)
+    if not target.get("found"):
+        press_key("Escape")
+        raise RuntimeError(f"select_model: model {model_name!r} not in visible list")
+    if not target.get("checked"):
+        activated = _radio_target(model_name, activate=True)
+        if not activated.get("found") or not activated.get("activated"):
+            raise RuntimeError(f"select_model: could not activate model {model_name!r}")
+        wait(1.2)
+    return _verify_radio_after_reopen(model_name, model=True)
+
+
+def set_reasoning_effort(level: str) -> dict[str, Any]:
+    """Set reasoning effort and re-open the picker to prove exact aria-checked."""
+    open_model_picker()
+    _click_advanced_item("推理强度", required=False)
+    target = _radio_target(level, first_token=True)
+    if not target.get("found"):
+        press_key("Escape")
+        raise RuntimeError(f"set_reasoning_effort: level {level!r} not in visible list")
+    if not target.get("checked"):
+        activated = _radio_target(level, first_token=True, activate=True)
+        if not activated.get("found") or not activated.get("activated"):
+            raise RuntimeError(f"set_reasoning_effort: could not activate level {level!r}")
+        wait(1.0)
+    return _verify_radio_after_reopen(level, model=False, first_token=True)
+
+
+def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
+    """Send once from the unified composer and return non-retryable evidence.
+
+    Preflight failures raise before any click. After the send click, callers get
+    ``definitely_sent`` or ``unknown`` and must never resend an ``unknown`` result.
+    """
+    expected = _norm(text)
+    if not expected:
+        raise RuntimeError("send_message: message must not be empty")
+    before = js(r"""
+    (() => {
+      const form = document.querySelector('form[data-type="unified-composer"]');
+      const editor = form && (form.querySelector('[contenteditable="true"]') ||
+                              form.querySelector('textarea, [role="textbox"]'));
+      const existing_user_messages = document.querySelectorAll('[data-message-author-role="user"]').length;
+      if (!form || !editor || !editor.offsetParent) return {found: false};
+      const r = editor.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0 || r.x < 0 || r.y < 0 ||
+          r.right > innerWidth || r.bottom > innerHeight) return {found: false};
+      const content = (editor.innerText || editor.value || '').trim();
+      editor.focus();
+      return {
+        found: true,
+        empty: content === '',
+        url: location.href,
+        user_count: existing_user_messages
+      };
+    })()
+    """)
+    if not before or not before.get("found"):
+        raise RuntimeError("send_message: visible unified composer not found")
+    if not before.get("empty"):
+        raise RuntimeError("send_message: unified composer must be empty before typing")
     wait(0.4)
     type_text(text)
     wait(0.5)
     btn = js(r"""
     (() => {
       const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-      const b = [...document.querySelectorAll('button')].find(el =>
-        norm(el.getAttribute('aria-label') || '') === '发送提示' ||
-        norm(el.getAttribute('aria-label') || '') === 'Send prompt');
-      if (!b) return {found: false};
-      const r = b.getBoundingClientRect();
-      return {found: true, x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2)};
+      const form = document.querySelector('form[data-type="unified-composer"]');
+      const send_button = form && [...form.querySelectorAll('button')].find(el => {
+        const label = norm(el.getAttribute('aria-label') || '');
+        return (label === '发送提示' || label === 'Send prompt') && el.offsetParent &&
+               !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+      });
+      if (!send_button) return {found: false};
+      const r = send_button.getBoundingClientRect();
+      const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+      if (r.width <= 0 || r.height <= 0 || r.x < 0 || r.y < 0 ||
+          r.right > innerWidth || r.bottom > innerHeight ||
+          !hit || !(hit === send_button || send_button.contains(hit))) return {found: false};
+      return {found: true};
     })()
     """)
     if not btn or not btn.get("found"):
-        raise RuntimeError("send_message: send button not found")
-    click_at_xy(btn["x"], btn["y"])
-    wait(1.5)
-    empty = js("((document.querySelector('[contenteditable=\"true\"]')||{}).innerText||'').trim() === ''")
-    if not empty:
-        raise RuntimeError("send_message: composer still has text after send")
+        raise RuntimeError("send_message: enabled unified-composer send button not found")
+    try:
+        activated = js(r"""
+        (() => {
+          const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+          const form = document.querySelector('form[data-type="unified-composer"]');
+          const activate_send_button = form && [...form.querySelectorAll('button')].find(el => {
+            const label = norm(el.getAttribute('aria-label') || '');
+            return (label === '发送提示' || label === 'Send prompt') && el.offsetParent &&
+                   !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+          });
+          if (!activate_send_button) return {found: false, clicked: false};
+          for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+            const event = type.startsWith('pointer')
+              ? new PointerEvent(type, {bubbles: true, cancelable: true, pointerId: 1,
+                  pointerType: 'mouse', isPrimary: true, button: 0,
+                  buttons: type.endsWith('down') ? 1 : 0})
+              : new MouseEvent(type, {bubbles: true, cancelable: true, button: 0,
+                  buttons: type.endsWith('down') ? 1 : 0});
+            activate_send_button.dispatchEvent(event);
+          }
+          return {found: true, clicked: true};
+        })()
+        """) or {}
+    except Exception:
+        return {
+            "status": "unknown",
+            "reason": "send_activation_exception",
+            "url": before.get("url"),
+            "composer_empty": False,
+            "expected_user_message_found": False,
+        }
+    if not activated.get("found") or not activated.get("clicked"):
+        return {
+            "status": "unknown",
+            "reason": "send_activation_unconfirmed",
+            "url": before.get("url"),
+            "composer_empty": False,
+            "expected_user_message_found": False,
+        }
+
+    deadline = time.time() + evidence_timeout
+    latest: dict[str, Any] = {}
+    while time.time() < deadline:
+        wait(0.5)
+        latest = js(r"""
+        (() => {
+          const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+          const form = document.querySelector('form[data-type="unified-composer"]');
+          const editor = form && (form.querySelector('[contenteditable="true"]') ||
+                                  form.querySelector('textarea, [role="textbox"]'));
+          const users = [...document.querySelectorAll('[data-message-author-role="user"]')];
+          const last_user_message = users.length ? norm(users[users.length - 1].innerText || users[users.length - 1].textContent) : '';
+          return {
+            url: location.href,
+            composer_empty: !!editor && norm(editor.innerText || editor.value) === '',
+            user_count: users.length,
+            last_user_message: last_user_message
+          };
+        })()
+        """) or {}
+        found = expected in _norm(latest.get("last_user_message"))
+        if ("/c/" in latest.get("url", "") and
+                latest.get("user_count", 0) > before.get("user_count", 0) and found):
+            return {
+                "status": "definitely_sent",
+                "url": latest.get("url"),
+                "composer_empty": bool(latest.get("composer_empty")),
+                "expected_user_message_found": True,
+            }
+    return {
+        "status": "unknown",
+        "url": latest.get("url", before.get("url")),
+        "composer_empty": bool(latest.get("composer_empty")),
+        "expected_user_message_found": False,
+    }
 
 
 def scroll_conversation(direction: str = "down", amount: int = 600, wait_s: float = 0.8) -> int:
@@ -616,19 +871,60 @@ def conversation_text(limit: int = 4000) -> str:
     """ % (limit, limit))
 
 
-def rename_chat(title_fragment: str, new_title: str) -> str:
-    """Rename a conversation via sidebar options → 重命名.
+def _conversation_id(conversation: str) -> str:
+    """Normalize an exact ChatGPT conversation URL/path/ID; reject title fragments."""
+    value = (conversation or "").strip().rstrip("/")
+    if re.fullmatch(r"[A-Za-z0-9-]{8,}", value):
+        return value
+    path_match = re.fullmatch(r"/c/([A-Za-z0-9-]{8,})", value)
+    if path_match:
+        return path_match.group(1)
+    parsed = urlparse(value)
+    url_match = re.fullmatch(r"/c/([A-Za-z0-9-]{8,})", parsed.path)
+    if (parsed.scheme == "https" and parsed.hostname == "chatgpt.com" and
+            not parsed.query and not parsed.fragment and url_match):
+        return url_match.group(1)
+    raise RuntimeError("rename_chat: exact conversation URL or ID is required; title fragments are unsafe")
 
-    Hover the sidebar item, click its options button, click 重命名, clear the
-    input and type the new title. Returns the sidebar title after rename.
-    """
-    opt = _hover_and_get_options_button(title_fragment)
+
+def _open_exact_conversation_options(conversation_id: str) -> None:
+    """Open only the options button inside the exact `/c/<id>` sidebar row."""
+    r = js(r"""
+    (() => {
+      const suffix = '/c/' + %r;
+      const matches = [...document.querySelectorAll('a[href*="/c/"]')].filter(a =>
+        a.offsetParent && new URL(a.href, location.href).pathname === suffix);
+      if (matches.length !== 1) return {found: false, count: matches.length};
+      const a = matches[0];
+      for (const type of ['mouseover', 'mouseenter', 'mousemove', 'pointerover']) {
+        a.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true}));
+      }
+      const item = a.closest('li') || a.parentElement;
+      const btn = [...item.querySelectorAll('button')].find(b =>
+        /history-item-\d+-options/i.test(b.getAttribute('data-testid') || ''));
+      if (!btn) return {found: false, count: 1};
+      btn.click();
+      return {found: true};
+    })()
+    """ % conversation_id)
+    if not r or not r.get("found"):
+        raise RuntimeError(f"rename_chat: exact sidebar row /c/{conversation_id} or its options button was not found")
+    wait(1.2)
+
+
+def rename_chat(conversation: str, new_title: str) -> str:
+    """Rename one exact conversation URL/ID and verify only that sidebar row."""
+    conversation_id = _conversation_id(conversation)
+    new_title = _norm(new_title)
+    if not new_title:
+        raise RuntimeError("rename_chat: new title must not be empty")
+    _open_exact_conversation_options(conversation_id)
     ren = js(r"""
     (() => {
       const norm = s => (s || '').replace(/\s+/g, ' ').trim();
       const el = [...document.querySelectorAll('[role="menuitem"]')].find(i => {
         const t = norm(i.innerText || i.textContent);
-        return t === '重命名' && i.offsetParent;
+        return (t === '重命名' || t === 'Rename') && i.offsetParent;
       });
       if (!el) return {found: false};
       el.click();
@@ -636,48 +932,75 @@ def rename_chat(title_fragment: str, new_title: str) -> str:
     })()
     """)
     if not ren or not ren.get("found"):
-        raise RuntimeError("rename_chat: 重命名 menu item not found")
+        raise RuntimeError("rename_chat: rename menu item not found")
     wait(1.2)
-    # rename input appears; select-all + type new title
-    inp = js(r"""
+    edited = js(r"""
     (() => {
-      const el = document.querySelector('input[type="text"], textarea') || document.querySelector('[role="textbox"]');
-      if (!el || el.offsetParent === null) return {found: false};
-      el.focus();
-      return {found: true};
-    })()
-    """)
-    if not inp or not inp.get("found"):
-        raise RuntimeError("rename_chat: rename input not found")
-    wait(0.4)
-    press_key("Meta+A")
-    wait(0.4)
-    type_text(new_title)
-    wait(0.6)
-    # save: blur + synthetic Enter (plain Return keypress did not save)
-    js(r"""
-    (() => {
-      const el = document.querySelector('input[type="text"], textarea');
-      if (!el) return null;
+      const title = %r;
+      const el = [...document.querySelectorAll('input[aria-label="聊天标题"], input[aria-label="Chat title"]')]
+        .find(x => x.offsetParent);
+      if (!el) return {found: false};
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(el, title);
+      el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: title}));
+      el.dispatchEvent(new Event('change', {bubbles: true}));
       el.blur();
-      el.dispatchEvent(new Event('blur', {bubbles: true}));
-      el.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', code: 'Enter', bubbles: true, cancelable: true}));
-      el.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', code: 'Enter', bubbles: true}));
-      return true;
+      const form = document.querySelector('form[data-type="unified-composer"]');
+      if (!form || !form.offsetParent) return {found: false, blurred: document.activeElement !== el};
+      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+        const event = type.startsWith('pointer')
+          ? new PointerEvent(type, {bubbles: true, cancelable: true, pointerId: 1,
+              pointerType: 'mouse', isPrimary: true, button: 0,
+              buttons: type.endsWith('down') ? 1 : 0})
+          : new MouseEvent(type, {bubbles: true, cancelable: true, button: 0,
+              buttons: type.endsWith('down') ? 1 : 0});
+        form.dispatchEvent(event);
+      }
+      return {found: true, blurred: document.activeElement !== el, commit_dispatched: true};
     })()
-    """)
-    wait(2.0)
-    # verify new title in sidebar
+    """ % new_title)
+    if (not edited or not edited.get("found") or not edited.get("blurred") or
+            not edited.get("commit_dispatched")):
+        raise RuntimeError("rename_chat: title input commit sequence could not be dispatched")
+
+    wait(1.5)
     check = js(r"""
     (() => {
       const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-      const a = [...document.querySelectorAll('a[href*="/c/"]')].find(x => x.offsetParent && norm(x.innerText).includes(%r));
-      return a ? norm(a.innerText).split('\n')[0] : null;
+      const suffix = '/c/' + %r;
+      const a = [...document.querySelectorAll('a[href*="/c/"]')].find(x =>
+        x.offsetParent && new URL(x.href, location.href).pathname === suffix);
+      const inputGone = ![...document.querySelectorAll('input[aria-label="聊天标题"], input[aria-label="Chat title"]')]
+        .some(x => x.offsetParent);
+      const title = a ? norm(a.innerText || a.textContent).split('\n')[0] : null;
+      return {found: !!a, input_gone: inputGone, title: title};
     })()
-    """ % new_title)
-    if not check:
-        raise RuntimeError(f"rename_chat: renamed title {new_title!r} not found in sidebar")
-    return check
+    """ % conversation_id) or {}
+    if not check.get("found") or not check.get("input_gone") or check.get("title") != new_title:
+        raise RuntimeError(f"rename_chat: exact /c/{conversation_id} row did not save title {new_title!r}")
+
+    target_url = f"https://chatgpt.com/c/{conversation_id}"
+    goto_url("https://chatgpt.com/")
+    wait_for_load(timeout=20)
+    wait(1.5)
+    goto_url(target_url)
+    wait_for_load(timeout=20)
+    wait(2.0)
+    persisted = js(r"""
+    (() => {
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+      const suffix = '/c/' + %r;
+      const a = [...document.querySelectorAll('a[href*="/c/"]')].find(x =>
+        x.offsetParent && new URL(x.href, location.href).pathname === suffix);
+      const inputGone = ![...document.querySelectorAll('input[aria-label="聊天标题"], input[aria-label="Chat title"]')]
+        .some(x => x.offsetParent);
+      const title = a ? norm(a.innerText || a.textContent).split('\n')[0] : null;
+      return {found: !!a, input_gone: inputGone, title: title};
+    })()
+    """ % conversation_id) or {}
+    if not persisted.get("found") or not persisted.get("input_gone") or persisted.get("title") != new_title:
+        raise RuntimeError(f"rename_chat: exact /c/{conversation_id} title {new_title!r} did not persist after reload")
+    return persisted["title"]
 
 
 def toggle_user_message_expand(msg_index: int = 0) -> str:
@@ -749,7 +1072,11 @@ def send_and_wait(text: str, timeout: int = 180) -> str:
     has been stable for 2 consecutive polls. Returns the last assistant
     message text (truncated to 4000 chars).
     """
-    send_message(text)
+    send_evidence = send_message(text)
+    if send_evidence.get("status") != "definitely_sent":
+        raise RuntimeError(
+            f"send_and_wait: send status unknown at {send_evidence.get('url')}; do not retry automatically"
+        )
     last_txt = ""
     stable = 0
     deadline = time.time() + timeout

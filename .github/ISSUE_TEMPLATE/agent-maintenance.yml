@@ -1,5 +1,5 @@
 name: Agent maintenance report
-description: Report a verified problem, upstream change, or local enhancement for maintainer triage.
+description: Report a suspected or verified problem for maintainer reproduction and triage.
 title: "[agent] "
 labels: [agent-report, needs-triage]
 body:
@@ -23,11 +23,22 @@ body:
         - Upstream contribution candidate
     validations:
       required: true
+  - type: dropdown
+    id: evidence_type
+    attributes:
+      label: Evidence type
+      description: Static findings are welcome but are not accepted as real-browser proof.
+      options:
+        - Static / dry-run audit only (no real browser)
+        - Real isolated Agent Chrome reproduction (read-only)
+        - Real isolated Agent Chrome reproduction (dedicated test artifact)
+    validations:
+      required: true
   - type: textarea
     id: evidence
     attributes:
       label: Observed evidence
-      description: Actual output, screenshots, affected URL, and exact version. Redact secrets and private browser data.
+      description: Actual output, screenshots, affected URL, and exact version. State any unverified inference. Redact secrets and private browser data.
     validations:
       required: true
   - type: textarea
@@ -70,7 +81,9 @@ body:
       options:
         - label: I searched for duplicates.
           required: true
-        - label: I included real evidence rather than an assumption.
+        - label: I marked whether the evidence is static or from a real browser and did not present static evidence as live proof.
           required: true
         - label: I did not include tokens, cookies, auth files, or private browser data.
+          required: true
+        - label: I did not modify Browser Harness, Helper, or Domain Skill files and did not create a branch, commit, PR, or push.
           required: true
