@@ -43,9 +43,11 @@ PY
 | `delete_chat(fragment, confirm=True)` | Hover item → options (history-item-N-options) → 删除 → confirm dialog (`delete-conversation-confirm-button`). **Destructive — requires confirm=True** |
 | `select_model(name)` | Open the advanced or direct model submenu, select an exact visible radio, then reopen and require `aria-checked="true"` |
 | `set_reasoning_effort(level)` | Select the exact reasoning radio in either UI variant, then reopen and require `aria-checked="true"` |
-| `send_message(text)` | Require an initially empty unified composer, send once, and return `definitely_sent` or non-retryable `unknown` evidence, including activation exceptions |
-| `scroll_conversation(direction, amount)` | Wheel on the main `overflowY:auto` container; returns scrollTop |
+| `send_message(text)` | Require an initially empty unified composer, send once, and return `definitely_sent` or non-retryable `unknown` evidence. Long collapsed prompts can be proven by the rendered prefix, an unseen `data-message-id`, an increasing `conversation-turn-N`, and an emptied composer; transient `/c/WEB:...` routes are rejected until the canonical URL appears |
+| `scroll_conversation(direction, amount)` | Wheel on the main `overflowY:auto` container; returns scrollTop. Use only for ordinary viewport movement |
+| `page_conversation(direction, steps)` | Focus the main conversation scroller and send real PageUp/PageDown keys so ChatGPT's virtualizer renders the next page; returns scroll/message evidence |
 | `conversation_text(limit)` | Read last user/assistant turns from `[data-message-author-role]` nodes |
+| `read_markdown_block_summary(index=-1)` | Return the full text of a ChatGPT writing/Markdown editor block when a summary is rendered outside ordinary message text |
 | `close_extra_tab(fragment=None)` | Close most recently opened content tab; option to protect tabs by URL fragment |
 | `export_share_link(fragment=None)` | Export conversation as public link. Header `share-chat-button` copies conversation-level `/share/` link to clipboard directly (toast, no dialog). Fallback: message-level share → `/s/p_...` single-message link. **Link is public on the internet** |
 | `read_shared_conversation(url)` | Open share link in new tab, return visible conversation text, close tab |
@@ -73,6 +75,8 @@ PY
 - Main scroll container: the largest `div` with `overflowY:auto` and
   `scrollHeight > clientHeight + 50`. Note: the side "输出内容" pane is
   `overflowY:clip` (custom scroll) — not scrollable via wheel.
+- Long chats are virtualized: the DOM contains only the currently rendered page of `[data-message-author-role]` nodes. For full collection, call `page_conversation(..., steps=1)` repeatedly and collect after every call until `moved` stays false; assigning `scrollTop` alone is not proof of full coverage.
+- Markdown/document summaries can render in `.writing-block-editor`, `.mt4SwW_editor`, or `[data-writing-block-fullscreen-editor]` instead of ordinary message text. Use `read_markdown_block_summary()` before concluding the summary is missing or truncated.
 - ChatGPT may auto-rename a new chat. Title fragments are acceptable for read-only discovery. `rename_chat` requires an exact ChatGPT conversation URL/path/ID; `delete_chat` still accepts a title fragment but requires exactly one matching row and never falls back to another row's options button.
 - New chats only appear in the sidebar after the first message is sent.
 
@@ -83,7 +87,8 @@ PY
 - `select_model` / `set_reasoning_effort` change the composer state: restore
   the previous model/effort after a test (verified pattern: switch then switch
   back and re-check the exact radio's `aria-checked` state).
-- `send_message()` may return `status="unknown"` after a click. Never resend an unknown result; inspect the returned URL and conversation before deciding what happened.
+- `send_message()` may return `status="unknown"` after a click. Never resend an unknown result; inspect the returned URL and conversation before deciding what happened. Route/context-transition exceptions during post-click evidence polling are retried until the evidence timeout, then converted to non-retryable `unknown`.
+- ChatGPT can expose a transient `/c/WEB:<temporary-id>` route immediately after send. It is not an exact conversation identity and must never be passed to rename/delete helpers; wait for the canonical `/c/<id>` URL.
 - Sidebar mutation helpers must never fall back to another row's options button. An absent or ambiguous exact target is a hard failure.
 - Login walls/payment UI: stop and ask Ye Lin; never type credentials.
 
