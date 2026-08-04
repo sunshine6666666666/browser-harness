@@ -142,8 +142,8 @@ def new_chat() -> dict[str, Any]:
     if "/c/" in before_url and after_url == before_url:
         raise RuntimeError("new_chat: unchanged existing conversation is not a fresh chat")
     path = state.get("path") or ""
-    if path != "/" and "/c/" not in path:
-        raise RuntimeError(f"new_chat: unexpected URL after click ({after_url})")
+    if path != "/":
+        raise RuntimeError(f"new_chat: fresh home path required after click ({after_url})")
     return state
 
 
