@@ -37,6 +37,7 @@
     "framer": ["framer.com", "*.framer.com"],
     "fred": ["fred.stlouisfed.org", "api.stlouisfed.org"],
     "g2": ["g2.com", "*.g2.com"],
+    "gemini": ["gemini.google.com", "*.gemini.google.com"],
     "genius": ["genius.com", "*.genius.com"],
     "github": ["github.com", "*.github.com", "githubusercontent.com", "*.githubusercontent.com"],
     "glassdoor": ["glassdoor.com", "*.glassdoor.com"],
