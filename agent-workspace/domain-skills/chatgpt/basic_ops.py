@@ -7,7 +7,9 @@ Chinese UI (direct capability radios + current-model submenu, sidebar history it
 
 Covered lifecycle: open site, new chat, switch chat, delete chat,
 select model, set reasoning effort, send message, scroll conversation,
-close tab. Settings/personalization are intentionally out of scope.
+close tab. Deep Research (深度研究) lives in the companion
+deep_research.py (arm / progress / export).
+Settings/personalization are intentionally out of scope.
 
 All element targeting is DOM/aria/testid based; coordinates are computed
 at runtime via getBoundingClientRect, never hardcoded.
