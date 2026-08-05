@@ -5,7 +5,8 @@ on ChatGPT Pro account (model picker shows `5.6 Sol 中` style).
 
 Scope: the full "create a conversation" lifecycle — open site, new chat,
 switch chat, delete chat, select model, set reasoning effort, send message,
-scroll conversation, close tab. **Settings/personalization/workspace
+scroll conversation, close tab, plus Deep Research (深度研究) via the
+companion `deep_research.py` module. **Settings/personalization/workspace
 management are intentionally out of scope** (per Ye Lin).
 
 ## Invocation
@@ -56,6 +57,46 @@ PY
 | `expand_all_user_messages()` | Expand every collapsed long prompt; returns count |
 | `send_and_wait(text, timeout=180)` | Require `definitely_sent`, then poll until reply finishes; an unknown send stops without retrying |
 | `switch_header_tab('聊天'\|'工作')` | Toggle the top header 聊天/工作 (chat/workspace) radio tabs. Named to avoid shadowing the harness's built-in `switch_tab` (browser tab switcher) |
+
+## Deep Research (深度研究) — companion `deep_research.py`
+
+Verified 2026-08-05 with a real minimal DR run on the Chinese UI (Pro account).
+Load the companion module alongside `basic_ops.py`:
+
+```python
+exec(open(".../domain-skills/chatgpt/basic_ops.py").read())
+exec(open(".../domain-skills/chatgpt/deep_research.py").read())
+```
+
+| Function | Behavior |
+|---|---|
+| `arm_deep_research()` | Open composer `+` menu (`composer-plus-btn`, aria 添加文件等), click the 深度研究 text-leaf row (plain DIV, not `menuitemradio`), verify the composer shows the 深度研究 pill. Does NOT send anything |
+| `disarm_deep_research()` | Remove the pill by clicking the composer token then Backspace; verify it is gone. Clicking the `+` row again would ADD a second token — never use that to toggle off |
+| `deep_research_progress()` | Resolve `iframe_target('connector-openai-deep-research')`, read the NESTED `iframe#root` body (the outer connector body is empty). Returns `state`: `idle` (no connector yet) / `planning` / `running` / `done` / `unknown`, plus `text` |
+| `export_deep_research_markdown(timeout=30)` | Inside the connector iframe click the 导出 icon (`aria-label=导出`), then 导出到 Markdown; waits for the newest non-empty `~/Downloads/deep-research-report (N).md` and returns its absolute path |
+| `run_deep_research(question, poll_interval=8, timeout=900, export=True)` | Arm + type question + send + poll until `done`; optionally export. **Consumes a real Pro Deep Research quota run** |
+
+DR UI facts:
+
+- Menu rows under `+` are plain DIVs; the 深度研究 row is a text-leaf whose
+  normalized text is exactly 深度研究 inside an ancestor whose normalized
+  text is exactly `深度研究 获取详细报告`.
+- After arming, the composer shows a blue 深度研究 pill as a span/token inside
+  `form[data-type="unified-composer"]` (not a button). Verify via form innerText.
+- Progress runs in a sandbox iframe
+  `https://connector-openai-deep-research.web-sandbox.oaiusercontent.com/...`
+  (hyphenated name). Real progress/report text is inside nested
+  `iframe#root`; the outer connector body is empty. Never judge completion by
+  main-page text length — the main page can stay prompt-only the whole run.
+- Running state: plan title + step checklist + `正在研究…` / `停止研究`.
+  Completion: `研究完成情况：<time> · N 次引用 · N 个搜索` plus the report
+  body and `停止研究` gone.
+- Export control is inside the connector iframe, NOT the main-page top bar:
+  icon `aria-label=导出` → menu 复制内容 / 导出到 Markdown / 导出到 Word /
+  导出到 PDF. Markdown download lands in `~/Downloads/deep-research-report (N).md`.
+- All clicks use the full pointer sequence (`pointerdown → mousedown → pointerup
+  → mouseup → click`); the small composer `+` control may ignore a bare DOM
+  click, and CDP mouse events time out on this SPA.
 
 ## UI facts / selectors (Chinese UI)
 
