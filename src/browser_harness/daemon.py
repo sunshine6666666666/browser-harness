@@ -363,6 +363,71 @@ class Daemon:
         self.events = deque(maxlen=BUF)
         self.dialog = None
         self.stop = None  # asyncio.Event, set inside start()
+        # Tab protection registry for shared/multi-agent browsers.
+        # by_target: targetId -> {"owner","purpose","url_contains","protected_at"}
+        # by_url:    URL substring -> same entry shape (protects any tab whose
+        #            URL contains the substring, e.g. a session URL pattern).
+        # Loaded lazily from config_dir on first use so tests that never touch
+        # protection do not need a writable config dir.
+        self.protected = {"by_target": {}, "by_url": {}}
+        self._protected_loaded = False
+        self._protected_path = None
+
+    def _ensure_protected_loaded(self):
+        if self._protected_loaded:
+            return
+        self._protected_loaded = True
+        self._protected_path = paths.config_dir() / f"tab-protections-{NAME}.json"
+        try:
+            data = json.loads(self._protected_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("schema_version") == 1:
+                self.protected = {
+                    "by_target": data.get("by_target", {}),
+                    "by_url": data.get("by_url", {}),
+                }
+        except (OSError, ValueError):
+            pass
+
+    def _save_protected(self):
+        self._ensure_protected_loaded()
+        p = self._protected_path
+        if p is None:
+            return
+        try:
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(
+                {"schema_version": 1, "by_target": self.protected["by_target"], "by_url": self.protected["by_url"]},
+                ensure_ascii=False, indent=2,
+            ), encoding="utf-8")
+            tmp.replace(p)
+        except OSError as e:
+            log(f"protect: failed to persist tab protections: {e}")
+
+    async def _protected_match(self, target_id):
+        """Protection entry for a target, or None. Exact targetId match wins;
+        otherwise a URL-substring pattern match against the target's live URL."""
+        entry = self.protected["by_target"].get(target_id)
+        if entry:
+            return entry
+        if not self.protected["by_url"]:
+            return None
+        cdp = self.cdp
+        if cdp is None:
+            return None
+        try:
+            info = (await cdp.send_raw("Target.getTargetInfo", {"targetId": target_id})).get("targetInfo", {})
+            url = info.get("url", "")
+        except Exception:
+            return None
+        for pattern, entry in self.protected["by_url"].items():
+            if pattern and pattern in url:
+                return entry
+        return None
+
+    def _clear_target_protection(self, target_id):
+        """Drop an exact-target protection after the tab is gone (closed)."""
+        if self.protected["by_target"].pop(target_id, None) is not None:
+            self._save_protected()
 
     async def attach_first_page(self):
         """Attach to a real page (or any page). Sets self.session. Returns attached target or None."""
@@ -561,10 +626,77 @@ class Daemon:
             )))
             return {"session_id": self.session}
         if meta == "pending_dialog": return {"dialog": self.dialog}
+        if meta == "protect_tab":
+            self._ensure_protected_loaded()
+            target_id = req.get("target_id")
+            url_contains = req.get("url_contains") or None
+            if not target_id and not url_contains:
+                return {"error": "protect_tab requires target_id or url_contains"}
+            entry = {
+                "owner": req.get("owner") or "unknown",
+                "purpose": req.get("purpose") or "",
+                "url_contains": url_contains,
+                "protected_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            }
+            if url_contains:
+                self.protected["by_url"][url_contains] = entry
+            else:
+                self.protected["by_target"][target_id] = entry
+            self._save_protected()
+            return {"protected": {**entry, "target_id": target_id}}
+        if meta == "unprotect_tab":
+            self._ensure_protected_loaded()
+            target_id = req.get("target_id")
+            url_contains = req.get("url_contains") or None
+            removed = False
+            if target_id and target_id in self.protected["by_target"]:
+                del self.protected["by_target"][target_id]
+                removed = True
+            if url_contains and url_contains in self.protected["by_url"]:
+                del self.protected["by_url"][url_contains]
+                removed = True
+            if removed:
+                self._save_protected()
+            return {"removed": removed}
+        if meta == "protected_tabs":
+            self._ensure_protected_loaded()
+            out = [{"target_id": tid, **e} for tid, e in self.protected["by_target"].items()]
+            out += [{"target_id": None, **e} for e in self.protected["by_url"].values()]
+            return {"protected": out}
         if meta == "shutdown":    self.stop.set(); return {"ok": True}
 
         method = req["method"]
         params = req.get("params") or {}
+        # Tab protection: refuse to close protected tabs unless the caller
+        # explicitly passes force=True. Enforced daemon-side so every close
+        # path (close_tab(), raw cdp("Target.closeTarget", ...), domain skills)
+        # is covered on the shared Agent Chrome instance.
+        if method == "Target.closeTarget":
+            target_id = params.get("targetId")
+            force = bool(params.pop("force", False))
+            if target_id:
+                hit = await self._protected_match(target_id)
+                if hit and not force:
+                    return {"error": (
+                        f"tab_protected: target {target_id} is protected by "
+                        f"{hit.get('owner') or 'unknown'} ({hit.get('purpose') or 'no purpose'}"
+                        f"{('; url_contains=' + hit['url_contains']) if hit.get('url_contains') else ''}); "
+                        "pass force=True to close anyway"
+                    )}
+            cdp = self.cdp
+            if cdp is None:
+                return {"error": "cdp_disconnected"}
+            try:
+                result = await cdp.send_raw(method, params, session_id=None)
+            except Exception as e:
+                msg = str(e)
+                if "No target with given id found" in msg and target_id:
+                    self._clear_target_protection(target_id)
+                    msg += " (cleared stale protection entry)"
+                return {"error": msg}
+            if target_id:
+                self._clear_target_protection(target_id)
+            return {"result": result}
         # Browser-level Target.* calls must not use a session (stale or otherwise).
         # For everything else, explicit session in req wins; else default.
         sid = None if method.startswith("Target.") else (req.get("session_id") or self.session)

@@ -95,6 +95,7 @@ Cloud profile cookie sync reference: https://github.com/browser-use/browser-harn
 - Fall back to raw HTML via `js(...)` only when the AX tree lacks the element (canvas, exotic widgets); screenshot when layout or imagery matters.
 - After navigation, call `wait_for_load()`.
 - If the current tab is stale or internal, call `ensure_real_tab()`.
+- **Shared browser safety:** Agent Chrome is shared by multiple agents. Only close tabs your own `new_tab()` returned; never batch-close by URL/domain filter. Protect work tabs with `protect_tab(...)` and check `tab_owner(tid)` before closing tabs you did not open (details in `interaction-skills/tabs.md`).
 - Use `js(...)` for DOM inspection or extraction when coordinates are the wrong tool.
 - Login walls: stop and ask. Exception: use available SSO automatically when Chrome is already signed in; still stop for passwords, MFA, consent, or ambiguous account choice.
 - Raw CDP is available with `cdp("Domain.method", ...)`.

@@ -408,3 +408,124 @@ def test_wait_for_network_idle_filters_events_to_active_session():
         "session filter, the background rWS/lF pair would have updated "
         "last_activity and prevented the idle window from elapsing."
     )
+
+
+# --- tab protection (issue #11: shared agent Chrome ownership) ---
+
+def test_list_tabs_annotates_protected_owner_and_purpose():
+    fake_send = {
+        "protected_tabs": {"protected": [
+            {"target_id": "t-1", "owner": "researchbot", "purpose": "deep research", "url_contains": None, "protected_at": "x"},
+        ]}
+    }
+    targets = {
+        "targetInfos": [
+            {"targetId": "t-1", "type": "page", "title": "A", "url": "https://chatgpt.com/c/abc"},
+            {"targetId": "t-2", "type": "page", "title": "B", "url": "https://example.com/"},
+        ]
+    }
+    with patch("browser_harness.helpers._send", side_effect=lambda req: fake_send[req["meta"]]), \
+         patch("browser_harness.helpers.cdp", return_value=targets):
+        tabs = helpers.list_tabs()
+
+    by_id = {t["targetId"]: t for t in tabs}
+    assert by_id["t-1"]["protected"] is True
+    assert by_id["t-1"]["owner"] == "researchbot"
+    assert by_id["t-1"]["purpose"] == "deep research"
+    assert by_id["t-2"]["protected"] is False
+    assert by_id["t-2"]["owner"] is None
+    assert by_id["t-2"]["purpose"] is None
+
+
+def test_list_tabs_degrades_when_daemon_does_not_support_protection():
+    def fake_send(req):
+        if req["meta"] == "protected_tabs":
+            raise RuntimeError("unknown meta")
+        return {}
+    with patch("browser_harness.helpers._send", side_effect=fake_send), \
+         patch("browser_harness.helpers.cdp", return_value={"targetInfos": [
+             {"targetId": "t-1", "type": "page", "title": "A", "url": "https://example.com/"},
+         ]}):
+        tabs = helpers.list_tabs()
+    assert tabs[0]["protected"] is False
+    assert tabs[0]["owner"] is None
+
+
+def test_protect_tab_sends_meta_with_current_tab_when_target_omitted():
+    sent = {}
+
+    def fake_send(req):
+        sent.update(req)
+        if req.get("meta") == "current_tab":
+            return {"targetId": "t-current", "url": "https://example.com/", "title": "T"}
+        if req.get("meta") == "protect_tab":
+            return {"protected": {"target_id": "t-current", "owner": "devkeeper", "purpose": "verification"}}
+        return {}
+
+    with patch("browser_harness.helpers._send", side_effect=fake_send):
+        entry = helpers.protect_tab(owner="devkeeper", purpose="verification")
+
+    assert sent["meta"] == "protect_tab"
+    assert sent["target_id"] == "t-current"
+    assert entry["target_id"] == "t-current"
+
+
+def test_protect_tab_by_url_contains_does_not_require_target():
+    sent = {}
+
+    def fake_send(req):
+        sent.update(req)
+        return {"protected": {"target_id": None, "owner": "researchbot", "url_contains": "chatgpt.com/c/"}}
+
+    with patch("browser_harness.helpers._send", side_effect=fake_send):
+        entry = helpers.protect_tab(url_contains="chatgpt.com/c/", owner="researchbot")
+
+    assert sent["url_contains"] == "chatgpt.com/c/"
+    assert "target_id" not in sent or sent["target_id"] is None
+
+
+def test_unprotect_tab_returns_removed_flag():
+    def fake_send(req):
+        return {"removed": True}
+
+    with patch("browser_harness.helpers._send", side_effect=fake_send):
+        assert helpers.unprotect_tab("t-1") is True
+
+
+def test_close_tab_passes_force_flag():
+    called = {}
+
+    def fake_cdp(method, **params):
+        called["method"] = method
+        called["params"] = params
+        return {}
+
+    with patch("browser_harness.helpers.cdp", side_effect=fake_cdp):
+        helpers.close_tab("t-1", force=True)
+
+    assert called["method"] == "Target.closeTarget"
+    assert called["params"] == {"targetId": "t-1", "force": True}
+
+
+def test_close_tab_defaults_force_false():
+    called = {}
+
+    def fake_cdp(method, **params):
+        called["params"] = params
+        return {}
+
+    with patch("browser_harness.helpers.cdp", side_effect=fake_cdp):
+        helpers.close_tab("t-1")
+
+    assert called["params"] == {"targetId": "t-1", "force": False}
+
+
+def test_tab_owner_returns_entry_or_none():
+    def fake_send(req):
+        return {"protected": [
+            {"target_id": "t-1", "owner": "researchbot", "purpose": "session", "url_contains": None, "protected_at": "x"},
+        ]}
+
+    with patch("browser_harness.helpers._send", side_effect=fake_send):
+        assert helpers.tab_owner("t-1")["owner"] == "researchbot"
+        assert helpers.tab_owner("t-other") is None

@@ -293,3 +293,123 @@ def test_current_tab_meta_returns_not_attached_when_no_target_id():
     assert result == {"error": "not_attached"}
     # No CDP call should have been issued.
     assert d.cdp.calls == []
+
+
+# --- tab protection (issue #11: shared agent Chrome ownership) ---
+
+class _CloseTrackingCDP(_FakeCDP):
+    """Tracks closeTarget calls and can answer Target.getTargetInfo for URL match tests."""
+
+    def __init__(self, urls=None):
+        super().__init__()
+        self.urls = urls or {}  # targetId -> url
+
+    async def send_raw(self, method, params=None, session_id=None):
+        self.calls.append((method, params, session_id))
+        if method == "Target.getTargetInfo":
+            url = self.urls.get(params.get("targetId"), "")
+            return {"targetInfo": {"targetId": params.get("targetId"), "url": url, "title": "", "type": "page"}}
+        return {}
+
+
+def _fresh_protect_daemon(tmp_path, monkeypatch, urls=None):
+    monkeypatch.setenv("BH_CONFIG_DIR", str(tmp_path))
+    d = daemon.Daemon()
+    d.cdp = _CloseTrackingCDP(urls=urls)
+    return d
+
+
+def test_protect_tab_registers_and_lists(tmp_path, monkeypatch):
+    d = _fresh_protect_daemon(tmp_path, monkeypatch)
+
+    r = asyncio.run(d.handle({"meta": "protect_tab", "target_id": "t-1", "owner": "researchbot", "purpose": "deep research session"}))
+    assert r["protected"]["owner"] == "researchbot"
+    assert r["protected"]["target_id"] == "t-1"
+
+    listed = asyncio.run(d.handle({"meta": "protected_tabs"}))
+    assert listed["protected"] == [{"target_id": "t-1", "owner": "researchbot", "purpose": "deep research session", "url_contains": None, "protected_at": r["protected"]["protected_at"]}]
+
+
+def test_protect_tab_requires_target_or_url_pattern(tmp_path, monkeypatch):
+    d = _fresh_protect_daemon(tmp_path, monkeypatch)
+    r = asyncio.run(d.handle({"meta": "protect_tab"}))
+    assert r == {"error": "protect_tab requires target_id or url_contains"}
+
+
+def test_close_target_blocked_for_protected_tab(tmp_path, monkeypatch):
+    d = _fresh_protect_daemon(tmp_path, monkeypatch)
+    asyncio.run(d.handle({"meta": "protect_tab", "target_id": "t-1", "owner": "researchbot", "purpose": "keep open"}))
+
+    r = asyncio.run(d.handle({"method": "Target.closeTarget", "params": {"targetId": "t-1"}}))
+
+    assert "tab_protected" in r.get("error", "")
+    # The close must NOT reach the browser.
+    assert all(m != "Target.closeTarget" for (m, _p, _s) in d.cdp.calls)
+
+
+def test_close_target_force_bypasses_protection_and_clears_entry(tmp_path, monkeypatch):
+    d = _fresh_protect_daemon(tmp_path, monkeypatch)
+    asyncio.run(d.handle({"meta": "protect_tab", "target_id": "t-1", "owner": "researchbot", "purpose": "keep open"}))
+
+    r = asyncio.run(d.handle({"method": "Target.closeTarget", "params": {"targetId": "t-1", "force": True}}))
+
+    assert r == {"result": {}}
+    close_calls = [(m, p) for (m, p, _s) in d.cdp.calls if m == "Target.closeTarget"]
+    assert close_calls == [("Target.closeTarget", {"targetId": "t-1"})], "force must be stripped before forwarding"
+    # Protection entry removed after a forced close.
+    listed = asyncio.run(d.handle({"meta": "protected_tabs"}))
+    assert listed["protected"] == []
+
+
+def test_close_target_blocked_by_url_contains_pattern(tmp_path, monkeypatch):
+    urls = {"t-chat": "https://chatgpt.com/c/6a7305c9-abc"}
+    d = _fresh_protect_daemon(tmp_path, monkeypatch, urls=urls)
+    asyncio.run(d.handle({"meta": "protect_tab", "url_contains": "chatgpt.com/c/6a7305c9", "owner": "researchbot", "purpose": "session tab"}))
+
+    r = asyncio.run(d.handle({"method": "Target.closeTarget", "params": {"targetId": "t-chat"}}))
+    assert "tab_protected" in r.get("error", "")
+    assert "url_contains=chatgpt.com/c/6a7305c9" in r.get("error", "")
+    assert all(m != "Target.closeTarget" for (m, _p, _s) in d.cdp.calls)
+
+
+def test_unprotect_tab_removes_entry(tmp_path, monkeypatch):
+    d = _fresh_protect_daemon(tmp_path, monkeypatch)
+    asyncio.run(d.handle({"meta": "protect_tab", "target_id": "t-1", "owner": "devkeeper"}))
+    r = asyncio.run(d.handle({"meta": "unprotect_tab", "target_id": "t-1"}))
+    assert r == {"removed": True}
+    assert asyncio.run(d.handle({"meta": "protected_tabs"}))["protected"] == []
+    # Closing is allowed again.
+    rr = asyncio.run(d.handle({"method": "Target.closeTarget", "params": {"targetId": "t-1"}}))
+    assert rr == {"result": {}}
+
+
+def test_protection_persists_across_daemon_restart(tmp_path, monkeypatch):
+    d1 = _fresh_protect_daemon(tmp_path, monkeypatch)
+    asyncio.run(d1.handle({"meta": "protect_tab", "target_id": "t-persist", "owner": "researchbot", "purpose": "long session"}))
+
+    d2 = _fresh_protect_daemon(tmp_path, monkeypatch)
+    listed = asyncio.run(d2.handle({"meta": "protected_tabs"}))
+    assert listed["protected"][0]["target_id"] == "t-persist"
+    assert listed["protected"][0]["owner"] == "researchbot"
+
+    # Protection survives restart too: close still refused.
+    r = asyncio.run(d2.handle({"method": "Target.closeTarget", "params": {"targetId": "t-persist"}}))
+    assert "tab_protected" in r.get("error", "")
+
+
+def test_stale_protection_cleared_when_target_gone(tmp_path, monkeypatch):
+    d = _fresh_protect_daemon(tmp_path, monkeypatch)
+    asyncio.run(d.handle({"meta": "protect_tab", "target_id": "t-gone", "owner": "devkeeper"}))
+
+    class _GoneCDP(_FakeCDP):
+        async def send_raw(self, method, params=None, session_id=None):
+            self.calls.append((method, params, session_id))
+            if method == "Target.closeTarget":
+                raise RuntimeError("No target with given id found")
+            return {}
+
+    d.cdp = _GoneCDP()
+    r = asyncio.run(d.handle({"method": "Target.closeTarget", "params": {"targetId": "t-gone", "force": True}}))
+    assert "No target with given id found" in r.get("error", "")
+    assert "cleared stale protection entry" in r.get("error", "")
+    assert asyncio.run(d.handle({"meta": "protected_tabs"}))["protected"] == []

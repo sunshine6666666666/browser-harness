@@ -316,16 +316,26 @@ def _is_agent_startup_placeholder(title, url):
 
 def list_tabs(include_chrome=True):
     out = []
+    try:
+        protected = _send({"meta": "protected_tabs"}).get("protected", [])
+    except RuntimeError:
+        # Older daemon without protection support — degrade gracefully.
+        protected = []
+    prot_by_id = {p.get("target_id"): p for p in protected if p.get("target_id")}
     for t in cdp("Target.getTargets")["targetInfos"]:
         if t["type"] != "page": continue
         url = t.get("url", "")
         if _is_agent_startup_placeholder(t.get("title", ""), url): continue
         if not include_chrome and url.startswith(INTERNAL): continue
+        p = prot_by_id.get(t["targetId"]) or {}
         out.append({
             "targetId": t["targetId"],
             "target_id": t["targetId"],
             "title": t.get("title", ""),
             "url": url,
+            "protected": bool(p),
+            "owner": p.get("owner"),
+            "purpose": p.get("purpose"),
         })
     return out
 
@@ -381,13 +391,64 @@ def new_tab(url="about:blank"):
         goto_url(url)
     return tid
 
-def close_tab(target=None):
+def _resolve_target_id(target):
+    """Accept a raw targetId string or a dict from list_tabs()/current_tab()."""
+    if isinstance(target, dict):
+        return target.get("targetId") or target.get("target_id")
+    return target
+
+def protect_tab(target=None, owner=None, purpose=None, url_contains=None):
+    """Protect a tab from accidental close by other agents sharing this Chrome.
+
+    `target` accepts a raw targetId string or a dict from list_tabs()/current_tab();
+    if omitted, protects the currently attached tab. Alternatively pass
+    `url_contains` (e.g. "chatgpt.com/c/6a7305c9") to protect any tab whose URL
+    contains that substring, even if it is opened later. Protected tabs refuse
+    `close_tab()` / `Target.closeTarget` unless `force=True` is passed.
+    Returns the protection entry dict."""
+    target_id = _resolve_target_id(target)
+    if target_id is None and not url_contains:
+        target_id = current_tab()["targetId"]
+    r = _send({
+        "meta": "protect_tab",
+        "target_id": target_id,
+        "owner": owner,
+        "purpose": purpose,
+        "url_contains": url_contains,
+    })
+    return r["protected"]
+
+def unprotect_tab(target=None, url_contains=None):
+    """Remove protection from a tab (or a url_contains pattern)."""
+    target_id = _resolve_target_id(target)
+    if target_id is None and not url_contains:
+        target_id = current_tab()["targetId"]
+    return _send({
+        "meta": "unprotect_tab",
+        "target_id": target_id,
+        "url_contains": url_contains,
+    })["removed"]
+
+def protected_tabs():
+    """List protection entries: [{target_id, owner, purpose, url_contains, protected_at}, ...]"""
+    return _send({"meta": "protected_tabs"}).get("protected", [])
+
+def tab_owner(target):
+    """Return the protection entry for a tab (owner/purpose), or None if unprotected."""
+    target_id = _resolve_target_id(target)
+    for p in protected_tabs():
+        if p.get("target_id") == target_id:
+            return p
+    return None
+
+def close_tab(target=None, force=False):
     """Close a tab. If `target` is omitted, closes the currently attached tab.
-    Accepts a raw targetId string or a dict from list_tabs()/current_tab()."""
-    target_id = (target.get("targetId") or target.get("target_id")) if isinstance(target, dict) else target
+    Accepts a raw targetId string or a dict from list_tabs()/current_tab().
+    Protected tabs refuse to close unless `force=True`."""
+    target_id = _resolve_target_id(target)
     if target_id is None:
         target_id = current_tab()["targetId"]
-    cdp("Target.closeTarget", targetId=target_id)
+    cdp("Target.closeTarget", targetId=target_id, force=force)
 
 
 def ensure_real_tab():

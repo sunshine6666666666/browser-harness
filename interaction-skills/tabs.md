@@ -67,3 +67,38 @@ Typical tools:
 - `chrome://omnibox-popup.top-chrome/` can appear as a fake page target; ignore it for user-facing tab lists.
 - If a page has `w=0 h=0`, you may be attached to the wrong target or a non-window surface.
 - For dynamic UIs, re-read element rects after opening dropdowns / modals before coordinate-clicking.
+
+## Shared instance tab safety (multi-agent)
+
+The Agent Chrome (BU_NAME=agent, port 9223) is a **shared browser**: multiple
+Hermes agents (researchbot, devkeeper, ...) use it at the same time. A tab you
+see is usually another agent's live work — they judge task state by "open tabs +
+screenshots", so closing their tab breaks their workflow even though the session
+data stays recoverable server-side.
+
+**Safe closing conventions (mandatory):**
+- Only close tabs **your own `new_tab()` returned** (keep a targetId whitelist).
+- Never batch-close by URL/domain filter (e.g. `'chatgpt.com' in url`). That is
+  exactly what caused issue #11 — it closed 3 other agents' work tabs.
+- When you need to close a tab you did not open, check ownership first:
+  `tab_owner(tid)` → returns the protection entry or `None`.
+
+**Protection API (issue #11):**
+```python
+protect_tab(tid, owner="devkeeper", purpose="Issue #11 verification")  # protect a specific tab
+protect_tab(owner="researchbot", purpose="Deep Research session")      # protect current tab
+protect_tab(url_contains="chatgpt.com/c/6a7305c9", owner="researchbot",
+            purpose="session tab")                                     # protect by URL pattern
+list_tabs()        # each tab now includes protected / owner / purpose
+tab_owner(tid)     # -> protection entry or None
+unprotect_tab(tid) # remove protection when you are done
+close_tab(tid)               # raises RuntimeError("tab_protected: ...") if protected
+close_tab(tid, force=True)   # only when you own it — bypasses protection and clears the entry
+```
+
+- Protection is enforced **daemon-side**: even a raw
+  `cdp("Target.closeTarget", targetId=...)` refuses protected tabs unless
+  `force=True` is passed. Entries persist across daemon restarts in the config
+  dir (`tab-protections-<BU_NAME>.json`).
+- Protect tabs you are actively working on so other agents' cleanup cannot
+  close them; unprotect when the work is done.
