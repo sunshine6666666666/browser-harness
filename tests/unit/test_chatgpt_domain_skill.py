@@ -109,6 +109,8 @@ def test_open_model_picker_uses_dom_click_instead_of_cdp_coordinates():
     menu_counts = iter([0, 1, 1])
 
     def fake_js(script):
+        if "querySelectorAll('[role=\"menu\"]')" in script and "模型" in script:
+            return False
         if "visibleMenus" in script:
             return next(menu_counts)
         if "const scoped =" in script:
@@ -147,6 +149,89 @@ def test_close_visible_menus_unwinds_every_open_layer():
     ops["_close_visible_menus"]()
 
     assert pressed == []
+
+def test_close_visible_menus_tolerates_usable_panel_after_cleanup_failure():
+    # Issue #12: a model/effort panel that stays visible after trigger/Escape
+    # cleanup but is fully usable must not be reported as a hard failure.
+    counts = iter([2, 1, 1, 1, 1, 1])
+    pressed = []
+
+    def fake_js(script):
+        if "visibleMenus" in script:
+            return next(counts)
+        if "form[data-type=\"unified-composer\"]" in script:
+            return {"found": True}
+        if "querySelectorAll('[role=\"menu\"]')" in script and "模型" in script:
+            return True
+        raise AssertionError(f"unexpected JS: {script[:80]}")
+
+    ops = load_ops(fake_js, press_impl=pressed.append)
+    ops["_close_visible_menus"](tolerate_usable=True)
+
+    assert pressed == ["Escape"] * 4
+
+
+def test_close_visible_menus_still_raises_without_tolerate_usable():
+    counts = iter([2, 1, 1, 1, 1, 1])
+
+    def fake_js(script):
+        if "visibleMenus" in script:
+            return next(counts)
+        if "form[data-type=\"unified-composer\"]" in script:
+            return {"found": True}
+        if "querySelectorAll('[role=\"menu\"]')" in script and "模型" in script:
+            return True
+        raise AssertionError(f"unexpected JS: {script[:80]}")
+
+    ops = load_ops(fake_js)
+    with pytest.raises(RuntimeError, match="remained visible"):
+        ops["_close_visible_menus"]()
+
+
+def test_open_model_picker_reuses_already_usable_panel():
+    # Issue #12: when the model/effort panel is already open and usable,
+    # open_model_picker must reuse it instead of close→reopen raising a false
+    # cleanup failure.
+    def fake_js(script):
+        if "querySelectorAll('[role=\"menu\"]')" in script and "模型" in script:
+            return True
+        raise AssertionError(f"unexpected JS: {script[:80]}")
+
+    ops = load_ops(fake_js)
+    ops["open_model_picker"]()
+
+
+def test_set_reasoning_effort_tries_both_reasoning_labels():
+    # Issue #12: label drift 推理强度 → 思考强度. The helper must try the new
+    # label when the old one is not found. _verify_radio_after_reopen is mocked
+    # so the test stays focused on the label fallback in set_reasoning_effort.
+    requested = "中"
+    label_attempts = []
+
+    def fake_js(script):
+        if "visibleMenus" in script:
+            return 0
+        if "menuitemradio" in script and requested in script:
+            return {"found": True, "x": 30, "y": 30, "checked": True}
+        if "const pre" in script:
+            label_attempts.append(script.split("const pre = ")[1].split(";")[0].strip())
+            return {"found": False}
+        if "const norm" in script and "return el ? norm" in script:
+            return "中"
+        raise AssertionError(f"unexpected JS: {script[:120]}")
+
+    ops = load_ops(fake_js)
+    ops["open_model_picker"] = lambda: None
+    ops["_verify_radio_after_reopen"] = lambda name, *, model, first_token=False: {
+        "name": name, "checked": True
+    }
+
+    evidence = ops["set_reasoning_effort"](requested)
+
+    assert evidence["name"] == requested
+    assert evidence["checked"] is True
+    assert label_attempts == ["'推理强度'", "'思考强度'"]
+
 
 
 def test_select_model_supports_live_direct_submenu_and_verifies_exact_radio():
