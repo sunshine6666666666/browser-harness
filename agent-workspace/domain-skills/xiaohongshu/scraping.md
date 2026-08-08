@@ -1,5 +1,10 @@
 # Xiaohongshu — Search and Sort
 
+> **Mandatory behavior layer:** this file is a technical reference (page
+> structure, selectors, tokenized URLs). Actual scraping MUST follow
+> `xiaohongshu-humanized` — `domain-skills/xiaohongshu-humanized/scraping.md`
+> — which is the default enforced behavior for logged-in scraping sessions.
+
 URL patterns:
 - Home / discovery: `https://www.xiaohongshu.com/explore`
 - Search results: `https://www.xiaohongshu.com/search_result?keyword=...`

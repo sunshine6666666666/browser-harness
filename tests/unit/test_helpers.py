@@ -72,6 +72,26 @@ def test_registry_resolves_alias_and_multiple_skills(tmp_path, monkeypatch):
     assert len(result["domain_skill_directories"]) == 2
 
 
+def test_registry_returns_all_skills_for_identical_host_patterns(tmp_path, monkeypatch):
+    monkeypatch.setenv("BH_DOMAIN_SKILLS", "1")
+    monkeypatch.setattr(helpers, "AGENT_WORKSPACE", tmp_path)
+    root = tmp_path / "domain-skills"
+    for name in ("xiaohongshu", "xiaohongshu-humanized"):
+        site = root / name
+        site.mkdir(parents=True)
+        (site / "scraping.md").write_text(name)
+    (root / "registry.json").write_text(
+        '{"version":1,"skills":{'
+        '"xiaohongshu":["xiaohongshu.com","*.xiaohongshu.com"],'
+        '"xiaohongshu-humanized":["xiaohongshu.com","*.xiaohongshu.com"]}}'
+    )
+    result = helpers._domain_skill_context(
+        "https://www.xiaohongshu.com/search_result?keyword=test"
+    )
+    assert result["domain_skills"] == ["scraping.md", "scraping.md"]
+    assert len(result["domain_skill_directories"]) == 2
+
+
 def test_page_info_includes_domain_skills_after_new_tab_flow(tmp_path, monkeypatch):
     monkeypatch.setenv("BH_DOMAIN_SKILLS", "1")
     monkeypatch.setattr(helpers, "AGENT_WORKSPACE", tmp_path)

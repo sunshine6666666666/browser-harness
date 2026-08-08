@@ -96,6 +96,7 @@
     "world-bank": ["worldbank.org", "*.worldbank.org"],
     "x": ["x.com", "*.x.com", "twitter.com", "*.twitter.com"],
     "xiaohongshu": ["xiaohongshu.com", "*.xiaohongshu.com"],
+    "xiaohongshu-humanized": ["xiaohongshu.com", "*.xiaohongshu.com"],
     "youtube": ["youtube.com", "*.youtube.com", "youtu.be"],
     "zillow": ["zillow.com", "*.zillow.com", "redfin.com", "*.redfin.com"]
   }
