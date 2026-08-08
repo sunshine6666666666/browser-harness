@@ -327,8 +327,35 @@ def _activate_composer_picker() -> dict[str, Any]:
     """) or {"found": False}
 
 
-def _close_visible_menus(max_layers: int = 4) -> None:
-    """Close all visible picker layers, preferring the Radix trigger toggle."""
+def _usable_picker_panel() -> bool:
+    """True when a visible menu is an already-open usable model/effort panel.
+
+    Issue #12 (2026-08-08): the current ChatGPT UI renders the model/effort
+    panel as a Radix popper that stays 'open' even after trigger toggle and
+    Escape presses, while remaining fully usable (radios clickable, aria-checked
+    verifiable). Treat that as a successfully open panel instead of a cleanup
+    failure. Unrelated menus (e.g. 下载 ChatGPT 桌面版) never match.
+    """
+    return bool(js(r"""
+    (() => {
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+      return [...document.querySelectorAll('[role="menu"]')].some(el => {
+        if (!el.offsetParent) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        const t = norm(el.innerText || '');
+        return /模型|思考强度|推理强度|GPT-|高级|更快|更智能|极高/.test(t);
+      });
+    })()
+    """) or False)
+
+
+def _close_visible_menus(max_layers: int = 4, *, tolerate_usable: bool = False) -> None:
+    """Close all visible picker layers, preferring the Radix trigger toggle.
+
+    When tolerate_usable=True, a still-visible model/effort panel that is open
+    and usable is accepted (Issue #12 cleanup false-failure) instead of raising.
+    """
     if _visible_menu_count() == 0:
         return
     toggled = _activate_composer_picker()
@@ -341,6 +368,8 @@ def _close_visible_menus(max_layers: int = 4) -> None:
         wait(0.35)
         if _visible_menu_count() == 0:
             return
+    if tolerate_usable and _usable_picker_panel():
+        return
     raise RuntimeError("picker menus remained visible after trigger/Escape cleanup")
 
 
@@ -349,7 +378,13 @@ def open_model_picker() -> None:
 
     Handles both UI styles: model+effort (e.g. '5.6 Sol 中') and capability
     slider (e.g. '极高'). Then ensures the advanced view is expanded.
+
+    Issue #12 (2026-08-08): if the model/effort panel is already open and
+    usable (trigger toggle and Escape cannot dismiss this Radix popper), reuse
+    it instead of a close→reopen cycle that raises a false cleanup failure.
     """
+    if _usable_picker_panel():
+        return
     _close_visible_menus()
     r = _find_composer_picker()
     if not r or not r.get("found"):
@@ -380,7 +415,13 @@ def open_model_picker() -> None:
 
 
 def _click_advanced_item(prefix: str, required: bool = True) -> bool:
-    """Click an advanced-view menu item when that UI variant is present."""
+    """Click an advanced-view menu item when that UI variant is present.
+
+    UI label drift (2026-08-08): the reasoning group's submenu entry is currently
+    rendered as 思考强度 (older label: 推理强度). Callers that need the reasoning
+    radios should pass a candidate list via _click_advanced_item_any() or try both
+    labels explicitly; never rely on a single stale label.
+    """
     r = js(r"""
     (() => {
       const norm = s => (s || '').replace(/\s+/g, ' ').trim();
@@ -501,9 +542,9 @@ def _verify_radio_after_reopen(name: str, *, model: bool, first_token: bool = Fa
     if model:
         _open_model_choices()
     elif not _click_advanced_item("推理强度", required=False):
-        pass  # current UI exposes reasoning radios directly in the top-level menu
+        _click_advanced_item("思考强度", required=False)
     check = _radio_target(name, first_token=first_token)
-    _close_visible_menus()
+    _close_visible_menus(tolerate_usable=True)
     if not check.get("found") or not check.get("checked"):
         raise RuntimeError(f"picker radio {name!r} is not aria-checked after selection")
     return {"name": name, "checked": True}
@@ -528,7 +569,8 @@ def select_model(model_name: str) -> dict[str, Any]:
 def set_reasoning_effort(level: str) -> dict[str, Any]:
     """Set reasoning effort and re-open the picker to prove exact aria-checked."""
     open_model_picker()
-    _click_advanced_item("推理强度", required=False)
+    if not _click_advanced_item("推理强度", required=False):
+        _click_advanced_item("思考强度", required=False)
     target = _radio_target(level, first_token=True)
     if not target.get("found"):
         press_key("Escape")
