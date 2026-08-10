@@ -105,6 +105,64 @@ material; downstream reasoning owns factual reconstruction and contradictions.
 CLI-ish entry; prints raw post material. If `topic_url` is omitted, it takes
 the first social hot-rank entry as the topic source.
 
+## Topic materials (图片素材库落地)
+
+Sibling helper: `topic_materials.py` (same directory). Downloads original
+images of a topic into a local material library so downstream vision/OCR/辨证
+can consume them offline. Videos are NOT downloaded (out of scope; they are
+too large for archival and their URLs are already exposed by
+`fetch_topic_facts` for on-demand access).
+
+**Calling convention**: because Browser Harness loads skill files via
+`exec(open(...).read())`, sibling imports do not work — load `topic_facts.py`
+FIRST, then `topic_materials.py`, in the same session:
+
+```python
+exec(open(".../weibo/topic_facts.py").read())
+exec(open(".../weibo/topic_materials.py").read())
+lib = fetch_topic_materials(topic_url, out_dir, max_pages=5, stale_pages=None,
+                            limit=None, max_images_per_post=None)
+```
+
+### `fetch_topic_materials(topic_url, out_dir, max_pages=5, stale_pages=None, limit=None, max_images_per_post=None)`
+
+- `out_dir`: root directory of the material library (per-topic subdirectory
+  is created automatically).
+- `max_pages` / `stale_pages` / `limit`: forwarded to `fetch_topic_facts`
+  (how many pages/posts to collect — the caller decides the budget).
+- `max_images_per_post`: optional cap on images downloaded per post.
+- Downloads every post's original image URLs with a Weibo Referer header
+  (Sina CDN may otherwise 403). Each image is verified: HTTP 200 and file
+  size > 1 KB.
+
+Output layout:
+
+```
+<out_dir>/<topic_slug>/
+├── manifest.json     # every post + local image paths + meta
+└── images/
+    ├── 001-1.jpg     # post #001, image #1 (original resolution, for OCR)
+    └── ...
+```
+
+Return:
+
+```python
+{"topic": "武汉通报天桥打人事件", "page_count": 5, "post_count": 50,
+ "downloaded": 12, "failed": 0, "library_dir": "...", "manifest_path": "...",
+ "manifest": [post entries with local_images]}
+```
+
+`manifest.json` keeps, per post: author, verify_type, source_type
+(official/media/verified_org/verified_person/ordinary), is_official,
+is_media, time, source, text (truncated to 500 chars), url, page,
+images (remote URLs), local_images (absolute paths).
+
+### `run(topic_url=None, out_dir='/tmp/weibo_materials', max_pages=5, limit=None)`
+
+CLI-ish entry; prints the material library summary. If `topic_url` is
+omitted, it takes the first social hot-rank entry as the topic source.
+
 ## Example
 
 ```bash
