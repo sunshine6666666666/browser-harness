@@ -1,5 +1,11 @@
 # ChatGPT domain skill — basic conversation lifecycle
 
+> **路由标准（2026-08-06 起）**：ChatGPT 会话管理已登记为共享能力
+> `chatgpt.conversation-ops`（experimental）与 `chatgpt.deep-research`（experimental），
+> 详见 `~/.hermes/shared-skills/site-capability-registry/references/catalog.md` 与规范
+> `CAPABILITY-REGISTRY-SPEC.md`。已固化为 OpenCLI 命令（`opencli chatgpt rename/share/delete/deep-research`），
+> 命中后优先用 OpenCLI；本文件保留页面交互知识与 BrowserHarness 手动路径。
+
 Target: `chatgpt.com` (logged-in Agent Chrome, Chinese UI). Verified 2026-08-04
 on ChatGPT Pro account (model picker shows `5.6 Sol 中` style).
 
