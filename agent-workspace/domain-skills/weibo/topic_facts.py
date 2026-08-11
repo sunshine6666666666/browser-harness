@@ -36,7 +36,7 @@ UI facts (verified 2026-08-10) — s.weibo.com search results page:
 from __future__ import annotations
 
 import re
-from urllib.parse import unquote
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -63,6 +63,43 @@ OFFICIAL_EXACT = {
     "平安武昌", "央视新闻", "人民日报", "新华社", "中国政府网",
     "新华视点", "北京发布", "上海发布",
 }
+
+VALID_SORTS = ("general", "hot", "time")
+
+
+def _topic_url_for_sort(topic_url, sort="general", page=None):
+    """Build a Weibo search URL for the requested UI sort and page.
+
+    Weibo implements the three visible sorts as separate paths rather than by
+    honoring ``xsort=hot`` on ``/weibo``. Keep unrelated query parameters,
+    normalize mode-specific ones, and add ``page`` only when requested.
+    """
+    if sort not in VALID_SORTS:
+        raise ValueError("sort must be one of: %s" % ", ".join(VALID_SORTS))
+
+    parts = urlsplit(topic_url)
+    params = dict(parse_qsl(parts.query, keep_blank_values=True))
+    for key in ("page", "xsort", "suball", "tw", "rd", "Refer"):
+        params.pop(key, None)
+
+    if sort == "hot":
+        path = "/hot"
+        params.update({
+            "xsort": "hot", "suball": "1", "tw": "hotweibo",
+            "Refer": "weibo_hot",
+        })
+    elif sort == "time":
+        path = "/realtime"
+        params.update({
+            "rd": "realtime", "tw": "realtime", "Refer": "weibo_realtime",
+        })
+    else:
+        path = "/weibo"
+        params["Refer"] = "weibo_weibo"
+
+    if page is not None:
+        params["page"] = str(page)
+    return urlunsplit((parts.scheme, parts.netloc, path, urlencode(params), ""))
 
 
 def _topic_from_url(url):
@@ -140,7 +177,8 @@ def _extract_posts_js():
     )
 
 
-def fetch_topic_facts(topic_url, max_pages=5, stale_pages=None, limit=None):
+def fetch_topic_facts(topic_url, max_pages=5, stale_pages=None, limit=None,
+                      sort="general"):
     """Open a Weibo topic search URL and extract raw post material, paging.
 
     Args:
@@ -150,6 +188,8 @@ def fetch_topic_facts(topic_url, max_pages=5, stale_pages=None, limit=None):
         no new official/media post. Default None scans all max_pages because
         later pages can still contain additional fact sources.
       limit: optional max posts in the final list; None returns all collected.
+      sort: general (default), hot, or time. These map to Weibo's 综合、热门、
+        实时 search tabs. Hot and time pagination use the site's live URLs.
 
     Returns:
     {
@@ -163,7 +203,7 @@ def fetch_topic_facts(topic_url, max_pages=5, stale_pages=None, limit=None):
     verified_person / ''. Blue-V alone is never treated as official media.
     Posts are in page order; no reordering.
     """
-    base_url = topic_url
+    base_url = _topic_url_for_sort(topic_url, sort=sort)
     page = 1
     processed_pages = 0
     all_posts = []
@@ -172,9 +212,9 @@ def fetch_topic_facts(topic_url, max_pages=5, stale_pages=None, limit=None):
     last_stats = ""
 
     while page <= max_pages:
-        url = base_url if page == 1 else re.sub(
-            r"[&?]page=\d+", "", base_url
-        ) + ("&" if "?" in re.sub(r"[&?]page=\d+", "", base_url) else "?") + "page=%d" % page
+        url = base_url if page == 1 else _topic_url_for_sort(
+            base_url, sort=sort, page=page
+        )
         goto_url(url)
         wait(2.5)
 
@@ -233,10 +273,11 @@ def fetch_topic_facts(topic_url, max_pages=5, stale_pages=None, limit=None):
         "stats": last_stats,
         "posts": all_posts if limit is None else all_posts[:limit],
         "page_count": processed_pages,
+        "sort": sort,
     }
 
 
-def run(topic_url=None, max_pages=5, limit=None):
+def run(topic_url=None, max_pages=5, limit=None, sort="general"):
     """CLI entry for exec(open(...).read()) under Browser Harness.
 
     Prints topic stats and raw post material (page order).
@@ -245,7 +286,9 @@ def run(topic_url=None, max_pages=5, limit=None):
         import hot_rank  # same-dir sibling for fallback topic source
         rows = hot_rank.fetch_hot_rank("social", 1)
         topic_url = rows[0]["href"]
-    facts = fetch_topic_facts(topic_url, max_pages=max_pages, limit=limit)
+    facts = fetch_topic_facts(
+        topic_url, max_pages=max_pages, limit=limit, sort=sort
+    )
     print("=== 话题: %s ===" % facts["topic"])
     print("统计: %s | 抓取页数: %d | 帖子总数: %d" % (
         facts["stats"], facts["page_count"], len(facts["posts"])))

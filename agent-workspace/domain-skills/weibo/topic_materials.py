@@ -30,7 +30,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     def terminal(cmd: str) -> dict: ...
-    def fetch_topic_facts(topic_url, max_pages=5, stale_pages=None, limit=None) -> dict: ...
+    def fetch_topic_facts(topic_url, max_pages=5, stale_pages=None, limit=None,
+                          sort="general") -> dict: ...
 
 
 def _slugify(name):
@@ -65,13 +66,13 @@ def _download_image(url, dest, referer="https://weibo.com/"):
 
 
 def fetch_topic_materials(topic_url, out_dir, max_pages=5, stale_pages=None,
-                          limit=None, max_images_per_post=None):
+                          limit=None, max_images_per_post=None, sort="general"):
     """Collect a topic's posts and download original images to a library.
 
     Args:
       topic_url: s.weibo.com search URL (from hot-rank entry href).
       out_dir: root directory for the material library.
-      max_pages / stale_pages / limit: forwarded to fetch_topic_facts.
+      max_pages / stale_pages / limit / sort: forwarded to fetch_topic_facts.
       max_images_per_post: optional cap (None = all images).
 
     Returns:
@@ -83,7 +84,8 @@ def fetch_topic_materials(topic_url, out_dir, max_pages=5, stale_pages=None,
     }
     """
     facts = fetch_topic_facts(
-        topic_url, max_pages=max_pages, stale_pages=stale_pages, limit=limit
+        topic_url, max_pages=max_pages, stale_pages=stale_pages, limit=limit,
+        sort=sort
     )
 
     topic_slug = _slugify(facts["topic"])
@@ -141,14 +143,15 @@ def fetch_topic_materials(topic_url, out_dir, max_pages=5, stale_pages=None,
     }
 
 
-def run(topic_url=None, out_dir="/tmp/weibo_materials", max_pages=5, limit=None):
+def run(topic_url=None, out_dir="/tmp/weibo_materials", max_pages=5, limit=None,
+        sort="general"):
     """CLI entry for exec(open(...).read()) under Browser Harness."""
     if not topic_url:
         import hot_rank  # same-dir sibling for fallback topic source
         rows = hot_rank.fetch_hot_rank("social", 1)
         topic_url = rows[0]["href"]
     lib = fetch_topic_materials(
-        topic_url, out_dir, max_pages=max_pages, limit=limit
+        topic_url, out_dir, max_pages=max_pages, limit=limit, sort=sort
     )
     print("=== 话题: %s ===" % lib["topic"])
     print("素材库目录: %s" % lib["library_dir"])
