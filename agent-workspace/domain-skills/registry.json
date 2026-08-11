@@ -2,6 +2,10 @@
   "version": 1,
   "description": "Canonical hostname-to-domain-skill registry. Wildcards match the base domain and all subdomains.",
   "skills": {
+    "google": [
+      "google.com",
+      "*.google.com"
+    ],
     "aa": [
       "aa.com"
     ],
