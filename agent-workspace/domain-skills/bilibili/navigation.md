@@ -3,6 +3,21 @@
 Field-tested against bilibili.com on 2026-05-01.
 Requires login for personal-space features; public pages are accessible without auth.
 
+## Automation helpers (added 2026-08-10)
+
+- `search.py` — keyword video search with ordering (综合/最多播放/最新/最多弹幕/
+  最多收藏); returns ranked list (title, bvid, uploader, view, danmaku,
+  duration, publish). See `search_videos(keyword, order, limit)`.
+- `danmaku.py` — fetch a video's danmaku (弹幕) content + counts via the
+  logged-in session: XML mode (`list.so`, capped ~1200, full metadata) or
+  segment mode (`seg.so` protobuf, thousands of entries). See
+  `fetch_danmaku(bvid, cid, mode)`.
+- `replies.py` — fetch a video's comments (评论) via the reply API: hot mode
+  (likes ranking) or time mode (newest first), with cursor pagination. See
+  `fetch_replies(bvid, aid, mode, max_pages)`.
+- Full API, UI facts and verification checklist: see `danmaku.md` and
+  `replies.md` in this directory.
+
 ---
 
 ## URL Patterns
