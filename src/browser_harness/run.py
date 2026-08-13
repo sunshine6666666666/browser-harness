@@ -62,6 +62,7 @@ Commands:
   browser-harness telemetry status    show anonymous telemetry opt-out state
   browser-harness --update [-y]    pull the latest version (agents: pass -y)
   browser-harness --reload         stop the daemon so next call picks up code changes
+  browser-harness agent-pool ...   safely share or isolate the dedicated Agent Chrome
 """
 
 USAGE = """Usage:
@@ -122,7 +123,7 @@ def _telemetry_command(args):
         return "reload"
     if first == "--debug-clicks":
         return "debug-clicks"
-    if first in {"auth", "skill", "recordings", "telemetry", "video"}:
+    if first in {"agent-pool", "auth", "skill", "recordings", "telemetry", "video"}:
         return first
     return "usage"
 
@@ -312,6 +313,9 @@ def _run(args):
         sys.exit(run_doctor())
     if args and args[0] == "auth":
         sys.exit(auth.run_auth_cli(args[1:]))
+    if args and args[0] == "agent-pool":
+        from . import agent_pool
+        sys.exit(agent_pool.run_cli(args[1:]))
     if args and args[0] == "skill":
         if len(args) != 1:
             print("usage: browser-harness skill", file=sys.stderr)
@@ -368,6 +372,18 @@ def _run(args):
     # cloud API calls, parent agents managing their own session). An explicit BU_CDP_URL
     # or BU_CDP_WS also blocks the spawn so we honour the precedence install.md promises.
     cloud_admin = code.lstrip().startswith(("start_remote_daemon(", "stop_remote_daemon("))
+    if not cloud_admin:
+        from . import agent_pool
+        if agent_pool.should_manage_legacy():
+            # Legacy Hermes Skills are conservatively treated as writes. Explicit
+            # agent-pool callers can declare read mode and gain safe parallelism.
+            sys.exit(agent_pool.run_managed(
+                agent_pool._default_owner(),
+                agent_pool.infer_site(code),
+                "default",
+                "write",
+                code,
+            ))
     if not cloud_admin:
         if (
             not daemon_alive()
