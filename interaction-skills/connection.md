@@ -1,5 +1,9 @@
 # Connection & Tab Visibility
 
+## Hermes managed Agent Chrome
+
+For Hermes Profile tasks, do not use tab presence or daemon presence to decide whether port 9223 is free. Enter through `browser-harness agent-pool run`; the shared lease is authoritative and uncertain state falls back to an isolated disposable instance. The manual startup sequence below is for Browser Harness maintenance and non-Hermes environments only.
+
 ## The omnibox popup problem
 
 When Chrome opens fresh, the only CDP `type: "page"` targets are `chrome://inspect` and `chrome://omnibox-popup.top-chrome/` (a 1px invisible viewport). If the daemon attaches to the omnibox popup, all subsequent work — including `new_tab()` and `goto_url()` — happens on tabs that exist in CDP but may not be visible in the Chrome UI.

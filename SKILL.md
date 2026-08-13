@@ -46,6 +46,19 @@ chrome://inspect/#remote-debugging
 
 Ask the user to tick "Allow remote debugging for this browser instance" and click Allow if Chrome shows a permission popup. Then retry the same `browser-harness` command.
 
+### Managed Hermes Agent Chrome
+
+Hermes Profiles on Ye Lin's machine must not attach to port 9223 directly or copy Chrome Profiles themselves. Use the managed pool so browser ownership, logged-in isolation, heartbeat, and cleanup are one operation:
+
+```bash
+browser-harness agent-pool run --site example.com --mode read <<'PY'
+new_tab("https://example.com")
+print(page_info())
+PY
+```
+
+Use `--mode write --account default` for publishing, sending, uploading, deleting, checkout, or account-state changes. The pool derives the owner from Hermes environment, uses the shared Agent Chrome only when its lease is free, and otherwise starts a disposable logged-in instance. Uncertain state is always busy. Never run `agent-pool snapshot` or `agent-pool reap --apply` from an ordinary browser task.
+
 ## Remote Browsers
 
 Use Browser Use cloud for headless servers, parallel sub-agents, or isolated work.
@@ -95,7 +108,7 @@ Cloud profile cookie sync reference: https://github.com/browser-use/browser-harn
 - Fall back to raw HTML via `js(...)` only when the AX tree lacks the element (canvas, exotic widgets); screenshot when layout or imagery matters.
 - After navigation, call `wait_for_load()`.
 - If the current tab is stale or internal, call `ensure_real_tab()`.
-- **Shared browser safety:** Agent Chrome is shared by multiple agents. Only close tabs your own `new_tab()` returned; never batch-close by URL/domain filter. Protect work tabs with `protect_tab(...)` and check `tab_owner(tid)` before closing tabs you did not open (details in `interaction-skills/tabs.md`).
+- **Shared browser safety:** Hermes tasks enter through `agent-pool run`; its lease decides shared versus isolated execution. Only close tabs your own `new_tab()` returned; never batch-close by URL/domain filter. Protect work tabs with `protect_tab(...)` and check `tab_owner(tid)` before closing tabs you did not open (details in `interaction-skills/tabs.md`).
 - Use `js(...)` for DOM inspection or extraction when coordinates are the wrong tool.
 - Login walls: stop and ask. Exception: use available SSO automatically when Chrome is already signed in; still stop for passwords, MFA, consent, or ambiguous account choice.
 - Raw CDP is available with `cdp("Domain.method", ...)`.
