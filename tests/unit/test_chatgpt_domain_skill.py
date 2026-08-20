@@ -650,6 +650,41 @@ def test_exact_options_lookup_fails_without_target_row_button():
     assert clicks == []
 
 
+def test_open_exact_options_reloads_when_brand_new_row_not_hydrated():
+    query_calls = {"n": 0}
+    navigations = []
+
+    def fake_js(script):
+        if "const suffix" in script and "history-item-" in script:
+            query_calls["n"] += 1
+            # First query happens before the sidebar hydrates; the reload
+            # pass must find the row and open its options button.
+            if query_calls["n"] == 1:
+                return {"found": False, "count": 0}
+            return {"found": True}
+        raise AssertionError(f"unexpected JS: {script[:100]}")
+
+    ops = load_ops(fake_js, goto_impl=navigations.append)
+    ops["_open_exact_conversation_options"]("abcdefgh")
+
+    assert navigations == ["https://chatgpt.com/c/abcdefgh"]
+    assert query_calls["n"] == 2
+
+
+def test_open_exact_options_gives_up_after_bounded_reloads():
+    navigations = []
+
+    def fake_js(script):
+        if "const suffix" in script and "history-item-" in script:
+            return {"found": False, "count": 1}
+        raise AssertionError(f"unexpected JS: {script[:100]}")
+
+    ops = load_ops(fake_js, goto_impl=navigations.append)
+    with pytest.raises(RuntimeError, match="after 2 reloads"):
+        ops["_open_exact_conversation_options"]("abcdefgh")
+    assert len(navigations) == 2
+
+
 def test_rename_chat_targets_exact_url_and_verifies_persisted_title():
     conversation_id = "6a712ec4-5f78-83ea-b6fd-2b58edb87c98"
     new_title = "Verified Maintenance Chat"

@@ -1043,8 +1043,15 @@ def _conversation_id(conversation: str) -> str:
 
 
 def _open_exact_conversation_options(conversation_id: str) -> None:
-    """Open only the options button inside the exact `/c/<id>` sidebar row."""
-    r = js(r"""
+    """Open only the options button inside the exact `/c/<id>` sidebar row.
+
+    A brand-new conversation's row may not have hydrated into the sidebar
+    immediately after send_message (React list lag). Before raising, perform
+    a bounded reload-and-retry: navigate to the exact conversation URL, wait
+    for hydration, and re-query the row (max 2 reloads).
+    """
+    def _query() -> dict[str, Any]:
+        return js(r"""
     (() => {
       const suffix = '/c/' + %r;
       const matches = [...document.querySelectorAll('a[href*="/c/"]')].filter(a =>
@@ -1061,9 +1068,21 @@ def _open_exact_conversation_options(conversation_id: str) -> None:
       btn.click();
       return {found: true};
     })()
-    """ % conversation_id)
+    """ % conversation_id) or {"found": False}
+
+    r = _query()
+    reloads = 0
+    while (not r or not r.get("found")) and reloads < 2:
+        reloads += 1
+        goto_url(f"https://chatgpt.com/c/{conversation_id}")
+        wait_for_load(timeout=25)
+        wait(2.5)
+        r = _query()
     if not r or not r.get("found"):
-        raise RuntimeError(f"rename_chat: exact sidebar row /c/{conversation_id} or its options button was not found")
+        raise RuntimeError(
+            f"rename_chat: exact sidebar row /c/{conversation_id} or its options button "
+            f"was not found (after {reloads} reload{'' if reloads == 1 else 's'})"
+        )
     wait(1.2)
 
 
