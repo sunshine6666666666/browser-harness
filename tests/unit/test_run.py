@@ -14,6 +14,7 @@ def test_stdin_executes_code():
     with patch.object(sys, "argv", ["browser-harness"]), \
          patch("browser_harness.run.ensure_daemon"), \
          patch("browser_harness.run.print_update_banner"), \
+         patch("browser_harness.agent_pool.should_manage_legacy", return_value=False), \
          patch("sys.stdin", fake_stdin), \
          patch("sys.stdout", stdout):
         run.main()
@@ -67,7 +68,8 @@ def test_cloud_bootstrap_on_headless_server(monkeypatch):
          patch("browser_harness.run._local_chrome_listening", return_value=False), \
          patch("browser_harness.run.start_remote_daemon") as mock_start, \
          patch("browser_harness.run.ensure_daemon"), \
-         patch("browser_harness.run.print_update_banner"):
+         patch("browser_harness.run.print_update_banner"), \
+         patch("browser_harness.agent_pool.should_manage_legacy", return_value=False):
         run.main()
     mock_start.assert_called_once()
 
@@ -86,7 +88,8 @@ def test_explicit_bu_cdp_url_blocks_cloud_bootstrap(monkeypatch):
          patch("browser_harness.run._local_chrome_listening", return_value=False), \
          patch("browser_harness.run.start_remote_daemon") as mock_start, \
          patch("browser_harness.run.ensure_daemon"), \
-         patch("browser_harness.run.print_update_banner"):
+         patch("browser_harness.run.print_update_banner"), \
+         patch("browser_harness.agent_pool.should_manage_legacy", return_value=False):
         run.main()
     mock_start.assert_not_called()
 
@@ -104,7 +107,8 @@ def test_explicit_bu_cdp_ws_blocks_cloud_bootstrap(monkeypatch):
          patch("browser_harness.run._local_chrome_listening", return_value=False), \
          patch("browser_harness.run.start_remote_daemon") as mock_start, \
          patch("browser_harness.run.ensure_daemon"), \
-         patch("browser_harness.run.print_update_banner"):
+         patch("browser_harness.run.print_update_banner"), \
+         patch("browser_harness.agent_pool.should_manage_legacy", return_value=False):
         run.main()
     mock_start.assert_not_called()
 
@@ -122,7 +126,8 @@ def test_empty_bu_cdp_url_does_not_block_bootstrap(monkeypatch):
          patch("browser_harness.run._local_chrome_listening", return_value=False), \
          patch("browser_harness.run.start_remote_daemon") as mock_start, \
          patch("browser_harness.run.ensure_daemon"), \
-         patch("browser_harness.run.print_update_banner"):
+         patch("browser_harness.run.print_update_banner"), \
+         patch("browser_harness.agent_pool.should_manage_legacy", return_value=False):
         run.main()
     mock_start.assert_called_once()
 
@@ -136,7 +141,8 @@ def test_bad_stored_cloud_auth_does_not_bootstrap_or_crash(monkeypatch):
          patch("browser_harness.run.auth.get_browser_use_api_key", side_effect=run.auth.AuthError("auth file is not valid JSON")), \
          patch("browser_harness.run.start_remote_daemon") as mock_start, \
          patch("browser_harness.run.ensure_daemon"), \
-         patch("browser_harness.run.print_update_banner"):
+         patch("browser_harness.run.print_update_banner"), \
+         patch("browser_harness.agent_pool.should_manage_legacy", return_value=False):
         run.main()
 
     mock_start.assert_not_called()
@@ -156,7 +162,8 @@ def test_both_bu_cdp_url_and_bu_cdp_ws_set_blocks_bootstrap(monkeypatch):
          patch("browser_harness.run._local_chrome_listening", return_value=False), \
          patch("browser_harness.run.start_remote_daemon") as mock_start, \
          patch("browser_harness.run.ensure_daemon"), \
-         patch("browser_harness.run.print_update_banner"):
+         patch("browser_harness.run.print_update_banner"), \
+         patch("browser_harness.agent_pool.should_manage_legacy", return_value=False):
         run.main()
     mock_start.assert_not_called()
 
@@ -174,7 +181,8 @@ def test_explicit_endpoint_does_not_break_daemon_alive_short_circuit(monkeypatch
          patch("browser_harness.run._local_chrome_listening", return_value=False), \
          patch("browser_harness.run.start_remote_daemon") as mock_start, \
          patch("browser_harness.run.ensure_daemon"), \
-         patch("browser_harness.run.print_update_banner"):
+         patch("browser_harness.run.print_update_banner"), \
+         patch("browser_harness.agent_pool.should_manage_legacy", return_value=False):
         run.main()
     mock_start.assert_not_called()
 
@@ -193,7 +201,8 @@ def test_explicit_endpoint_does_not_break_local_chrome_short_circuit(monkeypatch
          patch("browser_harness.run._local_chrome_listening", return_value=True), \
          patch("browser_harness.run.start_remote_daemon") as mock_start, \
          patch("browser_harness.run.ensure_daemon"), \
-         patch("browser_harness.run.print_update_banner"):
+         patch("browser_harness.run.print_update_banner"), \
+         patch("browser_harness.agent_pool.should_manage_legacy", return_value=False):
         run.main()
     mock_start.assert_not_called()
 

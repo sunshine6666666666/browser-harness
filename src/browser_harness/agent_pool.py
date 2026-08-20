@@ -17,7 +17,7 @@ import time
 import urllib.request
 import uuid
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from . import paths
 
@@ -47,6 +47,9 @@ CHROME_BINARY = Path(os.environ.get(
 )).expanduser().resolve()
 MANIFEST = ".browser-harness-agent-pool.json"
 MARKER = "browser-harness-agent-pool-v1"
+CDP_TIMEOUT_SECONDS = 2
+TARGET_CLOSE_ATTEMPTS = 10
+TARGET_CLOSE_DELAY_SECONDS = 0.1
 
 
 class PoolError(RuntimeError):
@@ -259,6 +262,130 @@ def _cdp_alive(url: str | None, timeout: float = 0.3) -> bool:
         return False
 
 
+def _validate_cdp_url(cdp_url: str) -> str:
+    parsed = urlparse(cdp_url or "")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise PoolError("CDP URL must include a valid port") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost"}
+        or not 1 <= (port or 0) <= 65535
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise PoolError("CDP URL must be an http loopback URL with a valid port")
+    return cdp_url.rstrip("/")
+
+
+def list_page_targets(cdp_url: str) -> set[str]:
+    base_url = _validate_cdp_url(cdp_url)
+    try:
+        with urllib.request.urlopen(
+            base_url + "/json/list", timeout=CDP_TIMEOUT_SECONDS
+        ) as response:
+            data = json.loads(response.read())
+        if not isinstance(data, list):
+            raise PoolError("CDP /json/list response must be a list")
+        targets = set()
+        for item in data:
+            if not isinstance(item, dict):
+                raise PoolError("CDP /json/list contains a non-object target")
+            target_id = item.get("id")
+            if item.get("type") == "page" and isinstance(target_id, str) and target_id:
+                targets.add(target_id)
+        return targets
+    except PoolError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise PoolError(f"failed to list CDP page targets: {exc}") from exc
+
+
+def browser_identity(cdp_url: str) -> str:
+    base_url = _validate_cdp_url(cdp_url)
+    try:
+        with urllib.request.urlopen(
+            base_url + "/json/version", timeout=CDP_TIMEOUT_SECONDS
+        ) as response:
+            data = json.loads(response.read())
+        identity = data.get("webSocketDebuggerUrl") if isinstance(data, dict) else None
+        if not isinstance(identity, str) or not identity:
+            raise PoolError("CDP /json/version has no browser identity")
+        return identity
+    except PoolError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise PoolError(f"failed to read CDP browser identity: {exc}") from exc
+
+
+def close_task_targets(
+    cdp_url: str,
+    baseline_target_ids: list[str],
+    expected_browser_identity: str,
+) -> dict:
+    base_url = _validate_cdp_url(cdp_url)
+    if any(not isinstance(target_id, str) or not target_id for target_id in baseline_target_ids):
+        raise PoolError("baseline target IDs must be non-empty strings")
+    if not expected_browser_identity:
+        raise PoolError("expected browser identity must be non-empty")
+
+    def restarted() -> bool:
+        return browser_identity(base_url) != expected_browser_identity
+
+    if restarted():
+        return {
+            "closed": [],
+            "remaining": [],
+            "baseline_preserved": True,
+            "browser_restarted": True,
+        }
+    baseline = set(baseline_target_ids)
+    current = list_page_targets(base_url)
+    candidates = sorted(current - baseline)
+    closed = []
+    for target_id in candidates:
+        if restarted():
+            return {
+                "closed": closed,
+                "remaining": [],
+                "baseline_preserved": True,
+                "browser_restarted": True,
+            }
+        close_url = f"{base_url}/json/close/{quote(target_id, safe='')}"
+        try:
+            with urllib.request.urlopen(close_url, timeout=CDP_TIMEOUT_SECONDS) as response:
+                response.read()
+        except (OSError, TypeError, ValueError) as exc:
+            raise PoolError(f"failed to close CDP target {target_id}: {exc}") from exc
+        closed.append(target_id)
+
+    remaining = sorted(candidates)
+    for attempt in range(TARGET_CLOSE_ATTEMPTS):
+        if restarted():
+            return {
+                "closed": closed,
+                "remaining": [],
+                "baseline_preserved": True,
+                "browser_restarted": True,
+            }
+        current = list_page_targets(base_url)
+        remaining = sorted(current - baseline)
+        if not remaining:
+            return {
+                "closed": closed,
+                "remaining": remaining,
+                "baseline_preserved": True,
+                "browser_restarted": False,
+            }
+        if attempt + 1 < TARGET_CLOSE_ATTEMPTS:
+            time.sleep(TARGET_CLOSE_DELAY_SECONDS)
+    raise PoolError(f"CDP task targets remain after cleanup: {remaining}")
+
+
 def _is_within(path: Path, root: Path) -> bool:
     try:
         path.resolve().relative_to(root.resolve())
@@ -336,7 +463,12 @@ def reap(*, apply: bool = False, now: float | None = None, temp_root: Path | Non
             runner_dead = not _pid_alive(lease.get("runner_pid"))
             if lease.get("kind") == "shared":
                 ok = expired and runner_dead
-                reason = "stale shared lease" if ok else "shared lease is active"
+                if ok and (
+                    "baseline_target_ids" not in lease or "browser_identity" not in lease
+                ):
+                    reason = "legacy stale shared lease; no target cleanup evidence"
+                else:
+                    reason = "stale shared lease" if ok else "shared lease is active"
             elif not lease.get("profile_dir"):
                 ok = expired and runner_dead
                 reason = "stale pending lease" if ok else "pending lease is active"
@@ -364,6 +496,21 @@ def reap(*, apply: bool = False, now: float | None = None, temp_root: Path | Non
                 results.append(item)
                 continue
             if apply and ok:
+                if (
+                    lease.get("kind") == "shared"
+                    and "baseline_target_ids" in lease
+                    and "browser_identity" in lease
+                ):
+                    try:
+                        close_task_targets(
+                            lease["cdp_url"],
+                            lease["baseline_target_ids"],
+                            lease["browser_identity"],
+                        )
+                    except PoolError as exc:
+                        item["reason"] = f"stale shared target cleanup failed: {exc}"
+                        results.append(item)
+                        continue
                 if lease.get("profile_dir"):
                     profile = Path(lease["profile_dir"])
                     _safe_rmtree(profile, lease, temp_root=temp_root)
@@ -532,45 +679,131 @@ def _stop_daemon(name: str) -> None:
     restart_daemon(name)
 
 
-def run_managed(owner: str, site: str, account: str, mode: str, code: str) -> int:
+def _record_shared_baseline(lease: dict) -> None:
+    identity = browser_identity(lease["cdp_url"])
+    baseline = sorted(list_page_targets(lease["cdp_url"]))
+    if browser_identity(lease["cdp_url"]) != identity:
+        raise PoolError("shared browser restarted while target baseline was recorded")
+    lease["browser_identity"] = identity
+    lease["baseline_target_ids"] = baseline
+    with _locked_state() as state:
+        current = state["leases"].get(lease["id"])
+        if not current:
+            raise PoolError("lease disappeared before shared target baseline was recorded")
+        current.update(lease)
+
+
+def _cleanup_managed_lease(lease: dict, chrome_process, daemon_name: str) -> list[str]:
+    errors = []
+    try:
+        _stop_daemon(daemon_name)
+    except Exception as exc:
+        errors.append(f"daemon cleanup failed: {exc}")
+
+    if lease.get("kind") == "shared":
+        if "baseline_target_ids" not in lease or "browser_identity" not in lease:
+            errors.append("shared target baseline identity was not recorded")
+        else:
+            try:
+                close_task_targets(
+                    lease["cdp_url"],
+                    lease["baseline_target_ids"],
+                    lease["browser_identity"],
+                )
+            except PoolError as exc:
+                errors.append(f"shared target cleanup failed: {exc}")
+    else:
+        try:
+            _stop_owned_chrome(lease, chrome_process)
+        except Exception as exc:
+            errors.append(f"owned Chrome cleanup failed: {exc}")
+        if lease.get("profile_dir"):
+            profile = Path(lease["profile_dir"])
+            if not _pid_alive(lease.get("chrome_pid")) and not _cdp_alive(lease.get("cdp_url")):
+                try:
+                    _safe_rmtree(profile, lease)
+                except PoolError as exc:
+                    errors.append(f"temporary profile cleanup failed: {exc}")
+            if profile.exists():
+                errors.append("temporary profile still exists")
+
+    if not errors:
+        try:
+            forget(lease["id"])
+        except Exception as exc:
+            errors.append(f"lease release failed: {exc}")
+    return errors
+
+
+def _run_with_lease(owner: str, site: str, account: str, mode: str, child_runner) -> int:
     lease = reserve_wait(owner, site, account, mode)
     chrome_process = None
     stop = threading.Event()
     thread = None
     daemon_name = f"pool-{lease['id'][:16]}"
+    child_returncode = None
+    cleanup_errors = []
     try:
         if lease["kind"] == "temporary":
             chrome_process, lease = _start_temporary(lease)
         elif not _cdp_alive(lease["cdp_url"]):
             raise PoolError("shared Agent Chrome is unavailable")
+        if lease["kind"] == "shared":
+            _record_shared_baseline(lease)
         env = {
             **os.environ,
             "BU_NAME": daemon_name,
             "BU_CDP_URL": lease["cdp_url"],
             "BH_AGENT_POOL_CHILD": "1",
+            "BH_AGENT_POOL_LEASE_ID": lease["id"],
         }
         thread = threading.Thread(target=_heartbeat_loop, args=(lease["id"], stop), daemon=True)
         thread.start()
-        child = subprocess.run([sys.executable, "-m", "browser_harness.run"], input=code, text=True, env=env)
-        return child.returncode
+        child_returncode = child_runner(lease, env)
     finally:
         stop.set()
         if thread:
             thread.join(timeout=2)
-        try:
-            _stop_daemon(daemon_name)
-        except BaseException:
-            pass
-        _stop_owned_chrome(lease, chrome_process)
-        cleanup_complete = not lease.get("profile_dir")
-        if lease.get("kind") == "temporary" and lease.get("profile_dir"):
-            profile = Path(lease["profile_dir"])
-            if not _pid_alive(lease.get("chrome_pid")) and not _cdp_alive(lease.get("cdp_url")):
-                with contextlib.suppress(PoolError):
-                    _safe_rmtree(profile, lease)
-            cleanup_complete = not profile.exists()
-        if lease.get("kind") == "shared" or cleanup_complete:
-            forget(lease["id"])
+        cleanup_errors = _cleanup_managed_lease(lease, chrome_process, daemon_name)
+    if cleanup_errors:
+        print("browser-harness agent-pool: " + "; ".join(cleanup_errors), file=sys.stderr)
+        return child_returncode if child_returncode not in (None, 0) else 1
+    return child_returncode if child_returncode is not None else 0
+
+
+def run_managed(owner: str, site: str, account: str, mode: str, code: str) -> int:
+    if not code.strip():
+        raise PoolError("agent-pool run requires a Browser Harness script on stdin")
+    return _run_with_lease(
+        owner,
+        site,
+        account,
+        mode,
+        lambda lease, env: subprocess.run(
+            [sys.executable, "-m", "browser_harness.run"],
+            input=code,
+            text=True,
+            env=env,
+        ).returncode,
+    )
+
+
+def run_command_managed(owner: str, site: str, account: str, mode: str, command: list[str]) -> int:
+    if not command:
+        raise PoolError("command must be non-empty")
+    if (
+        len(command) >= 3
+        and Path(command[0]).name == "browser-harness"
+        and command[1:3] == ["agent-pool", "exec"]
+    ):
+        raise PoolError("agent-pool exec cannot wrap itself")
+    return _run_with_lease(
+        owner,
+        site,
+        account,
+        mode,
+        lambda lease, env: subprocess.run(command, env=env).returncode,
+    )
 
 
 def _source_in_use(source: Path) -> bool:
@@ -665,6 +898,12 @@ def run_cli(argv: list[str]) -> int:
     run.add_argument("--site", required=True)
     run.add_argument("--account", default="default")
     run.add_argument("--mode", choices=("read", "write"), default="read")
+    exec_parser = sub.add_parser("exec")
+    exec_parser.add_argument("--owner", default=_default_owner())
+    exec_parser.add_argument("--site", required=True)
+    exec_parser.add_argument("--account", default="default")
+    exec_parser.add_argument("--mode", choices=("read", "write"), default="read")
+    exec_parser.add_argument("command_argv", nargs=argparse.REMAINDER)
     sub.add_parser("snapshot")
     reap_parser = sub.add_parser("reap")
     reap_parser.add_argument("--apply", action="store_true")
@@ -679,6 +918,13 @@ def run_cli(argv: list[str]) -> int:
         if args.command == "reap":
             print(json.dumps(reap(apply=args.apply), ensure_ascii=False, indent=2))
             return 0
+        if args.command == "exec":
+            command = list(args.command_argv)
+            if command and command[0] == "--":
+                command = command[1:]
+            if not command:
+                raise PoolError("agent-pool exec requires a command after --")
+            return run_command_managed(args.owner, args.site, args.account, args.mode, command)
         code = sys.stdin.read()
         if not code.strip():
             raise PoolError("agent-pool run requires a Browser Harness script on stdin")

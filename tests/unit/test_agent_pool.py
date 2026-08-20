@@ -27,6 +27,25 @@ def managed_profile(root: Path, task_id: str) -> Path:
     return profile
 
 
+def persist_lease(lease: dict) -> None:
+    with pool._locked_state() as state:
+        state["leases"][lease["id"]] = dict(lease)
+
+
+class FakeResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self):
+        return self.payload.encode()
+
+
 def test_first_lease_gets_shared_and_second_gets_temporary(isolated):
     first = pool.reserve("researchbot", "example.com", "default", "read", now=10)
     second = pool.reserve("wikikeeper", "example.org", "default", "read", now=11)
@@ -71,6 +90,80 @@ def test_legacy_hermes_call_is_managed(monkeypatch):
 def test_infer_site_uses_first_literal_url():
     assert pool.infer_site('new_tab("https://sub.example.com/path")') == "sub.example.com"
     assert pool.infer_site("print(page_info())") == "unknown"
+
+
+def test_list_page_targets_rejects_non_loopback_cdp(monkeypatch):
+    called = []
+    monkeypatch.setattr(pool.urllib.request, "urlopen", lambda *args, **kwargs: called.append(args))
+    for url in ("", "https://127.0.0.1:9223", "http://192.168.1.2:9223", "http://127.0.0.1", "http://127.0.0.1:0"):
+        with pytest.raises(pool.PoolError):
+            pool.list_page_targets(url)
+    assert called == []
+
+
+def test_close_task_targets_closes_only_current_minus_baseline(monkeypatch):
+    current = {"keep-a", "new-b", "new-c"}
+    close_calls = []
+
+    def fake_urlopen(url, timeout):
+        if url.endswith("/json/list"):
+            return FakeResponse(json.dumps([
+                {"type": "page", "id": target_id} for target_id in sorted(current)
+            ]))
+        close_calls.append(url.rsplit("/", 1)[-1])
+        current.remove(close_calls[-1])
+        return FakeResponse("OK")
+
+    monkeypatch.setattr(pool.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(pool, "browser_identity", lambda url: "browser-a")
+    result = pool.close_task_targets("http://127.0.0.1:9223", ["keep-a"], "browser-a")
+    assert close_calls == ["new-b", "new-c"]
+    assert result == {
+        "closed": ["new-b", "new-c"],
+        "remaining": [],
+        "baseline_preserved": True,
+        "browser_restarted": False,
+    }
+
+
+def test_close_task_targets_preserves_baseline_when_close_fails(monkeypatch):
+    close_calls = []
+
+    def fake_urlopen(url, timeout):
+        if url.endswith("/json/list"):
+            return FakeResponse(json.dumps([
+                {"type": "page", "id": "keep-a"},
+                {"type": "page", "id": "new-b"},
+            ]))
+        close_calls.append(url.rsplit("/", 1)[-1])
+        raise OSError("close failed")
+
+    monkeypatch.setattr(pool.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(pool, "browser_identity", lambda url: "browser-a")
+    with pytest.raises(pool.PoolError, match="close failed"):
+        pool.close_task_targets("http://127.0.0.1:9223", ["keep-a"], "browser-a")
+    assert close_calls == ["new-b"]
+
+
+def test_close_task_targets_allows_baseline_to_disappear(monkeypatch):
+    states = iter([{"keep-a", "new-b"}, set()])
+    monkeypatch.setattr(pool, "list_page_targets", lambda url: next(states))
+    monkeypatch.setattr(pool, "browser_identity", lambda url: "browser-a")
+    monkeypatch.setattr(pool.urllib.request, "urlopen", lambda *args, **kwargs: FakeResponse("OK"))
+    result = pool.close_task_targets("http://127.0.0.1:9223", ["keep-a"], "browser-a")
+    assert result["closed"] == ["new-b"]
+    assert result["browser_restarted"] is False
+
+
+def test_close_task_targets_does_not_touch_restarted_browser(monkeypatch):
+    close_calls = []
+    monkeypatch.setattr(pool, "browser_identity", lambda url: "browser-b")
+    monkeypatch.setattr(pool, "list_page_targets", lambda url: {"new-browser-tab"})
+    monkeypatch.setattr(pool.urllib.request, "urlopen", lambda url, timeout: close_calls.append(url))
+    result = pool.close_task_targets("http://127.0.0.1:9223", ["old-tab"], "browser-a")
+    assert result["browser_restarted"] is True
+    assert result["closed"] == []
+    assert close_calls == []
 
 
 def test_corrupt_state_fails_closed(isolated):
@@ -136,12 +229,39 @@ def test_reap_releases_stale_shared_lease_without_touching_chrome(isolated):
     assert result == [{
         "lease_id": lease["id"],
         "eligible": True,
-        "reason": "stale shared lease",
+        "reason": "legacy stale shared lease; no target cleanup evidence",
         "deleted": False,
         "released": True,
         "terminated": False,
     }]
     assert pool.status()["leases"] == []
+
+
+def test_reap_cleans_stale_shared_task_targets_before_releasing_lease(isolated, monkeypatch):
+    lease = pool.reserve("shared", "a.example", "a", "read", now=0)
+    with pool._locked_state() as state:
+        state["leases"][lease["id"]]["baseline_target_ids"] = ["keep-a"]
+        state["leases"][lease["id"]]["browser_identity"] = "browser-a"
+    cleaned = []
+    monkeypatch.setattr(pool, "close_task_targets", lambda url, baseline, identity: cleaned.append((url, baseline, identity)) or {
+        "closed": ["new-b"], "remaining": [], "baseline_preserved": True, "browser_restarted": False,
+    })
+    result = pool.reap(apply=True, now=pool.LEASE_TTL_SECONDS + 1)
+    assert cleaned == [(pool.SHARED_CDP_URL, ["keep-a"], "browser-a")]
+    assert result[0]["released"] is True
+    assert pool.status()["leases"] == []
+
+
+def test_reap_keeps_stale_shared_lease_when_target_cleanup_fails(isolated, monkeypatch):
+    lease = pool.reserve("shared", "a.example", "a", "read", now=0)
+    with pool._locked_state() as state:
+        state["leases"][lease["id"]]["baseline_target_ids"] = ["keep-a"]
+        state["leases"][lease["id"]]["browser_identity"] = "browser-a"
+    monkeypatch.setattr(pool, "close_task_targets", lambda *args: (_ for _ in ()).throw(pool.PoolError("cleanup failed")))
+    result = pool.reap(apply=True, now=pool.LEASE_TTL_SECONDS + 1)
+    assert result[0]["released"] is False
+    assert "cleanup failed" in result[0]["reason"]
+    assert pool.status()["leases"][0]["id"] == lease["id"]
 
 
 def test_reap_terminates_only_verified_stale_owned_chrome(isolated, monkeypatch):
@@ -163,7 +283,7 @@ def test_reap_terminates_only_verified_stale_owned_chrome(isolated, monkeypatch)
     assert profile.exists()
 
 
-def test_managed_shared_run_releases_lease_and_daemon(monkeypatch):
+def test_managed_shared_run_releases_lease_and_daemon(isolated, monkeypatch):
     lease = {
         "id": "a" * 32,
         "owner": "researchbot",
@@ -173,7 +293,14 @@ def test_managed_shared_run_releases_lease_and_daemon(monkeypatch):
         "chrome_pid": None,
     }
     monkeypatch.setattr(pool, "reserve_wait", lambda *args, **kwargs: dict(lease))
+    persist_lease(lease)
     monkeypatch.setattr(pool, "_cdp_alive", lambda url: True)
+    monkeypatch.setattr(pool, "browser_identity", lambda url: "browser-a")
+    monkeypatch.setattr(pool, "list_page_targets", lambda url: {"keep-a"})
+    monkeypatch.setattr(pool, "close_task_targets", lambda url, baseline, identity: {
+        "closed": [], "remaining": [], "baseline_preserved": True,
+        "browser_restarted": False,
+    })
     calls = {}
     monkeypatch.setattr(pool.subprocess, "run", lambda command, **kwargs: calls.update(command=command, kwargs=kwargs) or types.SimpleNamespace(returncode=0))
     stopped = []
@@ -185,6 +312,96 @@ def test_managed_shared_run_releases_lease_and_daemon(monkeypatch):
     assert calls["kwargs"]["env"]["BU_CDP_URL"] == pool.SHARED_CDP_URL
     assert stopped == ["pool-" + "a" * 16]
     assert forgotten == ["a" * 32]
+
+
+def test_managed_shared_run_records_baseline_and_cleans_new_targets(isolated, monkeypatch):
+    lease = {
+        "id": "c" * 32,
+        "owner": "researchbot",
+        "kind": "shared",
+        "cdp_url": pool.SHARED_CDP_URL,
+        "profile_dir": None,
+        "chrome_pid": None,
+    }
+    monkeypatch.setattr(pool, "reserve_wait", lambda *args, **kwargs: dict(lease))
+    persist_lease(lease)
+    monkeypatch.setattr(pool, "_cdp_alive", lambda url: True)
+    monkeypatch.setattr(pool, "browser_identity", lambda url: "browser-a")
+    baselines = []
+    monkeypatch.setattr(pool, "list_page_targets", lambda url: {"keep-a", "keep-b"})
+    monkeypatch.setattr(pool, "close_task_targets", lambda url, baseline, identity: baselines.append((list(baseline), identity)) or {
+        "closed": ["new-c"], "remaining": [], "baseline_preserved": True,
+        "browser_restarted": False,
+    })
+    monkeypatch.setattr(pool, "subprocess", types.SimpleNamespace(
+        run=lambda command, **kwargs: types.SimpleNamespace(returncode=0),
+    ))
+    monkeypatch.setattr(pool, "_stop_daemon", lambda name: None)
+    monkeypatch.setattr(pool, "forget", lambda lease_id: None)
+    assert pool.run_managed("researchbot", "example.com", "default", "read", "print(1)") == 0
+    assert baselines == [(["keep-a", "keep-b"], "browser-a")]
+
+
+def test_managed_shared_run_keeps_lease_when_target_cleanup_fails(isolated, monkeypatch):
+    lease = {
+        "id": "d" * 32,
+        "owner": "researchbot",
+        "kind": "shared",
+        "cdp_url": pool.SHARED_CDP_URL,
+        "profile_dir": None,
+        "chrome_pid": None,
+    }
+    monkeypatch.setattr(pool, "reserve_wait", lambda *args, **kwargs: dict(lease))
+    persist_lease(lease)
+    monkeypatch.setattr(pool, "_cdp_alive", lambda url: True)
+    monkeypatch.setattr(pool, "browser_identity", lambda url: "browser-a")
+    monkeypatch.setattr(pool, "list_page_targets", lambda url: {"keep-a"})
+    monkeypatch.setattr(pool, "close_task_targets", lambda *args: (_ for _ in ()).throw(pool.PoolError("cleanup failed")))
+    monkeypatch.setattr(pool, "subprocess", types.SimpleNamespace(
+        run=lambda command, **kwargs: types.SimpleNamespace(returncode=0),
+    ))
+    monkeypatch.setattr(pool, "_stop_daemon", lambda name: None)
+    forgotten = []
+    monkeypatch.setattr(pool, "forget", forgotten.append)
+    assert pool.run_managed("researchbot", "example.com", "default", "read", "print(1)") == 1
+    assert forgotten == []
+
+
+def test_exec_passes_argv_without_shell_and_exports_pool_environment(isolated, monkeypatch):
+    lease = {
+        "id": "e" * 32,
+        "owner": "researchbot",
+        "kind": "shared",
+        "cdp_url": pool.SHARED_CDP_URL,
+        "profile_dir": None,
+        "chrome_pid": None,
+    }
+    monkeypatch.setattr(pool, "reserve_wait", lambda *args, **kwargs: dict(lease))
+    persist_lease(lease)
+    monkeypatch.setattr(pool, "_cdp_alive", lambda url: True)
+    monkeypatch.setattr(pool, "browser_identity", lambda url: "browser-a")
+    monkeypatch.setattr(pool, "list_page_targets", lambda url: set())
+    monkeypatch.setattr(pool, "close_task_targets", lambda *args: {
+        "closed": [], "remaining": [], "baseline_preserved": True,
+        "browser_restarted": False,
+    })
+    calls = {}
+    monkeypatch.setattr(pool, "subprocess", types.SimpleNamespace(
+        run=lambda command, **kwargs: calls.update(command=command, kwargs=kwargs) or types.SimpleNamespace(returncode=7),
+    ))
+    monkeypatch.setattr(pool, "_stop_daemon", lambda name: None)
+    monkeypatch.setattr(pool, "forget", lambda lease_id: None)
+    assert pool.run_command_managed("researchbot", "example.com", "default", "read", ["printf", "hello world"]) == 7
+    assert calls["command"] == ["printf", "hello world"]
+    assert calls["kwargs"]["env"]["BH_AGENT_POOL_CHILD"] == "1"
+    assert calls["kwargs"]["env"]["BH_AGENT_POOL_LEASE_ID"] == "e" * 32
+    assert calls["kwargs"]["env"]["BU_CDP_URL"] == pool.SHARED_CDP_URL
+    assert calls["kwargs"].get("shell", False) is False
+
+
+def test_exec_rejects_empty_command():
+    with pytest.raises(pool.PoolError, match="command must be non-empty"):
+        pool.run_command_managed("researchbot", "example.com", "default", "read", [])
 
 
 def test_managed_temporary_run_keeps_lease_when_cleanup_is_unsafe(tmp_path, monkeypatch):
@@ -208,7 +425,7 @@ def test_managed_temporary_run_keeps_lease_when_cleanup_is_unsafe(tmp_path, monk
     monkeypatch.setattr(pool, "_safe_rmtree", lambda *args, **kwargs: (_ for _ in ()).throw(pool.PoolError("unsafe")))
     forgotten = []
     monkeypatch.setattr(pool, "forget", forgotten.append)
-    assert pool.run_managed("researchbot", "example.com", "default", "read", "print(1)") == 0
+    assert pool.run_managed("researchbot", "example.com", "default", "read", "print(1)") == 1
     assert forgotten == []
 
 
