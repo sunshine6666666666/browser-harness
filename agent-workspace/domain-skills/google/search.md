@@ -24,8 +24,9 @@ Hosts: `google.com` / `*.google.com`。
   `MAX_BATCH_QUERIES = 20` 次/调用，超出需调用方分块。
 - 验证码/consent：遇到 `/sorry/` 或 consent 页，**抛 RuntimeError 并停止**，
   这是 human blocker，不要在循环里重试。
-- 浏览器：使用隔离 Agent Chrome（BU_CDP_URL 指向专用端口），不共享其他
-  Agent 占用的浏览器实例。
+- 浏览器：通过 source wrapper 的 `agent-pool run/exec` 进入；pool 按当前
+  Profile 和账号分配共享或临时会话并负责清理。调用方不得指定 CDP endpoint、
+  选择 CDP 端口或手工选择/复制/删除浏览器 Profile。
 
 ## UI facts（2026-08-12 实测）
 
@@ -73,7 +74,10 @@ Google SERP（`/search?hl=en&num=8`）：
 ## Example
 
 ```bash
-BH_DOMAIN_SKILLS=1 BU_NAME=agent BU_CDP_URL=http://127.0.0.1:9239 browser-harness <<'PY'
+/Users/yelin/Developer/agent-tools/browser-harness/browser-harness agent-pool run \
+  --site google.com --account default --mode read <<'PY'
+new_tab("https://www.google.com/search?hl=en&num=8")
+print(page_info())
 exec(open("/Users/yelin/Developer/agent-tools/browser-harness/agent-workspace/domain-skills/google/search.py").read())
 run("武汉天兴洲长江大桥 official english name", 8)
 PY

@@ -68,7 +68,7 @@ Sibling helper: `topic_facts.py` (same directory). It opens a topic search
 page from a hot-rank entry href and extracts raw material for downstream
 judgment/辨证 — it does NOT summarize.
 
-### `fetch_topic_facts(topic_url, max_pages=5, stale_pages=None, limit=None)`
+### `fetch_topic_facts(topic_url, max_pages=5, stale_pages=None, limit=None, sort="general")`
 
 Follows s.weibo.com pagination (`&page=N`) and scans five pages by default
 (about 100 raw posts before deduplication). It does not stop merely because an
@@ -76,11 +76,14 @@ early page lacks official media: later pages can contain additional fact
 sources. Callers can raise `max_pages` when text evidence is still incomplete,
 or explicitly set `stale_pages` for an early-stop policy.
 
+- `sort` selects the Weibo search tab: `general` (综合), `hot` (热门), or
+  `time` (实时). The selected mode is reflected in the returned `sort` field.
+
 Returns:
 
 ```python
 {"topic": "武汉通报天桥打人事件", "stats": "阅读量2857.9万 讨论量5630",
- "page_count": 5,
+ "page_count": 5, "sort": "general",
  "posts": [
    {"author": "平安武昌", "verified": True, "verify_type": "blue",
     "source_type": "official", "is_official": True, "is_media": False,
@@ -100,10 +103,11 @@ interaction counts (转发/评论/点赞); time, source device and canonical URL
 Posts stay in page order and are URL-deduplicated. The helper only extracts
 material; downstream reasoning owns factual reconstruction and contradictions.
 
-### `run(topic_url=None, limit=10)`
+### `run(topic_url=None, limit=10, sort="general")`
 
 CLI-ish entry; prints raw post material. If `topic_url` is omitted, it takes
-the first social hot-rank entry as the topic source.
+the first social hot-rank entry as the topic source. `sort` is forwarded to
+`fetch_topic_facts` and accepts `general`, `hot`, or `time`.
 
 ## Topic materials (图片素材库落地)
 
@@ -121,15 +125,16 @@ FIRST, then `topic_materials.py`, in the same session:
 exec(open(".../weibo/topic_facts.py").read())
 exec(open(".../weibo/topic_materials.py").read())
 lib = fetch_topic_materials(topic_url, out_dir, max_pages=5, stale_pages=None,
-                            limit=None, max_images_per_post=None)
+                        limit=None, max_images_per_post=None, sort="general")
 ```
 
-### `fetch_topic_materials(topic_url, out_dir, max_pages=5, stale_pages=None, limit=None, max_images_per_post=None)`
+### `fetch_topic_materials(topic_url, out_dir, max_pages=5, stale_pages=None, limit=None, max_images_per_post=None, sort="general")`
 
 - `out_dir`: root directory of the material library (per-topic subdirectory
   is created automatically).
-- `max_pages` / `stale_pages` / `limit`: forwarded to `fetch_topic_facts`
-  (how many pages/posts to collect — the caller decides the budget).
+- `max_pages` / `stale_pages` / `limit` / `sort`: forwarded to
+  `fetch_topic_facts` (how many pages/posts to collect and which search tab to
+  use — the caller decides the budget).
 - `max_images_per_post`: optional cap on images downloaded per post.
 - Downloads every post's original image URLs with a Weibo Referer header
   (Sina CDN may otherwise 403). Each image is verified: HTTP 200 and file
@@ -158,7 +163,7 @@ Return:
 is_media, time, source, text (truncated to 500 chars), url, page,
 images (remote URLs), local_images (absolute paths).
 
-### `run(topic_url=None, out_dir='/tmp/weibo_materials', max_pages=5, limit=None)`
+### `run(topic_url=None, out_dir='/tmp/weibo_materials', max_pages=5, limit=None, sort="general")`
 
 CLI-ish entry; prints the material library summary. If `topic_url` is
 omitted, it takes the first social hot-rank entry as the topic source.
@@ -166,17 +171,21 @@ omitted, it takes the first social hot-rank entry as the topic source.
 ## Example
 
 ```bash
-BH_DOMAIN_SKILLS=1 BU_NAME=agent BU_CDP_URL=http://127.0.0.1:9223 browser-harness <<'PY'
+/Users/yelin/Developer/agent-tools/browser-harness/browser-harness agent-pool run \
+  --site weibo.com --account default --mode read <<'PY'
+new_tab("https://weibo.com/hot/social")
+print(page_info())
 exec(open("/Users/yelin/Developer/agent-tools/browser-harness/agent-workspace/domain-skills/weibo/hot_rank.py").read())
-run('social', 15)
-run('entertainment', 15)
+run("social", 15)
+run("entertainment", 15)
 PY
 ```
 
 ## Verification checklist
 
-- [ ] Logged-in Agent Chrome: `goto_url('https://weibo.com/hot/social')` then
-      `page_info()` URL stays on `weibo.com/hot/social` (no `newlogin` redirect).
+- [ ] In the pool-assigned read session: `goto_url('https://weibo.com/hot/social')`
+      then `page_info()` URL stays on `weibo.com/hot/social` (no `newlogin`
+      redirect); do not select a browser instance or CDP port manually.
 - [ ] `fetch_hot_rank('social', 15)` returns 15 rows with non-empty
       rank/title/heat/href.
 - [ ] `fetch_hot_rank('entertainment', 15)` returns 15 rows.
