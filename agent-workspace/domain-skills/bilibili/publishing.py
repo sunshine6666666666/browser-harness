@@ -1,0 +1,590 @@
+"""Bilibili creator upload flow for an attached Browser Harness tab.
+
+The business gates mirror SAU's proven Bilibili CLI: verify identity, reject
+exact-title duplicates, prepare one form, submit once, then read archive
+evidence back from the creator API.
+"""
+from __future__ import annotations
+
+import json
+import re
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo
+
+from PIL import Image
+
+if TYPE_CHECKING:
+    def activate_tab(target: Any) -> str: ...
+    def click_at_xy(x: float, y: float, button: str = "left", clicks: int = 1) -> None: ...
+    def current_tab() -> dict[str, Any]: ...
+    def goto_url(url: str) -> None: ...
+    def js(expression: str) -> Any: ...
+    def page_info() -> dict[str, Any]: ...
+    def upload_file(selector: str, path: str) -> None: ...
+    def wait(seconds: float = 1.0) -> None: ...
+    def fill_input(selector: str, text: str, clear_first: bool = True, timeout: float = 0.0) -> None: ...
+    def press_key(key: str, modifiers: int = 0) -> None: ...
+
+
+UPLOAD_URL = "https://member.bilibili.com/platform/upload/video/frame"
+MANAGER_URL = "https://member.bilibili.com/platform/upload-manager/article"
+ARCHIVES_URL = "https://member.bilibili.com/x2/creative/web/archives/sp?pn=1&ps=20"
+
+
+def _visible(selector: str) -> dict[str, Any] | None:
+    return js("""(() => {
+      const el = Array.from(document.querySelectorAll(%s)).find(node => {
+        const r = node.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+      if (!el) return null;
+      el.scrollIntoView({block: 'center', inline: 'center'});
+      const r = el.getBoundingClientRect();
+      return {x: r.x + r.width / 2, y: r.y + r.height / 2,
+              text: (el.innerText || el.textContent || '').trim()};
+    })()""" % json.dumps(selector))
+
+
+def _click_visible(selector: str) -> None:
+    target = _visible(selector)
+    if not target:
+        raise RuntimeError("visible Bilibili control not found: %s" % selector)
+    wait(0.2)
+    target = _visible(selector)
+    if not target:
+        raise RuntimeError("visible Bilibili control moved away: %s" % selector)
+    click_at_xy(target["x"], target["y"])
+
+
+def _set_input(selector: str, value: str) -> None:
+    ok = js("""(() => {
+      const el = Array.from(document.querySelectorAll(%s)).find(node => {
+        const r = node.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+      if (!el) return false;
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(el, %s);
+      el.dispatchEvent(new Event('input', {bubbles: true}));
+      el.dispatchEvent(new Event('change', {bubbles: true}));
+      el.dispatchEvent(new Event('blur', {bubbles: true}));
+      return el.value === %s;
+    })()""" % (json.dumps(selector), json.dumps(value), json.dumps(value)))
+    if not ok:
+        raise RuntimeError("could not set Bilibili field: %s" % selector)
+
+
+def _normalized_text(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _wait_until(callback, timeout: float, message: str):
+    deadline = time.monotonic() + timeout
+    while True:
+        result = callback()
+        if result:
+            return result
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(message)
+        wait(min(0.2, remaining))
+
+
+def _selected_tags() -> list[str]:
+    return js("Array.from(document.querySelectorAll('.label-item-v2-content')).map(e => (e.innerText || '').trim()).filter(Boolean)") or []
+
+
+def _visible_text(text: str, selector: str = "button,[role=button],[role=option],.bcc-option,.drop-list-item,.menu-item") -> dict[str, Any] | None:
+    return js("""(() => {
+      const wanted = %s;
+      const el = Array.from(document.querySelectorAll(%s)).find(node => {
+        const r = node.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && (node.innerText || node.textContent || '').trim() === wanted;
+      });
+      if (!el) return null;
+      el.scrollIntoView({block: 'center', inline: 'center'});
+      const r = el.getBoundingClientRect();
+      return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+    })()""" % (json.dumps(text), json.dumps(selector)))
+
+
+def _click_visible_text(text: str, selector: str = "button,[role=button],[role=option],.bcc-option,.drop-list-item,.menu-item") -> None:
+    target = _visible_text(text, selector)
+    if not target:
+        raise RuntimeError("visible Bilibili option not found: %s" % text)
+    click_at_xy(target["x"], target["y"])
+
+
+def _schedule_state() -> dict[str, Any]:
+    return js("""(() => ({
+      scheduled: document.querySelector('.time-switch-wrp .switch-container')?.classList.contains('switch-container-active') || false,
+      schedule_date: document.querySelector('.date-picker-date .date-show')?.innerText.trim() || '',
+      schedule_time: document.querySelector('.date-picker-timer .date-show')?.innerText.trim() || ''
+    }))()""") or {"scheduled": False, "schedule_date": "", "schedule_time": ""}
+
+
+def _cover_state() -> dict[str, Any]:
+    return js("""(() => {
+      const visible = node => {
+        const r = node.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      };
+      const input = Array.from(document.querySelectorAll('input[type=file][data-bh-cover-input="1"]')).find(visible);
+      const filename = input?.files?.[0]?.name || input?.value?.split('\\\\').pop() || '';
+      const image = Array.from(document.querySelectorAll('.cover-wrp img,.cover-preview img,.cover-image img')).find(visible);
+      return {
+        cover_ready: !Boolean(document.querySelector('.cover-empty-pill')),
+        custom_cover_set: Boolean(filename && image?.src),
+        cover_filename: filename
+      };
+    })()""") or {"cover_ready": False, "custom_cover_set": False, "cover_filename": ""}
+
+
+def _partition_value() -> str:
+    return _normalized_text(js("""(() => {
+      const visible = node => {
+        const r = node.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      };
+      const candidates = Array.from(document.querySelectorAll('[role=combobox],.partition-select,.partition-container .select-item,.select-item'))
+        .filter(visible);
+      const marked = candidates.find(node => /分区|category|partition/i.test(node.getAttribute('aria-label') || '') ||
+        /分区/.test(node.parentElement?.innerText || ''));
+      const node = marked || candidates.find(item => (item.innerText || '').trim() && !/创作声明|合集/.test(item.innerText));
+      return node?.querySelector('.selected,.select-value,[role=option]')?.innerText || node?.innerText || '';
+    })()"""))
+
+
+def account_identity() -> dict[str, Any]:
+    identity = js("""fetch('https://api.bilibili.com/x/web-interface/nav', {
+      credentials: 'include'
+    }).then(r => r.json()).then(x => ({
+      code: x.code, mid: x.data && x.data.mid, uname: x.data && x.data.uname,
+      isLogin: Boolean(x.data && x.data.isLogin)
+    }))""")
+    if not identity or identity.get("code") != 0 or not identity.get("isLogin"):
+        raise RuntimeError("Bilibili session is not logged in")
+    return identity
+
+
+def archive_matches(title: str) -> list[dict[str, Any]]:
+    return js("""fetch(%s, {credentials: 'include'})
+      .then(r => r.json()).then(x => {
+        if (x.code !== 0) throw new Error('archive API: ' + x.code + ' ' + x.message);
+        return ((x.data && x.data.arc_audits) || []).map(row => row.Archive || row)
+          .filter(row => String(row.title || '').trim() === %s)
+          .map(row => ({aid: row.aid || row.id, bvid: row.bvid || '',
+                        title: row.title || '', state: row.state ?? row.status,
+                        dtime: row.dtime || row.pubtime || null,
+                        cover_present: Boolean(row.cover || row.pic || row.cover_url)}));
+      })""" % (json.dumps(ARCHIVES_URL), json.dumps(title.strip()))) or []
+
+
+def require_identity(expected_mid: int, expected_name: str | None = None) -> dict[str, Any]:
+    observed = account_identity()
+    if int(observed["mid"]) != int(expected_mid):
+        raise RuntimeError("blocked publish identity: expected mid=%s, observed mid=%s" %
+                           (expected_mid, observed["mid"]))
+    if expected_name and expected_name not in str(observed.get("uname") or ""):
+        raise RuntimeError("blocked publish identity: expected name=%s, observed name=%s" %
+                           (expected_name, observed.get("uname")))
+    return observed
+
+
+def prepare_upload(video_file: str, title: str, expected_mid: int,
+                   expected_name: str | None = None, timeout: int = 600) -> dict[str, Any]:
+    path = Path(video_file)
+    if not path.is_file() or path.stat().st_size == 0:
+        raise ValueError("video file is missing or empty: %s" % path)
+    if not title.strip() or len(title) > 80:
+        raise ValueError("Bilibili title must contain 1-80 characters")
+    identity = require_identity(expected_mid, expected_name)
+    if archive_matches(title):
+        raise RuntimeError("Bilibili exact title already exists; refusing duplicate submission")
+    if page_info().get("url") != UPLOAD_URL:
+        goto_url(UPLOAD_URL)
+        wait(3)
+    current_file = js("document.querySelector('input[type=file][accept*=\".mp4\"]')?.value || ''")
+    if path.name not in current_file:
+        upload_file('input[type=file][accept*=".mp4"]', str(path))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        body = js("document.body.innerText") or ""
+        if "上传完成" in body:
+            break
+        wait(2)
+    else:
+        raise TimeoutError("Bilibili video upload did not reach 上传完成")
+    _set_input('input[placeholder="请输入稿件标题"]', title)
+    return {"identity": identity, "title": title, "video": str(path), "uploaded": True}
+
+
+def choose_recommended_cover() -> None:
+    if not js("Boolean(document.querySelector('.cover-empty-pill'))"):
+        return
+    js("document.querySelector('.cover-empty-pill').click()")
+    wait(1)
+    result = js("""(() => {
+      const buttons = Array.from(document.querySelectorAll('.button.submit,button')).filter(b => {
+        const r = b.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && (b.innerText || '').trim() === '完成';
+      });
+      const b = buttons[buttons.length - 1];
+      if (!b) return false;
+      b.click();
+      return true;
+    })()""")
+    if not result:
+        raise RuntimeError("Bilibili cover completion button not found")
+    wait(1)
+    if js("Boolean(document.querySelector('.cover-empty-pill'))"):
+        raise RuntimeError("Bilibili recommended cover was not accepted")
+
+
+def set_custom_cover(path: str, timeout: float = 30) -> dict[str, Any]:
+    image_path = Path(path)
+    if not image_path.is_file() or image_path.stat().st_size == 0:
+        raise ValueError("Bilibili cover file is missing or empty: %s" % image_path)
+    try:
+        with Image.open(image_path) as image:
+            width, height = image.size
+    except (OSError, ValueError) as exc:
+        raise ValueError("Bilibili cover file is not a readable image: %s" % image_path) from exc
+    marked = js("""(() => {
+      const visible = node => {
+        const r = node.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      };
+      const input = Array.from(document.querySelectorAll('input[type=file]')).find(node =>
+        visible(node) && !/mp4|video/i.test(node.accept || '')
+      );
+      if (!input) return false;
+      input.setAttribute('data-bh-cover-input', '1');
+      return true;
+    })()""")
+    if not marked:
+        raise RuntimeError("visible Bilibili custom cover input not found")
+    upload_file('input[type=file][data-bh-cover-input="1"]', str(image_path))
+    _click_visible_text("完成", "button,[role=button],.button.submit")
+    state = _wait_until(
+        lambda: (lambda value: value if value.get("cover_ready") and value.get("custom_cover_set")
+                 and value.get("cover_filename") == image_path.name else None)(_cover_state()),
+        timeout,
+        "Bilibili custom cover was not accepted",
+    )
+    return {"custom_cover_set": True, "filename": state["cover_filename"],
+            "width": width, "height": height}
+
+
+def set_tags(tags: list[str], timeout: float = 10) -> list[str]:
+    normalized = []
+    for tag in tags:
+        value = _normalized_text(tag)
+        if not value:
+            raise ValueError("Bilibili tags cannot contain blank entries")
+        if value not in normalized:
+            normalized.append(value)
+    if not normalized:
+        raise ValueError("Bilibili requires at least one tag")
+    selector = 'input[placeholder="按回车键Enter创建标签"]'
+    for tag in normalized:
+        fill_input(selector, tag)
+        js("""(() => {
+          const el = document.querySelector(%s);
+          if (el) {
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+          }
+        })()""" % json.dumps(selector))
+        press_key("Enter")
+        try:
+            _wait_until(lambda: tag in _selected_tags(), timeout,
+                        "Bilibili tag was not accepted: %s" % tag)
+        except TimeoutError as exc:
+            raise RuntimeError("Bilibili tag was not accepted: %s; observed=%s" %
+                               (tag, _selected_tags())) from exc
+    return _selected_tags()
+
+
+def set_declaration(label: str = "内容无需标注") -> None:
+    _click_visible('input[placeholder*="创作声明"]')
+    _click_visible_text(label, ".bcc-option,[role=option],button")
+    observed = _normalized_text(js("""(() => {
+      const input = Array.from(document.querySelectorAll('input[placeholder*="创作声明"]')).find(node => {
+        const r = node.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+      return input?.value || '';
+    })()"""))
+    if observed != label:
+        raise RuntimeError("Bilibili declaration was not accepted: %s" % observed)
+
+
+def set_partition(name: str, timeout: float = 10) -> str:
+    requested = _normalized_text(name)
+    if not requested:
+        raise ValueError("Bilibili partition name cannot be blank")
+    target = js("""(() => {
+      const visible = node => {
+        const r = node.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      };
+      const candidates = Array.from(document.querySelectorAll('[role=combobox],.partition-select,.partition-container .select-item,.select-item'))
+        .filter(visible);
+      const node = candidates.find(item => /分区|category|partition/i.test(item.getAttribute('aria-label') || '') ||
+        /分区/.test(item.parentElement?.innerText || ''));
+      if (!node) return null;
+      node.scrollIntoView({block: 'center', inline: 'center'});
+      const r = node.getBoundingClientRect();
+      return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+    })()""")
+    if not target:
+        raise RuntimeError("visible Bilibili partition selector not found")
+    click_at_xy(target["x"], target["y"])
+    _wait_until(lambda: _visible_text(requested), timeout,
+                "Bilibili partition option was not found: %s" % requested)
+    _click_visible_text(requested)
+    try:
+        return _wait_until(lambda: _partition_value() if _partition_value() == requested else None,
+                           timeout, "Bilibili partition was not accepted: %s" % requested)
+    except TimeoutError:
+        second = _visible_text(requested)
+        if second:
+            click_at_xy(second["x"], second["y"])
+        return _wait_until(lambda: _partition_value() if _partition_value() == requested else None,
+                           timeout, "Bilibili partition was not accepted: requested=%s observed=%s" %
+                           (requested, _partition_value()))
+
+
+def set_description(text: str, timeout: float = 10) -> str:
+    requested = _normalized_text(text)
+    ok = js("""(() => {
+      const el = Array.from(document.querySelectorAll('.ql-editor[contenteditable="true"]')).find(node => {
+        const r = node.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+      if (!el) return false;
+      el.focus();
+      el.innerText = %s;
+      for (const type of ['beforeinput', 'input', 'change', 'blur']) {
+        el.dispatchEvent(new Event(type, {bubbles: true}));
+      }
+      return true;
+    })()""" % json.dumps(requested))
+    if not ok:
+        raise RuntimeError("visible Bilibili description editor not found")
+    return _wait_until(
+        lambda: (lambda value: value if value == requested else None)(
+            _normalized_text(js("document.querySelector('.ql-editor[contenteditable=\"true\"]')?.innerText || ''"))
+        ),
+        timeout,
+        "Bilibili description was not accepted",
+    )
+
+
+def _set_schedule_time_value(hour: int, minute: int) -> str:
+    active = js("document.querySelector('.time-switch-wrp .switch-container')?.classList.contains('switch-container-active')")
+    if not active:
+        js("document.querySelector('.time-switch-wrp .switch-container').click()")
+        wait(0.4)
+    picker_open = js("""(() => {
+      const el = document.querySelector('.time-picker-container');
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    })()""")
+    if not picker_open:
+        js("document.querySelector('.date-picker-timer').click()")
+        wait(0.2)
+    ok = js("""(() => {
+      const panels = document.querySelectorAll('.time-picker-panel-select-wrp');
+      const pick = (panel, value) => {
+        const el = Array.from(panel.querySelectorAll('.time-picker-panel-select-item'))
+          .find(x => x.textContent.trim() === value && !x.classList.contains('time-select-disabled'));
+        if (!el) return false;
+        el.click();
+        return true;
+      };
+      return panels.length >= 2 && pick(panels[0], %s);
+    })()""" % json.dumps(f"{hour:02d}"))
+    wait(0.2)
+    ok = bool(ok) and bool(js("""(() => {
+      const panels = document.querySelectorAll('.time-picker-panel-select-wrp');
+      if (panels.length < 2) return false;
+      const el = Array.from(panels[1].querySelectorAll('.time-picker-panel-select-item'))
+        .find(x => x.textContent.trim() === %s && !x.classList.contains('time-select-disabled'));
+      if (!el) return false;
+      el.click();
+      return true;
+    })()""" % json.dumps(f"{minute:02d}")))
+    wait(0.3)
+    observed = js("document.querySelector('.date-picker-timer .date-show')?.innerText.trim() || ''")
+    expected = f"{hour:02d}:{minute:02d}"
+    if not ok or observed != expected:
+        raise RuntimeError("Bilibili schedule time was not accepted: %s" % observed)
+    return expected
+
+
+def set_schedule_datetime(value: str, timeout: float = 15) -> dict[str, str]:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", value or ""):
+        raise ValueError("Bilibili schedule must use YYYY-MM-DD HH:MM")
+    try:
+        target = datetime.strptime(value, "%Y-%m-%d %H:%M")
+    except ValueError as exc:
+        raise ValueError("Bilibili schedule must use YYYY-MM-DD HH:MM") from exc
+    if target.minute % 5:
+        raise ValueError("Bilibili schedule minute must be divisible by five")
+    now = datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+    if target < now + timedelta(minutes=5):
+        raise ValueError("Bilibili schedule must be at least five minutes in the future")
+    if target > now + timedelta(days=15):
+        raise ValueError("Bilibili schedule cannot be more than fifteen days ahead")
+    date, clock = value.split(" ", 1)
+    date_set = js("""(() => {
+      const input = Array.from(document.querySelectorAll('input[type=date],.date-picker-date input')).find(node => {
+        const r = node.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+      if (!input) return false;
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(input, %s);
+      input.dispatchEvent(new Event('input', {bubbles: true}));
+      input.dispatchEvent(new Event('change', {bubbles: true}));
+      return true;
+    })()""" % json.dumps(date))
+    if not date_set:
+        date_control = _visible('.date-picker-date')
+        if not date_control:
+            raise RuntimeError("Bilibili schedule date control not found")
+        click_at_xy(date_control["x"], date_control["y"])
+        _click_visible_text(date, "button,[role=option],.calendar-day,.date-picker-panel *")
+    hour, minute = map(int, clock.split(":", 1))
+    _set_schedule_time_value(hour, minute)
+    state = _wait_until(
+        lambda: (lambda current: current if current.get("scheduled") and
+                 current.get("schedule_date") == date and current.get("schedule_time") == clock else None)(_schedule_state()),
+        timeout,
+        "Bilibili schedule readback did not match: %s" % value,
+    )
+    return {"schedule_date": state["schedule_date"], "schedule_time": state["schedule_time"],
+            "schedule": "%s %s" % (state["schedule_date"], state["schedule_time"])}
+
+
+def set_schedule_time(hour: int, minute: int) -> str:
+    if not 0 <= hour <= 23 or minute not in range(0, 60, 5):
+        raise ValueError("Bilibili schedule requires hour 0-23 and a 5-minute minute value")
+    value = "%s %02d:%02d" % (datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d"), hour, minute)
+    return set_schedule_datetime(value)["schedule_time"]
+
+
+def submission_snapshot() -> dict[str, Any]:
+    cover = _cover_state()
+    schedule = _schedule_state()
+    return {
+        "title": _normalized_text(js("document.querySelector('input[placeholder=\"请输入稿件标题\"]')?.value || ''")),
+        "cover_ready": bool(cover.get("cover_ready")),
+        "custom_cover_set": bool(cover.get("custom_cover_set")),
+        "cover_filename": cover.get("cover_filename", ""),
+        "partition": _partition_value(),
+        "description": _normalized_text(js("document.querySelector('.ql-editor[contenteditable=\"true\"]')?.innerText || ''")),
+        "tags": _selected_tags(),
+        "declaration": _normalized_text(js("document.querySelector('input[placeholder*=\"创作声明\"]')?.value || ''")),
+        "scheduled": bool(schedule.get("scheduled")),
+        "schedule_date": schedule.get("schedule_date", ""),
+        "schedule_time": schedule.get("schedule_time", ""),
+        "submit_text": js("""Array.from(document.querySelectorAll('.submit-add,button')).map(x => (x.innerText || '').trim()).find(x => x === '立即投稿') || ''""") or "",
+    }
+
+
+def manager_evidence(title: str, expected_schedule: str | None = None,
+                     strict: bool = True) -> dict[str, Any]:
+    goto_url(MANAGER_URL)
+    wait(4)
+    evidence = js("""(() => {
+      const card = Array.from(document.querySelectorAll('.article-card.v2')).find(row =>
+        (row.querySelector('a.name')?.innerText || '').trim() === %s);
+      if (!card) return null;
+      return {title: (card.querySelector('a.name')?.innerText || '').trim(),
+              href: card.querySelector('a.name')?.href || '',
+              text: (card.innerText || '').trim()};
+    })()""" % json.dumps(title.strip()))
+    if not evidence:
+        raise RuntimeError("Bilibili creator manager has no exact-title record")
+    if expected_schedule:
+        date, clock = expected_schedule.split(" ", 1)
+        chinese = "%s年%s月%s日 %s" % (*date.split("-"), clock)
+        evidence["schedule_match"] = "定时发布" in evidence["text"] and chinese in evidence["text"]
+        evidence["expected_schedule"] = expected_schedule
+        if strict and not evidence["schedule_match"]:
+            raise RuntimeError("Bilibili manager schedule mismatch: %s" % evidence["text"])
+    else:
+        evidence["schedule_match"] = True
+    return evidence
+
+
+def submit_once(title: str, expected_mid: int, expected_name: str | None = None,
+                expected_schedule: str | None = None, timeout: int = 600) -> dict[str, Any]:
+    identity = require_identity(expected_mid, expected_name)
+    existing = archive_matches(title)
+    if len(existing) > 1:
+        raise RuntimeError("Bilibili archive title matched multiple records")
+    if existing:
+        raise RuntimeError("Bilibili exact title already exists; refusing duplicate submission")
+    snapshot = submission_snapshot()
+    observed_schedule = "%s %s" % (snapshot.get("schedule_date"), snapshot.get("schedule_time"))
+    if (snapshot.get("title") != title or not snapshot.get("cover_ready") or
+            not snapshot.get("custom_cover_set") or not snapshot.get("tags") or
+            not snapshot.get("partition") or not snapshot.get("description") or
+            not snapshot.get("declaration") or not snapshot.get("scheduled") or
+            (expected_schedule and observed_schedule != expected_schedule)):
+        raise RuntimeError("Bilibili preflight failed: %s" % snapshot)
+    js("document.querySelector('input[placeholder=\"请输入稿件标题\"]')?.click()")
+    wait(0.3)
+    picker_open = js("""(() => {
+      const el = document.querySelector('.time-picker-container');
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    })()""")
+    if picker_open:
+        js("document.querySelector('.date-picker-timer')?.click()")
+        wait(0.3)
+    activate_tab(current_tab())
+    _click_visible('.submit-add')
+    clicked = True
+    deadline = time.monotonic() + timeout
+    archive = None
+    last_manager_error = ""
+    while time.monotonic() < deadline:
+        matches = archive_matches(title)
+        if len(matches) == 1:
+            archive = matches[0]
+            try:
+                manager = manager_evidence(title, expected_schedule, strict=False)
+            except RuntimeError as exc:
+                last_manager_error = str(exc)
+            else:
+                if manager.get("schedule_match"):
+                    return {"identity": identity, "submitted": True, "status": "verified",
+                            "archive": archive, "manager": manager, "submit_clicks": int(clicked)}
+                last_manager_error = manager.get("text") or "Bilibili manager schedule evidence is not ready"
+        elif len(matches) > 1:
+            raise RuntimeError("Bilibili archive title matched multiple records")
+        wait(min(3, max(0, deadline - time.monotonic())))
+    if archive is not None:
+        return {"identity": identity, "submitted": True,
+                "status": "accepted_but_schedule_unverified", "archive": archive,
+                "expected_schedule": expected_schedule, "manager_error": last_manager_error,
+                "submit_clicks": int(clicked)}
+    raise TimeoutError("Bilibili submission has no creator archive evidence after waiting; do not retry blindly")
+
+
+def _self_check() -> None:
+    assert UPLOAD_URL.startswith("https://member.bilibili.com/")
+    assert len("巴黎奥运选手赛后身体不适") <= 80
+
+
+_self_check()
