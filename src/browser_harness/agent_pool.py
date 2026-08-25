@@ -269,6 +269,45 @@ def _resolve_browser(browser_name: str | None) -> dict:
     return browser
 
 
+def browser_name_for_cdp(cdp_url: str | None) -> str | None:
+    if not cdp_url:
+        return None
+    parsed = urlparse(cdp_url)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise PoolError("explicit CDP URL has an invalid port") from exc
+    if parsed.hostname not in {"127.0.0.1", "localhost"} or not port:
+        return None
+    command = [sys.executable, str(FLEET_SCRIPT), "audit"]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PoolError(f"browser fleet audit failed: {exc}") from exc
+    if result.returncode != 0:
+        raise PoolError(f"browser fleet audit rejected the request: {result.stderr.strip()}")
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise PoolError("browser fleet audit returned invalid JSON") from exc
+    registered = data.get("registered") if isinstance(data, dict) else None
+    if not isinstance(registered, list):
+        raise PoolError("browser fleet audit returned no registered browser list")
+    matches = [item for item in registered if isinstance(item, dict) and item.get("port") == port]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise PoolError(f"browser fleet has multiple registrations for CDP port {port}")
+    browser = matches[0]
+    if (browser.get("status") != "running" or browser.get("health") != "ok"
+            or browser.get("problems")):
+        raise PoolError(f"registered browser on CDP port {port} is not healthy")
+    name = browser.get("name")
+    if not isinstance(name, str) or not name:
+        raise PoolError(f"registered browser on CDP port {port} has no name")
+    return name
+
+
 def list_page_targets(cdp_url: str) -> set[str]:
     base_url = _validate_cdp_url(cdp_url)
     try:

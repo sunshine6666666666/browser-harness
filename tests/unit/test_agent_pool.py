@@ -92,6 +92,54 @@ def test_resolver_rejects_non_loopback_cdp(monkeypatch):
         pool._resolve_browser("热点监控")
 
 
+def _audit_result(*registered):
+    return types.SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({"registered": list(registered)}),
+        stderr="",
+    )
+
+
+def test_browser_name_for_cdp_matches_healthy_registered_port(monkeypatch):
+    browser = {"name": "SAU-自媒体运营-2号-9226", "port": 9226,
+               "status": "running", "health": "ok", "problems": []}
+    monkeypatch.setattr(pool.subprocess, "run", lambda *args, **kwargs: _audit_result(browser))
+    assert pool.browser_name_for_cdp("http://127.0.0.1:9226") == browser["name"]
+
+
+def test_browser_name_for_cdp_keeps_unregistered_endpoint_exact(monkeypatch):
+    monkeypatch.setattr(pool.subprocess, "run", lambda *args, **kwargs: _audit_result())
+    assert pool.browser_name_for_cdp("http://127.0.0.1:9333") is None
+
+
+def test_browser_name_for_cdp_ignores_remote_websocket(monkeypatch):
+    def fail(*args, **kwargs):
+        raise AssertionError("remote endpoints must not invoke fleet audit")
+    monkeypatch.setattr(pool.subprocess, "run", fail)
+    assert pool.browser_name_for_cdp("wss://provider.example/devtools/browser/id") is None
+
+
+def test_browser_name_for_cdp_rejects_malformed_port():
+    with pytest.raises(pool.PoolError, match="invalid port"):
+        pool.browser_name_for_cdp("http://127.0.0.1:not-a-port")
+
+
+def test_browser_name_for_cdp_rejects_duplicate_registration(monkeypatch):
+    browser = {"name": "browser", "port": 9226, "status": "running",
+               "health": "ok", "problems": []}
+    monkeypatch.setattr(pool.subprocess, "run", lambda *args, **kwargs: _audit_result(browser, browser))
+    with pytest.raises(pool.PoolError, match="multiple registrations"):
+        pool.browser_name_for_cdp("ws://localhost:9226")
+
+
+def test_browser_name_for_cdp_rejects_unhealthy_registration(monkeypatch):
+    browser = {"name": "browser", "port": 9226, "status": "running",
+               "health": "error", "problems": ["conflict"]}
+    monkeypatch.setattr(pool.subprocess, "run", lambda *args, **kwargs: _audit_result(browser))
+    with pytest.raises(pool.PoolError, match="not healthy"):
+        pool.browser_name_for_cdp("http://127.0.0.1:9226")
+
+
 def test_heartbeat_refreshes_lease(isolated):
     lease = pool.reserve("one", "example.com", "a", "read", now=10)
     updated = pool.heartbeat(lease["id"], now=99)

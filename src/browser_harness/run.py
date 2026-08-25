@@ -383,13 +383,17 @@ def _run(args):
         if agent_pool.should_manage_legacy():
             # Legacy Hermes Skills are conservatively treated as writes. Explicit
             # agent-pool callers can declare read mode and gain safe parallelism.
-            sys.exit(agent_pool.run_managed(
-                agent_pool._default_owner(),
-                agent_pool.infer_site(code),
-                "default",
-                "write",
-                code,
-            ))
+            explicit_endpoint = os.environ.get("BU_CDP_WS") or os.environ.get("BU_CDP_URL")
+            browser_name = agent_pool.browser_name_for_cdp(explicit_endpoint)
+            if not explicit_endpoint or browser_name:
+                sys.exit(agent_pool.run_managed(
+                    agent_pool._default_owner(),
+                    agent_pool.infer_site(code),
+                    "default",
+                    "write",
+                    code,
+                    browser_name=browser_name,
+                ))
     if not cloud_admin:
         if (
             not daemon_alive()
