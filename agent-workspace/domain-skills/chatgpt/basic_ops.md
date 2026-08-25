@@ -58,7 +58,7 @@ PY
 | `close_extra_tab(fragment=None)` | Close most recently opened content tab; option to protect tabs by URL fragment |
 | `export_share_link(fragment=None)` | Export conversation as public link. Header `share-chat-button` copies conversation-level `/share/` link to clipboard directly (toast, no dialog). Fallback: message-level share → `/s/p_...` single-message link. **Link is public on the internet** |
 | `read_shared_conversation(url)` | Open share link in new tab, return visible conversation text, close tab |
-| `rename_chat(url_or_id, new_title)` | Require the exact conversation URL/ID, edit only `input[aria-label="聊天标题"]`, explicitly blur the controlled input, then leave/reopen and verify that exact `/c/<id>` row persisted |
+| `rename_chat(url_or_id, new_title)` | Require the exact conversation URL/ID, edit only `input[aria-label="聊天标题"]`, explicitly blur the controlled input, then leave/reopen and verify that exact `/c/<id>` row persisted; if that read still shows the old title, retry the exact transaction once |
 | `toggle_user_message_expand(i=0)` | Expand/collapse long user prompt (`collapsible-user-message-toggle`) |
 | `expand_all_user_messages()` | Expand every collapsed long prompt; returns count |
 | `send_and_wait(text, timeout=180)` | Require `definitely_sent`, then poll until reply finishes; an unknown send stops without retrying |

@@ -722,6 +722,39 @@ def test_rename_chat_targets_exact_url_and_verifies_persisted_title():
     assert all(conversation_id in script for script in (calls[0], calls[-1]))
 
 
+def test_rename_chat_retries_once_when_exact_row_still_has_generated_title():
+    conversation_id = "6a712ec4-5f58-83ea-b6fd-2b58edb87c98"
+    new_title = "2026-08-26 English Coach"
+    navigations = []
+    row_reads = {"n": 0}
+
+    def fake_js(script):
+        if "history-item-" in script:
+            return {"found": True}
+        if "t === '重命名'" in script:
+            return {"found": True}
+        if "HTMLInputElement.prototype" in script:
+            return {"found": True, "blurred": True, "commit_dispatched": True}
+        if "inputGone" in script:
+            row_reads["n"] += 1
+            # First transaction: the in-place check sees the new title, but
+            # the first post-reopen read still exposes ChatGPT's old title.
+            if row_reads["n"] == 2:
+                title = "ChatGPT generated title"
+            else:
+                title = new_title
+            return {"found": True, "input_gone": True, "title": title}
+        raise AssertionError(f"unexpected JS: {script[:100]}")
+
+    ops = load_ops(fake_js, goto_impl=navigations.append)
+    assert ops["rename_chat"](f"https://chatgpt.com/c/{conversation_id}", new_title) == new_title
+    assert row_reads["n"] == 4
+    assert navigations == [
+        "https://chatgpt.com/", f"https://chatgpt.com/c/{conversation_id}",
+        "https://chatgpt.com/", f"https://chatgpt.com/c/{conversation_id}",
+    ]
+
+
 def test_send_and_wait_stops_on_unknown_send_without_retrying():
     ops = load_ops(lambda script: None)
     ops["send_message"] = lambda text: {"status": "unknown", "url": "https://chatgpt.com/"}

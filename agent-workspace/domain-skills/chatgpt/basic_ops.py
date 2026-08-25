@@ -1086,12 +1086,23 @@ def _open_exact_conversation_options(conversation_id: str) -> None:
     wait(1.2)
 
 
-def rename_chat(conversation: str, new_title: str) -> str:
-    """Rename one exact conversation URL/ID and verify only that sidebar row."""
-    conversation_id = _conversation_id(conversation)
-    new_title = _norm(new_title)
-    if not new_title:
-        raise RuntimeError("rename_chat: new title must not be empty")
+def _read_exact_conversation_row(conversation_id: str) -> dict[str, Any]:
+    return js(r"""
+    (() => {
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+      const suffix = '/c/' + %r;
+      const a = [...document.querySelectorAll('a[href*="/c/"]')].find(x =>
+        x.offsetParent && new URL(x.href, location.href).pathname === suffix);
+      const inputGone = ![...document.querySelectorAll('input[aria-label="聊天标题"], input[aria-label="Chat title"]')]
+        .some(x => x.offsetParent);
+      const title = a ? norm(a.innerText || a.textContent).split('\n')[0] : null;
+      return {found: !!a, input_gone: inputGone, title: title};
+    })()
+    """ % conversation_id) or {}
+
+
+def _rename_chat_once(conversation_id: str, new_title: str) -> dict[str, Any]:
+    """Perform one exact-URL rename transaction and return its final row read."""
     _open_exact_conversation_options(conversation_id)
     ren = js(r"""
     (() => {
@@ -1138,18 +1149,7 @@ def rename_chat(conversation: str, new_title: str) -> str:
         raise RuntimeError("rename_chat: title input commit sequence could not be dispatched")
 
     wait(1.5)
-    check = js(r"""
-    (() => {
-      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-      const suffix = '/c/' + %r;
-      const a = [...document.querySelectorAll('a[href*="/c/"]')].find(x =>
-        x.offsetParent && new URL(x.href, location.href).pathname === suffix);
-      const inputGone = ![...document.querySelectorAll('input[aria-label="聊天标题"], input[aria-label="Chat title"]')]
-        .some(x => x.offsetParent);
-      const title = a ? norm(a.innerText || a.textContent).split('\n')[0] : null;
-      return {found: !!a, input_gone: inputGone, title: title};
-    })()
-    """ % conversation_id) or {}
+    check = _read_exact_conversation_row(conversation_id)
     if not check.get("found") or not check.get("input_gone") or check.get("title") != new_title:
         raise RuntimeError(f"rename_chat: exact /c/{conversation_id} row did not save title {new_title!r}")
 
@@ -1160,21 +1160,40 @@ def rename_chat(conversation: str, new_title: str) -> str:
     goto_url(target_url)
     wait_for_load(timeout=20)
     wait(2.0)
-    persisted = js(r"""
-    (() => {
-      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-      const suffix = '/c/' + %r;
-      const a = [...document.querySelectorAll('a[href*="/c/"]')].find(x =>
-        x.offsetParent && new URL(x.href, location.href).pathname === suffix);
-      const inputGone = ![...document.querySelectorAll('input[aria-label="聊天标题"], input[aria-label="Chat title"]')]
-        .some(x => x.offsetParent);
-      const title = a ? norm(a.innerText || a.textContent).split('\n')[0] : null;
-      return {found: !!a, input_gone: inputGone, title: title};
-    })()
-    """ % conversation_id) or {}
-    if not persisted.get("found") or not persisted.get("input_gone") or persisted.get("title") != new_title:
-        raise RuntimeError(f"rename_chat: exact /c/{conversation_id} title {new_title!r} did not persist after reload")
-    return persisted["title"]
+    return _read_exact_conversation_row(conversation_id)
+
+
+def rename_chat(conversation: str, new_title: str) -> str:
+    """Rename one exact conversation, retrying one stale persistence read only."""
+    conversation_id = _conversation_id(conversation)
+    new_title = _norm(new_title)
+    if not new_title:
+        raise RuntimeError("rename_chat: new title must not be empty")
+
+    def _persisted(row: dict[str, Any]) -> bool:
+        return bool(row.get("found") and row.get("input_gone") and
+                    row.get("title") == new_title)
+
+    persisted = _rename_chat_once(conversation_id, new_title)
+    if _persisted(persisted):
+        return persisted["title"]
+
+    # A newly-created row can transiently accept the edit while the first
+    # leave/reopen read still exposes its generated title. Retry the complete
+    # exact-URL transaction once, and only when that read proves the row is
+    # still present with a different title. Never retry a missing/ambiguous row.
+    retry_attempted = False
+    if (persisted.get("found") and persisted.get("title") and
+            persisted.get("title") != new_title):
+        retry_attempted = True
+        persisted = _rename_chat_once(conversation_id, new_title)
+        if _persisted(persisted):
+            return persisted["title"]
+
+    suffix = "after bounded retry" if retry_attempted else "after reload"
+    raise RuntimeError(
+        f"rename_chat: exact /c/{conversation_id} title {new_title!r} did not persist {suffix}"
+    )
 
 
 def toggle_user_message_expand(msg_index: int = 0) -> str:
