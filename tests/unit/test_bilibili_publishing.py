@@ -1,5 +1,6 @@
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -212,6 +213,12 @@ def test_description_dispatches_and_reads_back_normalized_text():
 
 def test_schedule_datetime_accepts_date_and_time_and_enforces_bounds(monkeypatch):
     namespace, _ = load_publishing()
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 8, 25, 12, tzinfo=tz)
+
+    monkeypatch.setitem(namespace, "datetime", FixedDateTime)
     assert namespace["set_schedule_datetime"]("2026-08-30 22:00", timeout=0) == {
         "schedule_date": "2026-08-30", "schedule_time": "22:00", "schedule": "2026-08-30 22:00"
     }

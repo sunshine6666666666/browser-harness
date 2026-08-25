@@ -22,19 +22,17 @@ def test_stdin_executes_code():
     assert stdout.getvalue().strip() == "hello from stdin"
 
 
-def test_legacy_hermes_registered_explicit_endpoint_stays_direct(monkeypatch):
+def test_legacy_hermes_registered_explicit_endpoint_uses_exact_browser(monkeypatch):
     monkeypatch.setenv("BU_CDP_URL", "http://127.0.0.1:9226")
     with patch.object(sys, "argv", ["browser-harness"]), \
          patch("sys.stdin", StringIO("x = 1")), \
          patch("browser_harness.run.print_update_banner"), \
          patch("browser_harness.agent_pool.should_manage_legacy", return_value=True), \
-         patch("browser_harness.agent_pool.browser_name_for_cdp") as mock_lookup, \
-         patch("browser_harness.run.ensure_daemon") as mock_ensure, \
-         patch("browser_harness.agent_pool.run_managed") as mock_run:
-        run.main()
-    mock_run.assert_not_called()
-    mock_lookup.assert_not_called()
-    mock_ensure.assert_called_once()
+         patch("browser_harness.agent_pool.browser_name_for_cdp", return_value="SAU-自媒体运营-2号-9226"), \
+         patch("browser_harness.agent_pool.run_managed", side_effect=SystemExit(0)) as mock_run:
+        with pytest.raises(SystemExit):
+            run.main()
+    assert mock_run.call_args.kwargs["browser_name"] == "SAU-自媒体运营-2号-9226"
 
 
 def test_legacy_hermes_remote_explicit_endpoint_stays_direct(monkeypatch):
