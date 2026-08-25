@@ -445,6 +445,10 @@
     "hotflashnews": [
       "hotflashnews.com",
       "*.hotflashnews.com"
+    ],
+    "gemini": [
+      "gemini.google.com",
+      "*.gemini.google.com"
     ]
   }
 }
