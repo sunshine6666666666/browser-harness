@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     def goto_url(url: str) -> None: ...
     def js(expression: str) -> Any: ...
     def page_info() -> dict[str, Any]: ...
+    def type_text(text: str) -> None: ...
     def upload_file(selector: str, path: str) -> None: ...
     def wait(seconds: float = 1.0) -> None: ...
     def fill_input(selector: str, text: str, clear_first: bool = True, timeout: float = 0.0) -> None: ...
@@ -97,7 +98,7 @@ def _selected_tags() -> list[str]:
     return js("Array.from(document.querySelectorAll('.label-item-v2-content')).map(e => (e.innerText || '').trim()).filter(Boolean)") or []
 
 
-def _visible_text(text: str, selector: str = "button,[role=button],[role=option],.bcc-option,.drop-list-item,.menu-item") -> dict[str, Any] | None:
+def _visible_text(text: str, selector: str = "button,[role=button],[role=option],.bcc-option,.drop-list-item,.drop-list-v2-item,.menu-item,.button,.btn,[class*=button],[class*=btn],[class*=submit]") -> dict[str, Any] | None:
     return js("""(() => {
       const wanted = %s;
       const el = Array.from(document.querySelectorAll(%s)).find(node => {
@@ -111,7 +112,7 @@ def _visible_text(text: str, selector: str = "button,[role=button],[role=option]
     })()""" % (json.dumps(text), json.dumps(selector)))
 
 
-def _click_visible_text(text: str, selector: str = "button,[role=button],[role=option],.bcc-option,.drop-list-item,.menu-item") -> None:
+def _click_visible_text(text: str, selector: str = "button,[role=button],[role=option],.bcc-option,.drop-list-item,.drop-list-v2-item,.menu-item,.button,.btn,[class*=button],[class*=btn],[class*=submit]") -> None:
     target = _visible_text(text, selector)
     if not target:
         raise RuntimeError("visible Bilibili option not found: %s" % text)
@@ -132,12 +133,16 @@ def _cover_state() -> dict[str, Any]:
         const r = node.getBoundingClientRect();
         return r.width > 0 && r.height > 0;
       };
-      const input = Array.from(document.querySelectorAll('input[type=file][data-bh-cover-input="1"]')).find(visible);
-      const filename = input?.files?.[0]?.name || input?.value?.split('\\\\').pop() || '';
-      const image = Array.from(document.querySelectorAll('.cover-wrp img,.cover-preview img,.cover-image img')).find(visible);
+      const input = Array.from(document.querySelectorAll('input[type=file][data-bh-cover-input="1"]'))
+        .find(node => node.files?.length || visible(node));
+      const filename = input?.files?.[0]?.name || input?.value?.split('\\\\').pop() ||
+        window.__bhCoverFilename || '';
+      const image = Array.from(document.querySelectorAll(
+        '.cover-wrp img,.cover-preview img,.cover-image img,.cover-slot img:not(.add-icon)'
+      )).find(visible);
       return {
         cover_ready: !Boolean(document.querySelector('.cover-empty-pill')),
-        custom_cover_set: Boolean(filename && image?.src),
+        custom_cover_set: Boolean(filename && !document.querySelector('.cover-empty-pill')),
         cover_filename: filename
       };
     })()""") or {"cover_ready": False, "custom_cover_set": False, "cover_filename": ""}
@@ -149,10 +154,11 @@ def _partition_value() -> str:
         const r = node.getBoundingClientRect();
         return r.width > 0 && r.height > 0;
       };
-      const candidates = Array.from(document.querySelectorAll('[role=combobox],.partition-select,.partition-container .select-item,.select-item'))
+      const candidates = Array.from(document.querySelectorAll('[role=combobox],.partition-select,.partition-container .select-item,.select-item,.video-human-type .select-item-cont'))
         .filter(visible);
       const marked = candidates.find(node => /分区|category|partition/i.test(node.getAttribute('aria-label') || '') ||
-        /分区/.test(node.parentElement?.innerText || ''));
+        /分区/.test(node.parentElement?.innerText || '') ||
+        node.matches('.video-human-type .select-item-cont'));
       const node = marked || candidates.find(item => (item.innerText || '').trim() && !/创作声明|合集/.test(item.innerText));
       return node?.querySelector('.selected,.select-value,[role=option]')?.innerText || node?.innerText || '';
     })()"""))
@@ -207,6 +213,16 @@ def prepare_upload(video_file: str, title: str, expected_mid: int,
     if page_info().get("url") != UPLOAD_URL:
         goto_url(UPLOAD_URL)
         wait(3)
+    if _visible_text("不用了", "*"):
+        js("""(() => {
+          const node = Array.from(document.querySelectorAll('*')).find(item => {
+            const r = item.getBoundingClientRect();
+            return r.width > 0 && r.height > 0 &&
+              (item.innerText || item.textContent || '').trim() === '不用了';
+          });
+          if (node) node.click();
+        })()""")
+        wait(1)
     current_file = js("document.querySelector('input[type=file][accept*=\".mp4\"]')?.value || ''")
     if path.name not in current_file:
         upload_file('input[type=file][accept*=".mp4"]', str(path))
@@ -253,22 +269,42 @@ def set_custom_cover(path: str, timeout: float = 30) -> dict[str, Any]:
             width, height = image.size
     except (OSError, ValueError) as exc:
         raise ValueError("Bilibili cover file is not a readable image: %s" % image_path) from exc
-    marked = js("""(() => {
+    js("""(() => {
+      const el = document.querySelector('.cover-empty-pill');
+      if (!el) return false;
+      el.click();
+      return true;
+    })()""")
+    cover_input_selector = 'input[type=file][accept*="image/png"]'
+    marked = _wait_until(lambda: js("""(() => {
+      const input = document.querySelector('.cover-editor-panel-select input[type=file][accept*="image/png"]');
+      if (!input) return false;
+      input.setAttribute('data-bh-cover-input', '1');
+      return true;
+    })()"""), timeout, "Bilibili custom cover image input not found")
+    if not marked:
+        raise RuntimeError("Bilibili custom cover image input not found")
+    upload_file('.cover-editor-panel-select ' + cover_input_selector, str(image_path))
+    filename = _wait_until(
+        lambda: js("document.querySelector('.cover-editor-panel-select input[type=file][accept*=\"image/png\"]')?.files?.[0]?.name || ''"),
+        timeout,
+        "Bilibili custom cover filename was not read back",
+    )
+    js("window.__bhCoverFilename = %s" % json.dumps(filename))
+    completed = _wait_until(lambda: js("""(() => {
       const visible = node => {
         const r = node.getBoundingClientRect();
         return r.width > 0 && r.height > 0;
       };
-      const input = Array.from(document.querySelectorAll('input[type=file]')).find(node =>
-        visible(node) && !/mp4|video/i.test(node.accept || '')
+      const node = Array.from(document.querySelectorAll('*')).find(item =>
+        visible(item) && (item.innerText || item.textContent || '').trim() === '完成'
       );
-      if (!input) return false;
-      input.setAttribute('data-bh-cover-input', '1');
+      if (!node) return false;
+      node.click();
       return true;
-    })()""")
-    if not marked:
-        raise RuntimeError("visible Bilibili custom cover input not found")
-    upload_file('input[type=file][data-bh-cover-input="1"]', str(image_path))
-    _click_visible_text("完成", "button,[role=button],.button.submit")
+    })()"""), timeout, "Bilibili cover completion button not found")
+    if not completed:
+        raise RuntimeError("Bilibili cover completion button not found")
     state = _wait_until(
         lambda: (lambda value: value if value.get("cover_ready") and value.get("custom_cover_set")
                  and value.get("cover_filename") == image_path.name else None)(_cover_state()),
@@ -291,9 +327,44 @@ def set_tags(tags: list[str], timeout: float = 10) -> list[str]:
         raise ValueError("Bilibili requires at least one tag")
     selector = 'input[placeholder="按回车键Enter创建标签"]'
     for tag in normalized:
-        fill_input(selector, tag)
+        if tag in _selected_tags():
+            continue
+        recommended = js("""(() => {
+          const visible = node => {
+            const r = node.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+          };
+          const node = Array.from(document.querySelectorAll('.hot-tag-container:not(.hot-tag-container-selected)'))
+            .find(item => visible(item) && (item.innerText || item.textContent || '').trim() === %s);
+          if (!node) return false;
+          node.click();
+          return true;
+        })()""" % json.dumps(tag))
+        if recommended:
+            try:
+                _wait_until(lambda: tag in _selected_tags(), timeout,
+                            "Bilibili recommended tag was not accepted: %s" % tag)
+                continue
+            except TimeoutError as exc:
+                raise RuntimeError("Bilibili recommended tag was not accepted: %s; observed=%s" %
+                                   (tag, _selected_tags())) from exc
+        focused = js("""(() => {
+          const input = Array.from(document.querySelectorAll(%s)).find(node => {
+            const r = node.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+          });
+          if (!input) return false;
+          input.focus();
+          return true;
+        })()""" % json.dumps(selector))
+        if not focused:
+            raise RuntimeError("visible Bilibili tag input not found")
+        type_text(tag)
         js("""(() => {
-          const el = document.querySelector(%s);
+          const el = Array.from(document.querySelectorAll(%s)).find(node => {
+            const r = node.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+          });
           if (el) {
             el.dispatchEvent(new Event('input', {bubbles: true}));
             el.dispatchEvent(new Event('change', {bubbles: true}));
@@ -310,8 +381,17 @@ def set_tags(tags: list[str], timeout: float = 10) -> list[str]:
 
 
 def set_declaration(label: str = "内容无需标注") -> None:
+    current = _normalized_text(js("""(() => {
+      const input = Array.from(document.querySelectorAll('input[placeholder*="创作声明"]')).find(node => {
+        const r = node.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+      return input?.value || '';
+    })()"""))
+    if current == label:
+        return
     _click_visible('input[placeholder*="创作声明"]')
-    _click_visible_text(label, ".bcc-option,[role=option],button")
+    _click_visible_text(label, ".bcc-option,[role=option],button,.drop-list-v2-item")
     observed = _normalized_text(js("""(() => {
       const input = Array.from(document.querySelectorAll('input[placeholder*="创作声明"]')).find(node => {
         const r = node.getBoundingClientRect();
@@ -327,26 +407,29 @@ def set_partition(name: str, timeout: float = 10) -> str:
     requested = _normalized_text(name)
     if not requested:
         raise ValueError("Bilibili partition name cannot be blank")
-    target = js("""(() => {
+    opened = js("""(() => {
+      const node = document.querySelector('.video-human-type .select-item-cont');
+      if (!node) return false;
+      node.click();
+      return true;
+    })()""")
+    if not opened:
+        raise RuntimeError("visible Bilibili partition selector not found")
+    _wait_until(lambda: _visible_text(requested), timeout,
+                "Bilibili partition option was not found: %s" % requested)
+    selected = js("""(() => {
       const visible = node => {
         const r = node.getBoundingClientRect();
         return r.width > 0 && r.height > 0;
       };
-      const candidates = Array.from(document.querySelectorAll('[role=combobox],.partition-select,.partition-container .select-item,.select-item'))
-        .filter(visible);
-      const node = candidates.find(item => /分区|category|partition/i.test(item.getAttribute('aria-label') || '') ||
-        /分区/.test(item.parentElement?.innerText || ''));
-      if (!node) return null;
-      node.scrollIntoView({block: 'center', inline: 'center'});
-      const r = node.getBoundingClientRect();
-      return {x: r.x + r.width / 2, y: r.y + r.height / 2};
-    })()""")
-    if not target:
-        raise RuntimeError("visible Bilibili partition selector not found")
-    click_at_xy(target["x"], target["y"])
-    _wait_until(lambda: _visible_text(requested), timeout,
-                "Bilibili partition option was not found: %s" % requested)
-    _click_visible_text(requested)
+      const node = Array.from(document.querySelectorAll('.drop-list-v2-item .item-cont-main,.drop-list-v2-item,[role=option],.drop-list-item'))
+        .find(item => visible(item) && (item.innerText || item.textContent || '').trim() === %s);
+      if (!node) return false;
+      node.click();
+      return true;
+    })()""" % json.dumps(requested))
+    if not selected:
+        raise RuntimeError("Bilibili partition option was not found: %s" % requested)
     try:
         return _wait_until(lambda: _partition_value() if _partition_value() == requested else None,
                            timeout, "Bilibili partition was not accepted: %s" % requested)
@@ -376,13 +459,12 @@ def set_description(text: str, timeout: float = 10) -> str:
     })()""" % json.dumps(requested))
     if not ok:
         raise RuntimeError("visible Bilibili description editor not found")
-    return _wait_until(
-        lambda: (lambda value: value if value == requested else None)(
-            _normalized_text(js("document.querySelector('.ql-editor[contenteditable=\"true\"]')?.innerText || ''"))
-        ),
+    _wait_until(
+        lambda: _normalized_text(js("document.querySelector('.ql-editor[contenteditable=\"true\"]')?.innerText || ''")) == requested,
         timeout,
         "Bilibili description was not accepted",
     )
+    return _normalized_text(js("document.querySelector('.ql-editor[contenteditable=\"true\"]')?.innerText || ''"))
 
 
 def _set_schedule_time_value(hour: int, minute: int) -> str:
@@ -443,6 +525,10 @@ def set_schedule_datetime(value: str, timeout: float = 15) -> dict[str, str]:
     if target > now + timedelta(days=15):
         raise ValueError("Bilibili schedule cannot be more than fifteen days ahead")
     date, clock = value.split(" ", 1)
+    active = js("document.querySelector('.time-switch-wrp .switch-container')?.classList.contains('switch-container-active')")
+    if not active:
+        js("document.querySelector('.time-switch-wrp .switch-container')?.click()")
+        wait(0.4)
     date_set = js("""(() => {
       const input = Array.from(document.querySelectorAll('input[type=date],.date-picker-date input')).find(node => {
         const r = node.getBoundingClientRect();
@@ -456,11 +542,25 @@ def set_schedule_datetime(value: str, timeout: float = 15) -> dict[str, str]:
       return true;
     })()""" % json.dumps(date))
     if not date_set:
-        date_control = _visible('.date-picker-date')
-        if not date_control:
+        opened = js("""(() => {
+          const node = document.querySelector('.date-picker-date');
+          if (!node) return false;
+          node.click();
+          return true;
+        })()""")
+        if not opened:
             raise RuntimeError("Bilibili schedule date control not found")
-        click_at_xy(date_control["x"], date_control["y"])
-        _click_visible_text(date, "button,[role=option],.calendar-day,.date-picker-panel *")
+        wait(0.3)
+        selected = js("""(() => {
+          const day = %s;
+          const node = Array.from(document.querySelectorAll('.date-picker-body-item.date-item'))
+            .find(item => item.getBoundingClientRect().width > 0 && item.innerText.trim() === day);
+          if (!node) return false;
+          node.click();
+          return true;
+        })()""" % json.dumps(str(target.day)))
+        if not selected:
+            _click_visible_text(str(target.day), ".date-picker-body-item.date-item,button,[role=option],.calendar-day,.date-picker-panel *")
     hour, minute = map(int, clock.split(":", 1))
     _set_schedule_time_value(hour, minute)
     state = _wait_until(

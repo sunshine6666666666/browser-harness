@@ -51,7 +51,8 @@ not depend on SAU or biliup at runtime.
   only after DOM readback. It never chooses a recommendation or submits.
 - `set_tags(tags: list[str], timeout: float = 10) -> list[str]`: strips and
   de-duplicates non-empty tags in caller order, preserves platform auto-tags,
-  enters each target through `按回车键Enter创建标签`, and returns all selected
+  clicks an exact visible platform recommendation when available and otherwise
+  enters the target through `按回车键Enter创建标签`, and returns all selected
   tags. Raises with the missing target and observed list on rejection/quota.
 - `set_declaration(label: str = "内容无需标注") -> None`: selects the visible
   declaration option and verifies the visible input. Raises on missing option or

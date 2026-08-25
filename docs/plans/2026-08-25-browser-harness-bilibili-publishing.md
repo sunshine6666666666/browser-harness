@@ -270,9 +270,9 @@ Do not keep the current fake `category = body contains 分区` boolean.
 | Task 3: fix exact endpoint routing | completed | Commit `91a57a5`; focused agent-pool/run suite `52 passed`; CodeGraph impact of `should_manage_legacy` reaches only `run.py` and its main path; registered, unregistered, remote, malformed, duplicate, and unhealthy endpoint cases covered. |
 | Task 4: complete publishing fields | completed | `publishing.py/.md` now expose custom cover, normalized tags, partition, description, full date/time schedule, and real snapshot readback; focused coverage passed `8` field tests; Domain Skill verifier `PASS registry=101 skills`. |
 | Task 5: make submit recovery idempotent | completed | Focused Bilibili suite passed `13`; delayed manager evidence verified after two mismatches with one click; accepted-but-unverified, no-evidence, multiple-record, and pre-existing duplicate gates covered. |
-| Task 6: static/full regression | pending | — |
-| Task 7: real fleet and concurrency tests | pending | — |
-| Task 8: high-intensity real Bilibili acceptance | pending | — |
+| Task 6: static/full regression | completed | CodeGraph sync/affected completed; listed Python compiled; full unit suite `243 passed in 0.74s`; Domain verifier `PASS`; raw daemon/agent-pool/run suite `87 passed`; raw diff/stat and `git diff --check main...HEAD` clean; changed-file placeholder scan clean. |
+| Task 7: real fleet and concurrency tests | completed | `/tmp/bh-browser-routing-acceptance.json`; direct 9225 MID `526557505`/Stella and 9226 MID `518800384`/水蜜桃; same-browser intervals `1787658981.010–1787658984.016` then `1787658985.425–1787658988.429`; different-browser intervals overlap and wall `5.028s`; unavailable 65534 returned `None` and direct exit `1`; final leases/write locks empty; six Domain hashes unchanged. |
+| Task 8: high-intensity real Bilibili acceptance | completed | `/tmp/bh-bilibili-acceptance.json`; MID `518800384`/水蜜桃英语; exact-title archive zero before submit and one after; AID `117156440248780`, BVID `BV1ath56uE7u`; status `verified`; one submit click; manager and progress pages confirm `2026-08-30 22:00`; final recommendation tags read back as `娱乐, 足球, 球迷, 困境, 高能, 二次元, 搞笑`; edit-page readback confirmed title/partition/description/schedule without saving. |
 | Task 9: commit, merge, push, final proof | pending | — |
 
 ### Task 1: Startup, protect existing work, and reproduce the baseline

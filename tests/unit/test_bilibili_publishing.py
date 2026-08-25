@@ -34,6 +34,8 @@ class FakePage:
         self.upload_calls = []
 
     def js(self, script):
+        if script.strip().startswith("Boolean(document.querySelector('.cover-empty-pill'))"):
+            return False
         if "input.setAttribute('data-bh-cover-input'" in script:
             self.cover_marked = True
             return True
@@ -43,6 +45,14 @@ class FakePage:
                     "cover_filename": self.cover_filename}
         if ".label-item-v2-content" in script:
             return list(self.tags)
+        if "hot-tag-container:not(.hot-tag-container-selected)" in script and ".click()" in script:
+            match = re.search(r"=== (\"[^\"]*\")", script)
+            tag = json.loads(match.group(1)) if match else ""
+            if tag not in {"足球", "彩票"} or tag in self.reject_tags:
+                return False
+            if tag not in self.tags:
+                self.tags.append(tag)
+            return True
         if "dispatchEvent(new Event('input'" in script and "placeholder" in script:
             return None
         if "const wanted =" in script:
@@ -51,6 +61,19 @@ class FakePage:
             return {"x": 10, "y": 20} if wanted in {"完成", "知识", "内容无需标注", "2026-08-30"} else None
         if "return {x:" in script:
             return {"x": 10, "y": 20} if self.partition_selector else None
+        if "video-human-type .select-item-cont" in script and ".click()" in script:
+            return self.partition_selector
+        if "drop-list-v2-item" in script and ".click()" in script:
+            self.partition = "知识"
+            return True
+        if "const node = Array.from(document.querySelectorAll('*')).find" in script and "'完成'" in script:
+            self.last_option = "完成"
+            self.cover_ready = True
+            self.cover_filename = self.upload_calls[-1][1].name
+            return True
+        if "accept*=\"image/png\"" in script and ".files" in script:
+            self.cover_filename = "cover.png"
+            return self.cover_filename
         if "return node?.querySelector" in script:
             return self.partition
         if "el.innerText =" in script and ".ql-editor" in script:
@@ -102,6 +125,9 @@ class FakePage:
     def fill_input(self, selector, text, **kwargs):
         self.pending_text = text
 
+    def type_text(self, text):
+        self.pending_text = text
+
     def press_key(self, key, modifiers=0):
         if key == "Enter" and self.pending_text not in self.reject_tags:
             if self.pending_text not in self.tags:
@@ -124,6 +150,7 @@ def load_publishing(page=None):
         "wait": lambda seconds=0: None,
         "upload_file": lambda selector, path: page.upload_calls.append((selector, Path(path))),
         "fill_input": page.fill_input,
+        "type_text": page.type_text,
         "press_key": page.press_key,
         "click_at_xy": page.click_at_xy,
         "activate_tab": lambda target: None,
@@ -152,7 +179,7 @@ def test_custom_cover_returns_dimensions_after_dom_acceptance(tmp_path):
     namespace, page = load_publishing()
     result = namespace["set_custom_cover"](str(cover), timeout=0)
     assert result == {"custom_cover_set": True, "filename": "cover.png", "width": 1280, "height": 720}
-    assert page.upload_calls[0][0] == 'input[type=file][data-bh-cover-input="1"]'
+    assert page.upload_calls[0][0] == '.cover-editor-panel-select input[type=file][accept*="image/png"]'
 
 
 def test_tags_preserve_auto_tags_and_normalize_duplicates():
