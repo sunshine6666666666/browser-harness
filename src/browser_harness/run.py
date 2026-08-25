@@ -380,20 +380,20 @@ def _run(args):
     cloud_admin = code.lstrip().startswith(("start_remote_daemon(", "stop_remote_daemon("))
     if not cloud_admin:
         from . import agent_pool
-        if agent_pool.should_manage_legacy():
+        # An explicit CDP endpoint is a precise caller choice. Do not let the
+        # Hermes compatibility route replace it with a managed-pool lease, even
+        # when that endpoint happens to be registered in the browser fleet.
+        if agent_pool.should_manage_legacy() and not _explicit_cdp_configured():
             # Legacy Hermes Skills are conservatively treated as writes. Explicit
             # agent-pool callers can declare read mode and gain safe parallelism.
-            explicit_endpoint = os.environ.get("BU_CDP_WS") or os.environ.get("BU_CDP_URL")
-            browser_name = agent_pool.browser_name_for_cdp(explicit_endpoint)
-            if not explicit_endpoint or browser_name:
-                sys.exit(agent_pool.run_managed(
-                    agent_pool._default_owner(),
-                    agent_pool.infer_site(code),
-                    "default",
-                    "write",
-                    code,
-                    browser_name=browser_name,
-                ))
+            sys.exit(agent_pool.run_managed(
+                agent_pool._default_owner(),
+                agent_pool.infer_site(code),
+                "default",
+                "write",
+                code,
+                browser_name=None,
+            ))
     if not cloud_admin:
         if (
             not daemon_alive()
