@@ -758,32 +758,35 @@ def submit_once(title: str, expected_mid: int, expected_name: str | None = None,
     deadline = time.monotonic() + timeout
     archive = None
     last_manager_error = ""
+    manager_loads = 0
     while time.monotonic() < deadline:
         matches = archive_matches(title)
         if len(matches) == 1:
             archive = matches[0]
         elif len(matches) > 1:
             raise RuntimeError("Bilibili archive title matched multiple records")
-        try:
-            manager = manager_evidence(
-                title, expected_schedule, strict=False, attempts=1
-            )
-        except RuntimeError as exc:
-            last_manager_error = str(exc)
-        else:
-            if manager.get("schedule_match"):
-                result = {
-                    "identity": identity, "submitted": True, "status": "verified",
-                    "manager": manager, "verification_source": "manager_latest",
-                    "submit_clicks": int(clicked),
-                }
-                if archive is not None:
-                    result["archive"] = archive
-                return result
-            last_manager_error = (
-                manager.get("text") or
-                "Bilibili manager schedule evidence is not ready"
-            )
+        if manager_loads < 3:
+            manager_loads += 1
+            try:
+                manager = manager_evidence(
+                    title, expected_schedule, strict=False, attempts=1
+                )
+            except RuntimeError as exc:
+                last_manager_error = str(exc)
+            else:
+                if manager.get("schedule_match"):
+                    result = {
+                        "identity": identity, "submitted": True, "status": "verified",
+                        "manager": manager, "verification_source": "manager_latest",
+                        "submit_clicks": int(clicked),
+                    }
+                    if archive is not None:
+                        result["archive"] = archive
+                    return result
+                last_manager_error = (
+                    manager.get("text") or
+                    "Bilibili manager schedule evidence is not ready"
+                )
         diagnostics = submission_diagnostics()
         if diagnostics["reason"] in {
                 "form_validation_failed", "confirmation_required", "platform_rejected"}:

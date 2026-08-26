@@ -360,6 +360,26 @@ def test_submit_once_accepts_latest_manager_record_before_archive_api_catches_up
     assert clicks == [".submit-add"]
 
 
+def test_submit_once_loads_manager_at_most_three_times():
+    namespace, _ = load_publishing()
+    clicks = []
+    _configure_submit(namespace, [[], []], [], clicks)
+    manager_calls = []
+
+    def missing_manager(title, schedule, strict=False, attempts=3):
+        manager_calls.append((title, schedule, strict, attempts))
+        raise RuntimeError("latest record not ready")
+
+    namespace["manager_evidence"] = missing_manager
+    result = namespace["submit_once"](
+        "标题", 518800384, "水蜜桃英语", "2026-08-30 22:00", timeout=0.01
+    )
+    assert result["status"] == "not_accepted"
+    assert len(manager_calls) == 3
+    assert all(call[3] == 1 for call in manager_calls)
+    assert clicks == [".submit-add"]
+
+
 def test_submit_once_zero_archive_returns_recoverable_validation_diagnostics():
     namespace, _ = load_publishing()
     clicks = []
