@@ -14,9 +14,8 @@ IMPORTANT platform quirks (all verified):
   TIMES OUT (~30s IPC timeout) on this page. Prefer JS full pointer sequence
   (pointerdown/mousedown/pointerup/mouseup/click) via `dispatchEvent`. Keep
   CDP only for wheel scrolling.
-- Tab switching: browser-harness may attach to the wrong tab between calls.
-  Always enumerate tabs and `switch_tab()` to the exact gemini.google.com tab
-  at the start of every script.
+- Tab ownership: reuse only the current task-owned Gemini tab, or open one new
+  tab. Never scan or switch to an arbitrary existing Gemini tab.
 - Model menu items have NO `aria-checked`; verify selection by re-reading the
   composer pill text (`打开模式选择器，当前模式为"Pro"`).
 - Deep Research lives in the `上传和工具` (upload-and-tools) menu under
@@ -35,43 +34,91 @@ IMPORTANT platform quirks (all verified):
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 if TYPE_CHECKING:
     def js(expression: str, target_id: str | None = None) -> Any: ...
     def new_tab(url: str = "about:blank") -> str: ...
     def goto_url(url: str) -> None: ...
-    def type_text(text: str) -> None: ...
     def press_key(key: str, modifiers: int = 0) -> None: ...
     def wait_for_load(timeout: float = 15.0) -> bool: ...
     def wait(seconds: float = 1.0) -> None: ...
     def cdp(method: str, session_id: str | None = None, **params: Any) -> Any: ...
-    def list_tabs(include_chrome: bool = True) -> list[dict[str, Any]]: ...
-    def switch_tab(target: str) -> None: ...
+    def current_tab() -> dict[str, Any]: ...
+    def activate_tab(target: str | None = None) -> None: ...
+    def click_at_xy(x: float, y: float) -> None: ...
+    def close_tab(target: str | None = None) -> None: ...
 
 
 GEMINI_HOME = "https://gemini.google.com/app"
+_SYNTHETIC_RUN_RE = re.compile(r"\bBH-GEMINI-AUDIT-\d{8}-\d{6}\b")
 _reply_count_before_send: int | None = None
+_synthetic_run_ids: dict[str, str] = {}
+_pending_synthetic_run_id: str | None = None
+_share_links: dict[str, str] = {}
+_share_unknown: dict[str, str] = {}
 
 
 def _norm(s: str | None) -> str:
     return " ".join((s or "").replace("\xa0", " ").split())
 
 
+def _gemini_url(value: str, *, allow_home: bool = True) -> str:
+    """Normalize an exact Gemini app URL or conversation ID."""
+    value = (value or "").strip().rstrip("/")
+    if allow_home and value in {GEMINI_HOME, "/app"}:
+        return GEMINI_HOME
+    if re.fullmatch(r"[A-Za-z0-9_-]{8,}", value):
+        return f"{GEMINI_HOME}/{value}"
+    parsed = urlparse(value)
+    match = re.fullmatch(r"/app/([A-Za-z0-9_-]{8,})", parsed.path)
+    if (parsed.scheme == "https" and parsed.hostname == "gemini.google.com" and
+            not parsed.query and not parsed.fragment and match):
+        return f"{GEMINI_HOME}/{match.group(1)}"
+    raise ValueError("Gemini URL must be https://gemini.google.com/app or an exact /app/<conversation_id>")
+
+
+def _is_gemini_app_url(value: str) -> bool:
+    try:
+        _gemini_url(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _is_conversation_url(value: str) -> bool:
+    try:
+        _gemini_url(value, allow_home=False)
+        return True
+    except ValueError:
+        return False
+
+
 def ensure_gemini_tab(url: str = GEMINI_HOME) -> dict[str, Any]:
-    """Switch to an existing gemini.google.com tab, or open one."""
-    tabs = list_tabs(include_chrome=False)
-    for t in tabs:
-        if "gemini.google.com" in t["url"]:
-            switch_tab(t["targetId"])
-            wait(1.5)
-            return t
-    new_tab(url)
+    """Reuse only the current task tab, otherwise open one owned tab."""
+    requested = _gemini_url(url)
+    current = current_tab()
+    current_url = (current or {}).get("url", "")
+    opened = False
+    if _is_gemini_app_url(current_url):
+        if current_url.rstrip("/") != requested:
+            goto_url(requested)
+        target_id = (current or {}).get("targetId") or (current or {}).get("target_id")
+    else:
+        target_id = new_tab(requested)
+        opened = True
     wait_for_load(timeout=20)
     wait(3.0)
-    return {"url": url}
+    actual = js("location.href") or requested
+    if not _is_gemini_app_url(actual):
+        raise RuntimeError(f"ensure_gemini_tab: unexpected URL {actual!r}")
+    if not _composer_editor().get("found"):
+        raise RuntimeError("ensure_gemini_tab: usable composer not found")
+    return {"target_id": target_id, "targetId": target_id, "url": actual, "opened": opened}
 
 
 def _composer_editor() -> dict[str, Any]:
@@ -168,14 +215,17 @@ def new_chat() -> dict[str, Any]:
 
 
 def _model_pill() -> dict[str, Any]:
-    """Composer model selector pill (aria-label contains 打开模式选择器)."""
+    """Composer model selector pill (ARIA label, then visible model text)."""
     return js(r"""
     (() => {
       const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-      const b = [...document.querySelectorAll('button')].find(x => {
-        const label = x.getAttribute('aria-label') || '';
-        return label.includes('打开模式选择器') && x.offsetParent;
-      });
+      const visible = e => e && e.offsetParent && e.getBoundingClientRect().width > 0;
+      const buttons = [...document.querySelectorAll('button')].filter(visible);
+      const b = buttons.find(x => (x.getAttribute('aria-label') || '').includes('打开模式选择器')) ||
+        buttons.find(x => {
+          const text = norm(x.innerText || x.textContent);
+          return !text.includes('Flash-Lite') && /^(Flash|Pro)(\b|\s)/.test(text);
+        });
       if (!b) return {found: false};
       const r = b.getBoundingClientRect();
       return {found: true, x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2),
@@ -246,18 +296,19 @@ def model_menu_items() -> list[dict[str, Any]]:
 
 
 def select_model(target: str) -> dict[str, Any]:
-    """Select a model by substring (e.g. 'Pro' or 'Flash') and verify the pill.
+    """Select a model by label and verify the composer pill.
 
-    Gemini model rows: `3.5 Flash-Lite 极速回答 新`, `3.6 Flash 全方位帮助`,
-    `3.1 Pro 高阶数学与代码`, `扩展思考 擅长解决复杂问题`.
+    `Flash` prefers the full Flash row and excludes `Flash-Lite`, whose label
+    also contains the substring. Other targets use substring matching.
     Opens the model picker itself first.
     """
     open_model_picker()
     r = _click_js(f"""
+      const wanted = {json.dumps(target, ensure_ascii=False)};
       const el = [...document.querySelectorAll('[role="menuitem"]')].find(e => {{
         if (!e.offsetParent) return false;
         const t = norm(e.innerText || '');
-        return t.includes({target!r});
+        return wanted === 'Flash' ? t.includes('Flash') && !t.includes('Flash-Lite') : t.includes(wanted);
       }});
     """)
     if not r or not r.get("found"):
@@ -271,14 +322,16 @@ def select_model(target: str) -> dict[str, Any]:
 
 
 def open_tools_menu() -> dict[str, Any]:
-    """Open the 上传和工具 menu."""
-    r = _click_js("""
-      const el = [...document.querySelectorAll('button')].find(x => (x.getAttribute('aria-label') || '') === '上传和工具' && x.offsetParent);
-    """)
-    if not r or not r.get("found"):
-        raise RuntimeError("open_tools_menu: 上传和工具 button not found")
-    wait(2.5)
-    return r
+    """Open the 上传和工具 menu after the composer UI has settled."""
+    for _ in range(10):
+        r = _click_js("""
+          const el = [...document.querySelectorAll('button')].find(x => (x.getAttribute('aria-label') || '') === '上传和工具' && x.offsetParent);
+        """)
+        if r and r.get("found"):
+            wait(2.5)
+            return r
+        wait(1.0)
+    raise RuntimeError("open_tools_menu: 上传和工具 button not found")
 
 
 def open_more_tools() -> dict[str, Any]:
@@ -392,7 +445,9 @@ def _reply_state() -> dict[str, Any]:
     return js(r"""
     (() => {
       const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-      const replies = [...document.querySelectorAll('h1,h2,h3,[role="heading"]')]
+      const structuredReplies = [...document.querySelectorAll('model-response,[data-message-author-role="assistant"]')]
+        .filter(e => e.offsetParent);
+      const replies = structuredReplies.length ? structuredReplies : [...document.querySelectorAll('h1,h2,h3,[role="heading"]')]
         .filter(e => norm(e.innerText || e.textContent) === 'Gemini 说');
       const stop = [...document.querySelectorAll('button,[role="button"]')].some(e => {
         if (!e.offsetParent) return false;
@@ -404,29 +459,111 @@ def _reply_state() -> dict[str, Any]:
     """) or {"assistant_count": 0, "has_stop": False, "len": 0}
 
 
-def send_message(text: str) -> dict[str, Any]:
-    """Type into the Quill composer and click 发送 (full JS pointer sequence)."""
-    global _reply_count_before_send
+def _turn_matches(expected: str, actual: str) -> bool:
+    expected = _norm(expected)
+    actual = _norm(actual)
+    for prefix in ("你说", "Gemini 说"):
+        if actual.startswith(prefix):
+            actual = _norm(actual[len(prefix):])
+            break
+    if actual == expected:
+        return True
+    # Gemini may render a collapsed long prompt; require both ends before
+    # accepting the visible excerpt as the just-sent turn.
+    return (len(actual) >= 160 and len(expected) >= len(actual) and
+            expected[:80] in actual[:160] and expected[-80:] in actual[-160:])
+
+
+def _canonical_url() -> str:
+    value = js("location.href") or ""
+    if not _is_conversation_url(value):
+        raise RuntimeError("Gemini conversation URL is not canonical")
+    return _gemini_url(value, allow_home=False)
+
+
+def send_message(text: str, evidence_timeout: float = 10.0) -> dict[str, Any]:
+    """Type once, click once, and return definite or unknown send evidence."""
+    global _reply_count_before_send, _pending_synthetic_run_id
+    expected = _norm(text)
+    run_ids = set(_SYNTHETIC_RUN_RE.findall(expected))
+    _pending_synthetic_run_id = next(iter(run_ids)) if len(run_ids) == 1 else None
+    if not expected:
+        raise ValueError("send_message: message must not be empty")
     ed = _composer_editor()
     if not ed.get("found"):
         raise RuntimeError("send_message: Quill composer editor not found")
     if not ed.get("empty"):
         raise RuntimeError("send_message: composer must be empty before typing")
+    current = current_tab()
+    target_id = (current or {}).get("targetId") or (current or {}).get("target_id")
+    if target_id:
+        activate_tab(target_id)
+        wait(1.0)
     js("([...document.querySelectorAll('[role=\"textbox\"]')].find(e => e.offsetParent && (e.className||'').toString().includes('ql-editor'))).focus()")
     wait(0.4)
-    type_text(text)
+    js(f"document.execCommand('insertText', false, {json.dumps(text, ensure_ascii=False)})")
     wait(1.0)
     ed2 = _composer_editor()
     if _norm(ed2.get("text")) != _norm(text):
         raise RuntimeError(f"send_message: composer text mismatch after typing: {ed2.get('text','')[:60]!r}")
+    before_turns = conversation_turns()
+    before_user_ids = {t.get("id") for t in before_turns if t.get("role") == "user" and t.get("id")}
+    before_user_count = sum(t.get("role") == "user" for t in before_turns)
     _reply_count_before_send = int(_reply_state().get("assistant_count", 0))
     r = _click_js("""
       const el = [...document.querySelectorAll('button')].find(x => (x.getAttribute('aria-label') || '') === '发送' && x.offsetParent);
     """)
     if not r or not r.get("found"):
-        raise RuntimeError("send_message: 发送 button not found")
-    wait(2.0)
-    return {"status": "sent", "url": js("location.href")}
+        return {"status": "unknown", "reason": "send_button_not_found", "url": js("location.href")}
+    try:
+        post_editor = _composer_editor()
+        composer_empty = bool(post_editor.get("empty"))
+    except Exception:
+        composer_empty = False
+    deadline = time.time() + max(0.0, evidence_timeout)
+    stable_key = None
+    stable_reads = 0
+    latest_url = js("location.href") or ""
+    while time.time() < deadline:
+        wait(0.5)
+        try:
+            composer_empty = bool(_composer_editor().get("empty"))
+            latest_url = js("location.href") or latest_url
+            turns = conversation_turns()
+        except Exception:
+            continue
+        candidates = [
+            (index, turn) for index, turn in enumerate(turns)
+            if turn.get("role") == "user" and _turn_matches(expected, turn.get("text", ""))
+        ]
+        if not candidates:
+            continue
+        index, turn = candidates[-1]
+        message_id = turn.get("id")
+        is_new = ((message_id and message_id not in before_user_ids) or
+                  (not message_id and sum(t.get("role") == "user" for t in turns) > before_user_count))
+        key = (message_id, index, _norm(turn.get("text", ""))[:80], _norm(turn.get("text", ""))[-80:])
+        stable_reads = stable_reads + 1 if key == stable_key else 1
+        stable_key = key
+        if (_is_conversation_url(latest_url) and composer_empty and is_new and stable_reads >= 2):
+            conversation_url = _gemini_url(latest_url, allow_home=False)
+            if _pending_synthetic_run_id:
+                _synthetic_run_ids[conversation_url] = _pending_synthetic_run_id
+            return {
+                "status": "definitely_sent",
+                "url": conversation_url,
+                "composer_empty": True,
+                "expected_user_message_found": True,
+                "message_id": message_id,
+                "message_turn": index,
+            }
+    return {
+        "status": "unknown",
+        "reason": "post_send_evidence_inconclusive",
+        "url": latest_url,
+        "composer_empty": composer_empty,
+        "expected_user_message_found": False,
+    }
 
 
 def wait_for_reply(timeout: float = 90.0) -> dict[str, Any]:
@@ -451,13 +588,80 @@ def wait_for_reply(timeout: float = 90.0) -> dict[str, Any]:
 
 
 def conversation_text(limit: int = 1000) -> str:
-    """Read the visible conversation text (the last N chars around 你说/Gemini 说)."""
-    body = js("document.body.innerText || ''") or ""
-    norm = " ".join(body.split())
-    idx = norm.find("你说")
-    if idx >= 0:
-        return norm[idx:idx + limit]
-    return norm[-limit:]
+    """Read the current rendered turns while preserving the old text API."""
+    text = "\n".join(f"[{turn['role']}] {turn['text']}" for turn in conversation_turns())
+    return text[:limit] if text else ""
+
+
+def conversation_turns(limit_per_turn: int = 20000) -> list[dict[str, Any]]:
+    """Return current DOM turns in order, excluding message action controls."""
+    if limit_per_turn < 1:
+        raise ValueError("conversation_turns: limit_per_turn must be at least 1")
+    return js(r"""
+    (() => {
+      const norm = s => (s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+      const visible = e => e && e.offsetParent;
+      const action = /^(复制|分享|赞|踩|编辑|重新生成|停止|复制链接|展开|收起|Copy|Share|Like|Dislike|Edit|Regenerate|Show more|Hide)$/i;
+      const clean = (root, marker) => {
+        const clone = root.cloneNode(true);
+        clone.querySelectorAll('button,[role="button"],svg,mat-icon,input,textarea,[aria-hidden="true"]').forEach(e => e.remove());
+        const text = (clone.innerText || clone.textContent || '').split(/\n+/).map(norm)
+          .filter(x => x && x !== marker && !action.test(x)).join(' ').slice(0, %d);
+        return marker && text.startsWith(marker) ? text.slice(marker.length).trim() : text;
+      };
+      const idOf = root => root.getAttribute('data-message-id') || root.getAttribute('data-turn-id') ||
+        ((root.getAttribute('data-testid') || '').match(/(?:message|turn)[-_]([A-Za-z0-9_-]+)/i) || [])[1] || null;
+      const result = [];
+      const seen = new Set();
+      const push = (root, role, marker) => {
+        if (!root || seen.has(root)) return;
+        const text = clean(root, marker);
+        if (!text) return;
+        seen.add(root);
+        result.push({role, text, id: idOf(root)});
+      };
+      const byRole = [...document.querySelectorAll('[data-message-author-role="user"],[data-message-author-role="assistant"]')]
+        .filter(visible);
+      if (byRole.length) {
+        byRole.forEach(root => push(root, root.getAttribute('data-message-author-role'), ''));
+        return result;
+      }
+      const selector = document.querySelector('model-response')
+        ? '.user-query-container,model-response'
+        : '.user-query-container,model-response,.response-container';
+      const structured = [...document.querySelectorAll(selector)]
+        .filter(root => visible(root) && (
+          (root.matches('model-response,.response-container') &&
+            !root.parentElement?.closest('model-response,.response-container')) ||
+          (!root.matches('model-response,.response-container') &&
+            !root.parentElement?.closest('.user-query-container'))))
+        .map(root => root.matches('model-response,.response-container')
+          ? [root, 'assistant', 'Gemini 说']
+          : [root, 'user', '你说']);
+      if (structured.length) {
+        structured.forEach(([root, role, marker]) => push(root, role, marker));
+        return result;
+      }
+      const markers = [...document.querySelectorAll('span,h1,h2,h3,[role="heading"]')]
+        .filter(visible).filter(e => ['你说', 'Gemini 说'].includes(norm(e.innerText || e.textContent)));
+      markers.forEach(marker => {
+        const role = norm(marker.innerText || marker.textContent) === '你说' ? 'user' : 'assistant';
+        let root = marker.closest('[data-message-id],[data-turn-id]');
+        if (!root) {
+          root = marker.parentElement;
+          for (let i = 0; i < 8 && root && root.parentElement; i++, root = root.parentElement) {
+            const className = (root.className || '').toString();
+            if (/screen-reader|visually-hidden/i.test(className)) continue;
+            const size = (root.innerText || root.textContent || '').length;
+            if (size > marker.textContent.length + 1 &&
+                (size < (document.body.innerText || '').length * 0.7 || /query-text|user-query|response/i.test(className))) break;
+          }
+        }
+        push(root, role, norm(marker.innerText || marker.textContent));
+      });
+      return result;
+    })()
+    """ % limit_per_turn) or []
 
 
 def _conversation_scroller() -> dict[str, Any]:
@@ -487,6 +691,179 @@ def scroll_conversation(direction: str = "down", amount: int = 600) -> int:
     cdp("Input.dispatchMouseEvent", type="mouseWheel", x=target["x"], y=target["y"], deltaX=0, deltaY=dy)
     wait(0.8)
     return _conversation_scroller().get("scrollTop", -1)
+
+
+def _conversation_scroll_state() -> dict[str, Any]:
+    """Focus the largest scrollable conversation container."""
+    return js(r"""
+    (() => {
+      const els = [...document.querySelectorAll('div')].filter(el =>
+        el.scrollHeight > el.clientHeight + 50 && ['auto', 'scroll'].includes(getComputedStyle(el).overflowY));
+      if (!els.length) return {found: false};
+      els.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+      const el = els[0];
+      if (!el.hasAttribute('tabindex')) el.setAttribute('tabindex', '-1');
+      el.focus({preventScroll: true});
+      return {found: true, scroll_top: el.scrollTop, scroll_height: el.scrollHeight,
+              client_height: el.clientHeight, turn_count: document.querySelectorAll('[data-message-author-role], [data-message-id]').length};
+    })()
+    """) or {"found": False}
+
+
+def page_conversation(direction: str = "down", steps: int = 1, wait_s: float = 0.8) -> dict[str, Any]:
+    """Page the focused conversation scroller with PageUp/PageDown."""
+    direction = direction.lower().strip()
+    if direction not in {"up", "down"}:
+        raise ValueError("page_conversation: direction must be 'up' or 'down'")
+    if not isinstance(steps, int) or steps < 1:
+        raise ValueError("page_conversation: steps must be at least 1")
+    if wait_s < 0:
+        raise ValueError("page_conversation: wait_s must not be negative")
+    before = _conversation_scroll_state()
+    if not before.get("found"):
+        raise RuntimeError("page_conversation: no scrollable main container")
+    for _ in range(steps):
+        press_key("PageDown" if direction == "down" else "PageUp")
+        wait(wait_s)
+    after = _conversation_scroll_state()
+    if not after.get("found"):
+        raise RuntimeError("page_conversation: conversation scroller disappeared")
+    return {"direction": direction, "steps": steps, "before": before, "after": after,
+            "moved": after.get("scroll_top") != before.get("scroll_top")}
+
+
+def expand_all_user_messages() -> int:
+    """Click only visible collapsed user-message controls and return the count."""
+    return int(js(r"""
+    (() => {
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+      const visible = e => e.offsetParent && e.getBoundingClientRect().width > 0;
+      const buttons = [...document.querySelectorAll('button,[role="button"]')].filter(e => {
+        const text = norm(e.innerText || e.textContent);
+        return visible(e) && ['展开', 'Show more'].includes(text);
+      });
+      for (const el of buttons) {
+        for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+          const event = type.startsWith('pointer')
+            ? new PointerEvent(type, {bubbles:true, cancelable:true, pointerId:1, pointerType:'mouse', isPrimary:true, button:0, buttons:type.endsWith('down') ? 1 : 0})
+            : new MouseEvent(type, {bubbles:true, cancelable:true, button:0, buttons:type.endsWith('down') ? 1 : 0});
+          el.dispatchEvent(event);
+        }
+      }
+      return buttons.length;
+    })()
+    """) or 0)
+
+
+def _merge_turn_page(accumulated: list[dict[str, Any]], page: list[dict[str, Any]]) -> int:
+    """Merge one rendered page without changing its conversation order."""
+    if not page:
+        return 0
+
+    def key(turn: dict[str, Any]) -> tuple[str, str]:
+        message_id = turn.get("id")
+        return ("id", message_id) if message_id else (
+            turn.get("role", ""), _norm(turn.get("text", ""))
+        )
+
+    overlap = 0
+    for size in range(min(len(accumulated), len(page)), 0, -1):
+        if [key(x) for x in accumulated[-size:]] == [key(x) for x in page[:size]]:
+            overlap = size
+            break
+
+    by_id = {
+        turn.get("id"): index
+        for index, turn in enumerate(accumulated)
+        if turn.get("id")
+    }
+    for turn in page[:overlap]:
+        message_id = turn.get("id")
+        if message_id in by_id:
+            index = by_id[message_id]
+            if len(turn.get("text", "")) > len(accumulated[index].get("text", "")):
+                accumulated[index] = turn
+
+    added = 0
+    for turn in page[overlap:]:
+        message_id = turn.get("id")
+        if message_id in by_id:
+            index = by_id[message_id]
+            if len(turn.get("text", "")) > len(accumulated[index].get("text", "")):
+                accumulated[index] = turn
+            continue
+        accumulated.append(turn)
+        if message_id:
+            by_id[message_id] = len(accumulated) - 1
+        added += 1
+    return added
+
+
+def _page_or_static(direction: str, wait_s: float) -> dict[str, Any]:
+    try:
+        return page_conversation(direction, 1, wait_s)
+    except RuntimeError as exc:
+        if "no scrollable main container" in str(exc):
+            return {"direction": direction, "moved": False, "static": True}
+        raise
+
+
+def full_conversation(max_pages: int = 120, wait_s: float = 0.8) -> dict[str, Any]:
+    """Read a virtualized conversation from top to bottom with stable boundaries."""
+    if not isinstance(max_pages, int) or max_pages < 1:
+        raise ValueError("full_conversation: max_pages must be at least 1")
+    pages = 0
+    top_stable = 0
+    previous_page: list[dict[str, Any]] | None = None
+    while top_stable < 2 and pages < max_pages:
+        page_state = _page_or_static("up", wait_s)
+        expand_all_user_messages()
+        current_page = conversation_turns()
+        same_page = current_page == previous_page
+        pages += 1
+        if not page_state.get("moved") and same_page:
+            top_stable += 1
+        else:
+            top_stable = 0
+        previous_page = current_page
+    if top_stable < 2:
+        raise RuntimeError("full_conversation: max_pages reached before top boundary")
+
+    accumulated: list[dict[str, Any]] = []
+    bottom_stable = 0
+    while bottom_stable < 2 and pages < max_pages:
+        expand_all_user_messages()
+        added = _merge_turn_page(accumulated, conversation_turns())
+        page_state = _page_or_static("down", wait_s)
+        pages += 1
+        if not page_state.get("moved") and added == 0:
+            bottom_stable += 1
+        else:
+            bottom_stable = 0
+    if bottom_stable < 2:
+        raise RuntimeError("full_conversation: max_pages reached before bottom boundary")
+    text = "\n".join(f"[{turn['role']}] {turn['text']}" for turn in accumulated)
+    return {"status": "complete", "turns": accumulated, "text": text, "pages": pages,
+            "url": js("location.href") or ""}
+
+
+def switch_chat(url_or_id: str) -> dict[str, Any]:
+    """Navigate only to an exact Gemini conversation URL or ID."""
+    url = _gemini_url(url_or_id, allow_home=False)
+    tab = ensure_gemini_tab(url)
+    if (tab.get("url", "") or "").rstrip("/") != url:
+        goto_url(url)
+    wait_for_load(timeout=20)
+    wait(2.0)
+    actual = js("location.href") or ""
+    if actual.rstrip("/") != url:
+        raise RuntimeError(f"switch_chat: exact URL was not reached ({actual!r})")
+    composer = _composer_editor()
+    turns = conversation_turns()
+    if not composer.get("found") and not turns:
+        raise RuntimeError("switch_chat: composer or conversation turns not found")
+    return {"status": "switched", "url": url, "conversation_id": url.rsplit("/", 1)[-1],
+            "composer_found": bool(composer.get("found")), "turn_count": len(turns)}
 
 
 def start_deep_research() -> dict[str, Any]:
@@ -600,6 +977,196 @@ def open_share_export_menu() -> list[dict[str, Any]]:
     return _share_export_menu_items()
 
 
+def _read_clipboard_text() -> str:
+    """Read clipboard text through the already attached Gemini page."""
+    try:
+        cdp("Browser.grantPermissions", permissions=["clipboardReadWrite", "clipboardSanitizedWrite"])
+    except Exception:
+        pass
+    clip = js(r"""
+    (async () => {
+      try {
+        const text = await navigator.clipboard.readText();
+        return {ok: true, text};
+      } catch (error) {
+        return {ok: false, error: String(error).slice(0, 120)};
+      }
+    })()
+    """) or {"ok": False}
+    text = clip.get("text")
+    if not clip.get("ok") or not isinstance(text, str) or not text.strip():
+        raise RuntimeError(f"clipboard read failed: {clip.get('error', 'empty')}")
+    return text.strip()
+
+
+def _share_url_allowed(value: str) -> bool:
+    if not isinstance(value, str):
+        return False
+    parsed = urlparse((value or "").strip().rstrip("/"))
+    host = parsed.hostname or ""
+    if (
+        parsed.scheme != "https"
+        or parsed.fragment
+        or parsed.netloc.lower() != host
+    ):
+        return False
+    short_link = (
+        host == "g.co" and not parsed.query and
+        re.fullmatch(r"/gemini/share/[A-Za-z0-9_-]{6,}", parsed.path)
+    ) or (
+        host == "share.gemini.google" and not parsed.query and
+        re.fullmatch(r"/[A-Za-z0-9_-]{6,}", parsed.path)
+    )
+    redirect = (
+        host == "gemini.google.com" and
+        re.fullmatch(r"/share/[A-Za-z0-9_-]{6,}", parsed.path) and
+        re.fullmatch(
+            r"skid=[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            parsed.query,
+        )
+    )
+    return bool(short_link or redirect)
+
+
+def _share_button() -> dict[str, Any]:
+    return js(r"""
+    (() => {
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+      const visible = e => e.offsetParent && e.getBoundingClientRect().width > 0;
+      const elements = [...document.querySelectorAll('button,a,[role="button"]')].filter(visible);
+      const direct = elements.find(e => {
+        const label = norm(e.getAttribute('aria-label') || e.innerText || e.textContent);
+        const testid = e.getAttribute('data-testid') || '';
+        return ['分享', 'Share', '分享聊天', 'Share chat'].includes(label) || /share/i.test(testid);
+      });
+      const button = direct || elements.find(e =>
+        (e.getAttribute('aria-label') || '').includes('打开对话操作菜单'));
+      if (!button) return {found: false};
+      const r = button.getBoundingClientRect();
+      return {found: true, kind: direct ? 'direct' : 'conversation_menu',
+              x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2)};
+    })()
+    """) or {"found": False}
+
+
+def _copy_share_button() -> dict[str, Any]:
+    return js(r"""
+    (() => {
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+      const button = [...document.querySelectorAll('button,[role="button"]')].find(e => {
+        if (!e.offsetParent) return false;
+        const label = norm(e.getAttribute('aria-label') || e.innerText || e.textContent);
+        return label === '复制链接' || label === 'Copy link';
+      });
+      if (!button) return {found: false};
+      const r = button.getBoundingClientRect();
+      return {found: true, x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2)};
+    })()
+    """) or {"found": False}
+
+
+def _share_unknown_result(conversation_url: str, reason: str) -> dict[str, Any]:
+    _share_unknown[conversation_url] = reason
+    return {"status": "unknown", "reason": reason, "conversation_url": conversation_url}
+
+
+def export_share_link() -> dict[str, Any]:
+    """Create or copy the current synthetic conversation's public share link."""
+    conversation_url = _canonical_url()
+    if conversation_url in _share_unknown:
+        return _share_unknown_result(conversation_url, _share_unknown[conversation_url])
+    turns = conversation_turns()
+    if not turns:
+        raise RuntimeError("export_share_link: current conversation has no readable turns")
+    run_id = _synthetic_run_ids.get(conversation_url)
+    if not run_id and _pending_synthetic_run_id:
+        if any(_pending_synthetic_run_id in _SYNTHETIC_RUN_RE.findall(turn.get("text", "")) for turn in turns):
+            run_id = _pending_synthetic_run_id
+            _synthetic_run_ids[conversation_url] = run_id
+    if not run_id or not any(run_id in _SYNTHETIC_RUN_RE.findall(turn.get("text", "")) for turn in turns):
+        raise RuntimeError("export_share_link: current conversation lacks this run's synthetic ID")
+    cached = _share_links.get(conversation_url)
+    if cached:
+        return {"status": "shared", "url": cached, "created": False, "conversation_url": conversation_url}
+
+    current = current_tab()
+    target_id = (current or {}).get("targetId") or (current or {}).get("target_id")
+    if target_id:
+        activate_tab(target_id)
+        wait(1.0)
+    control = _share_button()
+    if not control.get("found"):
+        return _share_unknown_result(conversation_url, "share_button_not_found")
+    try:
+        if control.get("kind") == "conversation_menu":
+            clicked = _click_js("""
+              const el = [...document.querySelectorAll('button,[role="button"]')].find(e =>
+                e.offsetParent && (e.getAttribute('aria-label') || '').includes('打开对话操作菜单'));
+            """)
+            if clicked and clicked.get("found"):
+                wait(1.5)
+                clicked = _click_js("""
+                  const el = [...document.querySelectorAll('[role="menuitem"]')].find(e => {
+                    if (!e.offsetParent) return false;
+                    const label = norm(e.innerText || e.textContent || e.getAttribute('aria-label'));
+                    return label === '分享对话内容' || label === 'Share conversation';
+                  });
+                """)
+        else:
+            clicked = _click_js("""
+              const el = [...document.querySelectorAll('button,a,[role="button"]')].find(e => {
+                if (!e.offsetParent) return false;
+                const label = norm(e.getAttribute('aria-label') || e.innerText || e.textContent);
+                const testid = e.getAttribute('data-testid') || '';
+                return ['分享', 'Share', '分享聊天', 'Share chat'].includes(label) || /share/i.test(testid);
+              });
+            """)
+    except Exception:
+        return _share_unknown_result(conversation_url, "share_activation_exception")
+    if not clicked or not clicked.get("found"):
+        return _share_unknown_result(conversation_url, "share_activation_unconfirmed")
+    wait(3.5)
+    copy = _copy_share_button()
+    if not copy.get("found"):
+        return _share_unknown_result(conversation_url, "copy_link_button_not_found")
+    try:
+        click_at_xy(copy["x"], copy["y"])
+    except Exception:
+        return _share_unknown_result(conversation_url, "copy_link_activation_unconfirmed")
+    wait(1.0)
+    if target_id:
+        activate_tab(target_id)
+        wait(1.0)
+    link = _read_clipboard_text()
+    if not _share_url_allowed(link):
+        raise ValueError("export_share_link: clipboard is not an allowed Gemini share URL")
+    _share_links[conversation_url] = link.rstrip("/")
+    _share_unknown.pop(conversation_url, None)
+    press_key("Escape")
+    return {"status": "shared", "url": link.rstrip("/"), "created": True, "conversation_url": conversation_url}
+
+
+def read_shared_conversation(url: str, close_after: bool = True) -> dict[str, Any]:
+    """Read an allowed Gemini share URL and close only its newly opened tab."""
+    if not _share_url_allowed(url):
+        raise ValueError("read_shared_conversation: URL is not an allowed Gemini share URL")
+    target = new_tab(url)
+    try:
+        wait_for_load(timeout=20)
+        wait(8.0)
+        final_url = js("location.href") or url
+        if not _share_url_allowed(final_url):
+            raise RuntimeError("read_shared_conversation: share page redirected to an unapproved URL")
+        turns = conversation_turns()
+        text = "\n".join(f"[{turn['role']}] {turn['text']}" for turn in turns)
+        return {"status": "read", "url": final_url.rstrip("/"), "title": js("document.title") or "", "turns": turns, "text": text}
+    finally:
+        if close_after and target:
+            close_tab(target)
+            wait(0.5)
+
+
 def export_report_copy() -> str:
     """Copy the finished Deep Research report to the system clipboard via
     分享和导出 → 复制内容.
@@ -618,32 +1185,13 @@ def export_report_copy() -> str:
     if not target:
         press_key("Escape")
         raise RuntimeError("export_report_copy: 复制内容 menu item not found")
-    try:
-        cdp("Browser.grantPermissions", permissions=["clipboardReadWrite", "clipboardSanitizedWrite"])
-    except Exception:
-        pass
     cdp("Input.dispatchMouseEvent", type="mouseMoved", x=target["x"], y=target["y"])
     wait(0.3)
     cdp("Input.dispatchMouseEvent", type="mousePressed", x=target["x"], y=target["y"], button="left", clickCount=1)
     wait(0.15)
     cdp("Input.dispatchMouseEvent", type="mouseReleased", x=target["x"], y=target["y"], button="left", clickCount=1)
     wait(2.0)
-    clip = js("""
-    (async () => {
-      try {
-        const t = await navigator.clipboard.readText();
-        return {ok: true, len: t.length, text: t};
-      } catch (e) {
-        return {ok: false, err: String(e).slice(0, 150)};
-      }
-    })()
-    """) or {"ok": False}
-    if not clip.get("ok") or not clip.get("text"):
-        raise RuntimeError(f"export_report_copy: clipboard read failed: {clip.get('err', 'empty')}")
-    text = clip.get("text")
-    if not isinstance(text, str):
-        raise RuntimeError("export_report_copy: clipboard returned non-string")
-    return text
+    return _read_clipboard_text()
 
 
 def report_is_done() -> bool:
