@@ -270,6 +270,16 @@ def test_snapshot_contains_real_contract_fields():
     assert snapshot["validation_errors"] == []
 
 
+def test_diagnostics_reclassifies_upload_success_as_positive_toast():
+    namespace, page = load_publishing()
+    notice = "视频《当前标题》上传成功"
+    page.validation_errors = [notice]
+    diagnostics = namespace["submission_diagnostics"]()
+    assert diagnostics["validation_errors"] == []
+    assert diagnostics["toasts"] == [notice]
+    assert diagnostics["reason"] == "archive_evidence_delayed"
+
+
 def _valid_snapshot():
     return {
         "title": "标题", "cover_ready": True, "custom_cover_set": True,
@@ -289,7 +299,7 @@ def _configure_submit(namespace, archive_values, manager_values, clicks, diagnos
     namespace["_click_visible"] = lambda selector: clicks.append(selector)
     manager_iter = iter(manager_values)
     manager_last = manager_values[-1] if manager_values else {"schedule_match": True}
-    namespace["manager_evidence"] = lambda title, schedule, strict=False: next(manager_iter, manager_last)
+    namespace["manager_evidence"] = lambda title, schedule, strict=False, attempts=3: next(manager_iter, manager_last)
     diagnostics_values = diagnostics_values or [{
         "url": "https://member.bilibili.com/platform/upload/video/frame",
         "validation_errors": [], "toasts": [], "modals": [],
@@ -328,6 +338,25 @@ def test_submit_once_returns_accepted_but_unverified_without_retry_signal():
     assert result["archive"] == archive[0]
     assert result["expected_schedule"] == "2026-08-30 22:00"
     assert result["submit_clicks"] == 1
+    assert clicks == [".submit-add"]
+
+
+def test_submit_once_accepts_latest_manager_record_before_archive_api_catches_up():
+    namespace, _ = load_publishing()
+    clicks = []
+    manager = {
+        "title": "标题", "text": "定时发布 2026年08月30日 22:00",
+        "schedule_match": True, "latest": True, "list_loads": 1,
+    }
+    _configure_submit(namespace, [[], []], [manager], clicks)
+    result = namespace["submit_once"](
+        "标题", 518800384, "水蜜桃英语", "2026-08-30 22:00", timeout=0.1
+    )
+    assert result["status"] == "verified"
+    assert result["submitted"] is True
+    assert result["verification_source"] == "manager_latest"
+    assert result["manager"] == manager
+    assert "archive" not in result
     assert clicks == [".submit-add"]
 
 
@@ -370,3 +399,26 @@ def test_submit_once_blocks_preexisting_exact_title_before_click():
     with pytest.raises(RuntimeError, match="already exists"):
         namespace["submit_once"]("标题", 518800384, "水蜜桃英语", "2026-08-30 22:00", timeout=1)
     assert clicks == []
+
+
+def test_manager_evidence_refreshes_until_latest_card_matches():
+    namespace, _ = load_publishing()
+    navigations = []
+    cards = iter([
+        {"title": "旧稿件", "href": "/old", "text": "旧稿件"},
+        None,
+        {
+            "title": "标题", "href": "/new",
+            "text": "标题 定时发布 2026年08月30日 22:00",
+        },
+    ])
+    namespace["goto_url"] = navigations.append
+    namespace["wait"] = lambda seconds=0: None
+    namespace["js"] = lambda script: next(cards)
+    evidence = namespace["manager_evidence"](
+        "标题", "2026-08-30 22:00", attempts=3
+    )
+    assert evidence["latest"] is True
+    assert evidence["list_loads"] == 3
+    assert evidence["schedule_match"] is True
+    assert navigations == [namespace["MANAGER_URL"]] * 3

@@ -26,9 +26,13 @@ not depend on SAU or biliup at runtime.
    `prepare_upload(video_file, title, expected_mid, expected_name)`.
 4. Set declaration, custom cover, tags, partition, description, and schedule.
    Read `submission_snapshot()` and assert every requested value.
-5. Call `submit_once(...)` exactly once. Persist its archive AID/BVID evidence.
-6. Close only the task-owned tab after read-only manager reconciliation. Never
-   stop Chrome or its Profile.
+5. Call `submit_once(...)` exactly once. After the click, confirmation is
+   read-only: return to the creator manager list and reload it. Publication is
+   confirmed only when the first (latest) card has the exact submitted title
+   and, when scheduled, the exact schedule. Do not infer failure from a delayed
+   archive API response.
+6. Close only the task-owned tab after manager-list reconciliation. Never stop
+   Chrome or its Profile.
 
 ## Public functions
 
@@ -83,15 +87,22 @@ not depend on SAU or biliup at runtime.
   `form_validation_failed`, `confirmation_required`, `platform_rejected`,
   `archive_evidence_delayed`, `click_not_accepted`, or
   `submission_unverified`. It never clicks or confirms anything.
-- `manager_evidence(title: str, expected_schedule: str | None = None) -> dict`:
-  opens the manager page, finds the unique exact-title card, and verifies the
-  optional `定时发布` plus exact Chinese date/time. Raises on absence/mismatch.
+- `manager_evidence(title: str, expected_schedule: str | None = None,
+  strict: bool = True, attempts: int = 3) -> dict`: opens the manager list and
+  re-navigates to that same URL for up to three total list loads. It accepts
+  only the first/latest card with the exact title, then verifies optional
+  `定时发布` plus the exact Chinese date/time. It returns `latest=true` and
+  `list_loads`; a matching older card is not publication evidence.
 - `submit_once(title: str, expected_mid: int, expected_name: str | None = None,
   expected_schedule: str | None = None, timeout: int = 600) -> dict`: rechecks
   identity, exact-title uniqueness, and two stable full snapshots, clicks
-  `立即投稿` exactly once, then polls archive, manager, and rejection evidence
-  under one deadline. Zero archive returns `status="not_accepted"`, a concrete
-  `reason`, diagnostics, and `submit_clicks=1` instead of a generic timeout.
+  `立即投稿` exactly once, then polls the archive API and repeatedly reloads the
+  manager list under one deadline. An exact latest manager card can verify
+  acceptance before the archive API catches up; the result then has
+  `verification_source="manager_latest"` and may not yet contain `archive`.
+  Upload/processing success notices are positive toasts, never form errors.
+  A true rejection returns `status="not_accepted"`, concrete diagnostics, and
+  `submit_clicks=1`.
 
 ## Exact usage example
 
@@ -117,9 +128,9 @@ print(result)
 
 | Result | Required action |
 | --- | --- |
-| `status="verified"` | Finish and retain the returned AID/BVID and manager evidence. |
-| `status="accepted_but_schedule_unverified"` | Poll only `manager_evidence(title, schedule)` read-only. Never call `prepare_upload`, any `set_*`, `_click_visible`, or `submit_once` again. |
-| `status="not_accepted"` | Preserve `diagnostics`, inspect the exact reason and exact-title archives, and stop. Do not click or submit again automatically. |
+| `status="verified"` | Finish when `manager.latest=true`, retain manager evidence, and retain AID/BVID too when the archive API has caught up. |
+| `status="accepted_but_schedule_unverified"` | Poll only `manager_evidence(title, schedule)` read-only. Its default three list loads are the bounded refresh procedure. Never call `prepare_upload`, any `set_*`, `_click_visible`, or `submit_once` again. |
+| `status="not_accepted"` | Preserve `diagnostics`, inspect the exact reason, then call only `manager_evidence(title, schedule)` for bounded read-only reconciliation. Do not click or submit again automatically. |
 | multiple exact-title records or pre-existing exact-title record | Hard stop. Never submit, duplicate, delete, retract, or invent a new title. |
 
 The submit click fact is recorded before polling, so a delayed manager page can
@@ -136,6 +147,9 @@ or immediate-publication dialogs.
 - [ ] Description and declaration read back exactly.
 - [ ] Scheduling is enabled and date/time match the requested value.
 - [ ] Two snapshots taken two seconds apart are identical.
-- [ ] `submit_once` is called once and returns one AID/BVID.
-- [ ] Manager evidence shows `定时发布` and the exact Chinese schedule.
+- [ ] `submit_once` is called once; no recovery path clicks it again.
+- [ ] After bounded list reloads, the manager's first/latest card has the exact
+  title, `latest=true`, and the exact Chinese schedule when scheduled.
+- [ ] AID/BVID is retained when the archive API has caught up; manager-latest
+  evidence remains sufficient while that API is delayed.
 - [ ] Agent Pool leases and write locks are empty after cleanup.

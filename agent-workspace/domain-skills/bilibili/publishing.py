@@ -200,9 +200,20 @@ def submission_diagnostics() -> dict[str, Any]:
     evidence.setdefault("modals", [])
     evidence.setdefault("submit_button", None)
     evidence.setdefault("page_text_summary", "")
-    negative_toast = any(re.search(r"失败|错误|请.*填写|请选择|不符合|无法|稍后重试", text)
+    negative_pattern = r"失败|错误|请.*填写|请选择|不符合|无法|稍后重试"
+    success_notices = [
+        text for text in evidence["validation_errors"]
+        if re.search(r"(?:上传|处理)(?:完成|成功)|已上传", text)
+        and not re.search(negative_pattern, text)
+    ]
+    if success_notices:
+        evidence["validation_errors"] = [
+            text for text in evidence["validation_errors"] if text not in success_notices
+        ]
+        evidence["toasts"] = list(dict.fromkeys([*evidence["toasts"], *success_notices]))
+    negative_toast = any(re.search(negative_pattern, text) for text in evidence["toasts"])
+    positive_toast = any(re.search(r"成功|已提交|审核中|上传完成", text)
                          for text in evidence["toasts"])
-    positive_toast = any(re.search(r"成功|已提交|审核中", text) for text in evidence["toasts"])
     if evidence["validation_errors"]:
         reason = "form_validation_failed"
     elif evidence["modals"]:
@@ -662,19 +673,33 @@ def submission_snapshot() -> dict[str, Any]:
 
 
 def manager_evidence(title: str, expected_schedule: str | None = None,
-                     strict: bool = True) -> dict[str, Any]:
-    goto_url(MANAGER_URL)
-    wait(4)
-    evidence = js("""(() => {
-      const card = Array.from(document.querySelectorAll('.article-card.v2')).find(row =>
-        (row.querySelector('a.name')?.innerText || '').trim() === %s);
-      if (!card) return null;
-      return {title: (card.querySelector('a.name')?.innerText || '').trim(),
-              href: card.querySelector('a.name')?.href || '',
-              text: (card.innerText || '').trim()};
-    })()""" % json.dumps(title.strip()))
-    if not evidence:
-        raise RuntimeError("Bilibili creator manager has no exact-title record")
+                     strict: bool = True, attempts: int = 3) -> dict[str, Any]:
+    if attempts < 1:
+        raise ValueError("manager evidence attempts must be at least one")
+    expected_title = title.strip()
+    observed_title = ""
+    evidence = None
+    for list_loads in range(1, attempts + 1):
+        goto_url(MANAGER_URL)
+        wait(4)
+        evidence = js("""(() => {
+          const card = document.querySelector('.article-card.v2');
+          if (!card) return null;
+          return {title: (card.querySelector('a.name')?.innerText || '').trim(),
+                  href: card.querySelector('a.name')?.href || '',
+                  text: (card.innerText || '').trim()};
+        })()""")
+        observed_title = (evidence or {}).get("title", "")
+        if observed_title == expected_title:
+            break
+    else:
+        raise RuntimeError(
+            "Bilibili creator manager latest record did not match exact title "
+            "after %s list loads: expected=%r observed=%r" %
+            (attempts, expected_title, observed_title)
+        )
+    evidence["latest"] = True
+    evidence["list_loads"] = list_loads
     if expected_schedule:
         date, clock = expected_schedule.split(" ", 1)
         chinese = "%s年%s月%s日 %s" % (*date.split("-"), clock)
@@ -737,19 +762,31 @@ def submit_once(title: str, expected_mid: int, expected_name: str | None = None,
         matches = archive_matches(title)
         if len(matches) == 1:
             archive = matches[0]
-            try:
-                manager = manager_evidence(title, expected_schedule, strict=False)
-            except RuntimeError as exc:
-                last_manager_error = str(exc)
-            else:
-                if manager.get("schedule_match"):
-                    return {"identity": identity, "submitted": True, "status": "verified",
-                            "archive": archive, "manager": manager, "submit_clicks": int(clicked)}
-                last_manager_error = manager.get("text") or "Bilibili manager schedule evidence is not ready"
         elif len(matches) > 1:
             raise RuntimeError("Bilibili archive title matched multiple records")
+        try:
+            manager = manager_evidence(
+                title, expected_schedule, strict=False, attempts=1
+            )
+        except RuntimeError as exc:
+            last_manager_error = str(exc)
+        else:
+            if manager.get("schedule_match"):
+                result = {
+                    "identity": identity, "submitted": True, "status": "verified",
+                    "manager": manager, "verification_source": "manager_latest",
+                    "submit_clicks": int(clicked),
+                }
+                if archive is not None:
+                    result["archive"] = archive
+                return result
+            last_manager_error = (
+                manager.get("text") or
+                "Bilibili manager schedule evidence is not ready"
+            )
         diagnostics = submission_diagnostics()
-        if diagnostics["reason"] in {"form_validation_failed", "confirmation_required", "platform_rejected"}:
+        if diagnostics["reason"] in {
+                "form_validation_failed", "confirmation_required", "platform_rejected"}:
             return {"identity": identity, "submitted": False, "status": "not_accepted",
                     "reason": diagnostics["reason"], "diagnostics": diagnostics,
                     "submit_clicks": int(clicked)}
