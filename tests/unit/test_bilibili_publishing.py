@@ -29,6 +29,10 @@ class FakePage:
         self.schedule = {"scheduled": True, "schedule_date": "2026-08-30", "schedule_time": "22:00"}
         self.title = "中奖彩票：赢得大奖反而陷入困境？数千名足球球迷的荒谬遭遇｜外刊播客｜中英+文稿"
         self.submit_text = "立即投稿"
+        self.submit_disabled = False
+        self.validation_errors = []
+        self.toasts = []
+        self.modals = []
         self.reject_tags = set()
         self.last_option = ""
         self.pending_hour = ""
@@ -77,6 +81,8 @@ class FakePage:
             return self.cover_filename
         if "return node?.querySelector" in script:
             return self.partition
+        if "return node?.innerText" in script:
+            return self.partition
         if "el.innerText =" in script and ".ql-editor" in script:
             value = json.loads(re.search(r"el\.innerText = (.*?);", script).group(1))
             self.description = value
@@ -109,6 +115,20 @@ class FakePage:
             return self.title
         if "input[placeholder*=\"创作声明\"]" in script:
             return self.declaration
+        if "const validationSelectors =" in script:
+            return {
+                "url": "https://member.bilibili.com/platform/upload/video/frame",
+                "validation_errors": list(self.validation_errors),
+                "toasts": list(self.toasts),
+                "modals": list(self.modals),
+                "submit_button": {
+                    "text": self.submit_text,
+                    "disabled": self.submit_disabled,
+                    "aria_disabled": "true" if self.submit_disabled else "",
+                    "class_name": "submit-add",
+                },
+                "page_text_summary": " | ".join(self.validation_errors + self.toasts + self.modals),
+            }
         if "submit-add" in script:
             return self.submit_text
         if "x/web-interface/nav" in script:
@@ -239,13 +259,15 @@ def test_snapshot_contains_real_contract_fields():
     assert set(snapshot) == {
         "title", "cover_ready", "custom_cover_set", "cover_filename", "partition",
         "description", "tags", "declaration", "scheduled", "schedule_date",
-        "schedule_time", "submit_text",
+        "schedule_time", "submit_text", "submit_enabled", "validation_errors",
     }
     assert snapshot["cover_ready"] is True
     assert snapshot["custom_cover_set"] is True
     assert snapshot["partition"] == "知识"
     assert snapshot["description"] == "描述文本"
     assert snapshot["submit_text"] == "立即投稿"
+    assert snapshot["submit_enabled"] is True
+    assert snapshot["validation_errors"] == []
 
 
 def _valid_snapshot():
@@ -254,10 +276,11 @@ def _valid_snapshot():
         "cover_filename": "cover.png", "partition": "知识", "description": "描述",
         "tags": ["英语学习"], "declaration": "内容无需标注", "scheduled": True,
         "schedule_date": "2026-08-30", "schedule_time": "22:00", "submit_text": "立即投稿",
+        "submit_enabled": True, "validation_errors": [],
     }
 
 
-def _configure_submit(namespace, archive_values, manager_values, clicks):
+def _configure_submit(namespace, archive_values, manager_values, clicks, diagnostics_values=None):
     namespace["require_identity"] = lambda mid, name=None: {"mid": mid, "uname": name}
     archive_iter = iter(archive_values)
     archive_last = archive_values[-1] if archive_values else []
@@ -267,6 +290,15 @@ def _configure_submit(namespace, archive_values, manager_values, clicks):
     manager_iter = iter(manager_values)
     manager_last = manager_values[-1] if manager_values else {"schedule_match": True}
     namespace["manager_evidence"] = lambda title, schedule, strict=False: next(manager_iter, manager_last)
+    diagnostics_values = diagnostics_values or [{
+        "url": "https://member.bilibili.com/platform/upload/video/frame",
+        "validation_errors": [], "toasts": [], "modals": [],
+        "submit_button": {"text": "立即投稿", "disabled": False, "aria_disabled": "", "class_name": "submit-add"},
+        "page_text_summary": "", "reason": "click_not_accepted",
+    }]
+    diagnostics_iter = iter(diagnostics_values)
+    diagnostics_last = diagnostics_values[-1]
+    namespace["submission_diagnostics"] = lambda: next(diagnostics_iter, diagnostics_last)
     namespace["wait"] = lambda seconds=0: None
 
 
@@ -299,12 +331,26 @@ def test_submit_once_returns_accepted_but_unverified_without_retry_signal():
     assert clicks == [".submit-add"]
 
 
-def test_submit_once_zero_archive_raises_do_not_retry_message():
+def test_submit_once_zero_archive_returns_recoverable_validation_diagnostics():
     namespace, _ = load_publishing()
     clicks = []
-    _configure_submit(namespace, [[]], [], clicks)
-    with pytest.raises(TimeoutError, match="do not retry blindly"):
-        namespace["submit_once"]("标题", 518800384, "水蜜桃英语", "2026-08-30 22:00", timeout=0)
+    diagnostics = {
+        "url": "https://member.bilibili.com/platform/upload/video/frame",
+        "validation_errors": ["请选择二级分区"], "toasts": [], "modals": [],
+        "submit_button": {"text": "立即投稿", "disabled": False, "aria_disabled": "", "class_name": "submit-add"},
+        "page_text_summary": "分区 | 请选择二级分区 | 立即投稿",
+        "reason": "form_validation_failed",
+    }
+    _configure_submit(namespace, [[]], [], clicks, [diagnostics])
+    snapshot_calls = []
+    namespace["submission_snapshot"] = lambda: (snapshot_calls.append(True), _valid_snapshot())[1]
+    result = namespace["submit_once"]("标题", 518800384, "水蜜桃英语", "2026-08-30 22:00", timeout=0)
+    assert result["status"] == "not_accepted"
+    assert result["reason"] == "form_validation_failed"
+    assert result["diagnostics"] == diagnostics
+    assert result["submitted"] is False
+    assert result["submit_clicks"] == 1
+    assert len(snapshot_calls) == 2
     assert clicks == [".submit-add"]
 
 
