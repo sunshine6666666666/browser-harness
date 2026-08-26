@@ -75,15 +75,23 @@ not depend on SAU or biliup at runtime.
   five-minute constraints.
 - `submission_snapshot() -> dict`: reads title, cover readiness/custom state and
   filename, partition, description, tags, declaration, scheduling date/time,
-  scheduling state, and exact `立即投稿` text from the DOM. It has no fake
-  body-text category flag.
+  scheduling state, exact `立即投稿` text, button enabled state, and visible
+  validation errors from the DOM. It has no fake body-text category flag.
+- `submission_diagnostics() -> dict`: reads post-click URL, visible validation
+  errors, toast text, confirmation/modal text, submit-button state, and a short
+  relevant page-text summary. Its deterministic `reason` is one of
+  `form_validation_failed`, `confirmation_required`, `platform_rejected`,
+  `archive_evidence_delayed`, `click_not_accepted`, or
+  `submission_unverified`. It never clicks or confirms anything.
 - `manager_evidence(title: str, expected_schedule: str | None = None) -> dict`:
   opens the manager page, finds the unique exact-title card, and verifies the
   optional `定时发布` plus exact Chinese date/time. Raises on absence/mismatch.
 - `submit_once(title: str, expected_mid: int, expected_name: str | None = None,
   expected_schedule: str | None = None, timeout: int = 600) -> dict`: rechecks
-  identity, exact-title uniqueness, and the full snapshot, clicks `立即投稿`
-  exactly once, then polls archive and manager evidence under one deadline.
+  identity, exact-title uniqueness, and two stable full snapshots, clicks
+  `立即投稿` exactly once, then polls archive, manager, and rejection evidence
+  under one deadline. Zero archive returns `status="not_accepted"`, a concrete
+  `reason`, diagnostics, and `submit_clicks=1` instead of a generic timeout.
 
 ## Exact usage example
 
@@ -111,7 +119,7 @@ print(result)
 | --- | --- |
 | `status="verified"` | Finish and retain the returned AID/BVID and manager evidence. |
 | `status="accepted_but_schedule_unverified"` | Poll only `manager_evidence(title, schedule)` read-only. Never call `prepare_upload`, any `set_*`, `_click_visible`, or `submit_once` again. |
-| no archive evidence | Treat as unknown; inspect exact-title archive records first. Do not retry blindly. |
+| `status="not_accepted"` | Preserve `diagnostics`, inspect the exact reason and exact-title archives, and stop. Do not click or submit again automatically. |
 | multiple exact-title records or pre-existing exact-title record | Hard stop. Never submit, duplicate, delete, retract, or invent a new title. |
 
 The submit click fact is recorded before polling, so a delayed manager page can

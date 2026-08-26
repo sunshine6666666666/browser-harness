@@ -154,14 +154,69 @@ def _partition_value() -> str:
         const r = node.getBoundingClientRect();
         return r.width > 0 && r.height > 0;
       };
-      const candidates = Array.from(document.querySelectorAll('[role=combobox],.partition-select,.partition-container .select-item,.select-item,.video-human-type .select-item-cont'))
-        .filter(visible);
-      const marked = candidates.find(node => /分区|category|partition/i.test(node.getAttribute('aria-label') || '') ||
-        /分区/.test(node.parentElement?.innerText || '') ||
-        node.matches('.video-human-type .select-item-cont'));
-      const node = marked || candidates.find(item => (item.innerText || '').trim() && !/创作声明|合集/.test(item.innerText));
-      return node?.querySelector('.selected,.select-value,[role=option]')?.innerText || node?.innerText || '';
+      const node = Array.from(document.querySelectorAll('.video-human-type .select-item-cont')).find(visible);
+      return node?.innerText || '';
     })()"""))
+
+
+def submission_diagnostics() -> dict[str, Any]:
+    evidence = js("""(() => {
+      const visible = node => {
+        const r = node.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      };
+      const text = node => (node.innerText || node.textContent || node.getAttribute('aria-label') ||
+        node.getAttribute('placeholder') || node.getAttribute('title') || '').trim().replace(/\\s+/g, ' ');
+      const unique = values => Array.from(new Set(values.filter(Boolean)));
+      const collect = selector => unique(Array.from(document.querySelectorAll(selector)).filter(visible).map(text));
+      const validationSelectors = '[role="alert"],[aria-invalid="true"],.el-form-item__error,.bcc-form-item-error,.error-text,.error-msg,.error-tip,.input-error-text,.section-title-warning';
+      const toastSelectors = '.bcc-toast,.el-message,.videoup-notification-dialog,.notify-tips,[class*="toast"]';
+      const modalSelectors = '.bcc-dialog__wrap,.el-message-box,.el-dialog__wrapper,[role="dialog"],.modal-content';
+      const submit = Array.from(document.querySelectorAll('.submit-add,button')).find(node =>
+        visible(node) && text(node) === '立即投稿');
+      const important = unique((document.body?.innerText || '').split('\\n').map(value => value.trim())
+        .filter(value => /必填|请选择|失败|错误|投稿|确认|稍后|至少|超过|违规|封面|分区|标签/.test(value)))
+        .slice(0, 16).join(' | ').slice(0, 1200);
+      return {
+        url: location.href,
+        validation_errors: collect(validationSelectors),
+        toasts: collect(toastSelectors),
+        modals: collect(modalSelectors),
+        submit_button: submit ? {
+          text: text(submit),
+          disabled: Boolean(submit.disabled || submit.closest('[disabled]') ||
+            /(^|[-_ ])disabled?($|[-_ ])/i.test(String(submit.className || '')) ||
+            getComputedStyle(submit).pointerEvents === 'none'),
+          aria_disabled: submit.getAttribute('aria-disabled') || submit.closest('[aria-disabled]')?.getAttribute('aria-disabled') || '',
+          class_name: String(submit.className || '')
+        } : null,
+        page_text_summary: important
+      };
+    })()""") or {}
+    evidence.setdefault("url", "")
+    evidence.setdefault("validation_errors", [])
+    evidence.setdefault("toasts", [])
+    evidence.setdefault("modals", [])
+    evidence.setdefault("submit_button", None)
+    evidence.setdefault("page_text_summary", "")
+    negative_toast = any(re.search(r"失败|错误|请.*填写|请选择|不符合|无法|稍后重试", text)
+                         for text in evidence["toasts"])
+    positive_toast = any(re.search(r"成功|已提交|审核中", text) for text in evidence["toasts"])
+    if evidence["validation_errors"]:
+        reason = "form_validation_failed"
+    elif evidence["modals"]:
+        reason = "confirmation_required"
+    elif negative_toast:
+        reason = "platform_rejected"
+    elif positive_toast:
+        reason = "archive_evidence_delayed"
+    elif evidence["url"].startswith(UPLOAD_URL) and evidence["submit_button"]:
+        reason = "click_not_accepted"
+    else:
+        reason = "submission_unverified"
+    evidence["reason"] = reason
+    return evidence
 
 
 def account_identity() -> dict[str, Any]:
@@ -408,7 +463,10 @@ def set_partition(name: str, timeout: float = 10) -> str:
     if not requested:
         raise ValueError("Bilibili partition name cannot be blank")
     opened = js("""(() => {
-      const node = document.querySelector('.video-human-type .select-item-cont');
+      const node = Array.from(document.querySelectorAll('.video-human-type .select-item-cont')).find(item => {
+        const r = item.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
       if (!node) return false;
       node.click();
       return true;
@@ -583,6 +641,8 @@ def set_schedule_time(hour: int, minute: int) -> str:
 def submission_snapshot() -> dict[str, Any]:
     cover = _cover_state()
     schedule = _schedule_state()
+    diagnostics = submission_diagnostics()
+    submit = diagnostics.get("submit_button") or {}
     return {
         "title": _normalized_text(js("document.querySelector('input[placeholder=\"请输入稿件标题\"]')?.value || ''")),
         "cover_ready": bool(cover.get("cover_ready")),
@@ -595,7 +655,9 @@ def submission_snapshot() -> dict[str, Any]:
         "scheduled": bool(schedule.get("scheduled")),
         "schedule_date": schedule.get("schedule_date", ""),
         "schedule_time": schedule.get("schedule_time", ""),
-        "submit_text": js("""Array.from(document.querySelectorAll('.submit-add,button')).map(x => (x.innerText || '').trim()).find(x => x === '立即投稿') || ''""") or "",
+        "submit_text": submit.get("text", ""),
+        "submit_enabled": not bool(submit.get("disabled") or submit.get("aria_disabled") == "true"),
+        "validation_errors": diagnostics.get("validation_errors", []),
     }
 
 
@@ -633,12 +695,19 @@ def submit_once(title: str, expected_mid: int, expected_name: str | None = None,
         raise RuntimeError("Bilibili archive title matched multiple records")
     if existing:
         raise RuntimeError("Bilibili exact title already exists; refusing duplicate submission")
+    first_snapshot = submission_snapshot()
+    wait(2)
     snapshot = submission_snapshot()
+    if first_snapshot != snapshot:
+        raise RuntimeError("Bilibili preflight was not stable: first=%s second=%s" %
+                           (first_snapshot, snapshot))
     observed_schedule = "%s %s" % (snapshot.get("schedule_date"), snapshot.get("schedule_time"))
     if (snapshot.get("title") != title or not snapshot.get("cover_ready") or
             not snapshot.get("custom_cover_set") or not snapshot.get("tags") or
             not snapshot.get("partition") or not snapshot.get("description") or
             not snapshot.get("declaration") or not snapshot.get("scheduled") or
+            snapshot.get("submit_text") != "立即投稿" or not snapshot.get("submit_enabled") or
+            snapshot.get("validation_errors") or
             (expected_schedule and observed_schedule != expected_schedule)):
         raise RuntimeError("Bilibili preflight failed: %s" % snapshot)
     js("document.querySelector('input[placeholder=\"请输入稿件标题\"]')?.click()")
@@ -655,6 +724,12 @@ def submit_once(title: str, expected_mid: int, expected_name: str | None = None,
     activate_tab(current_tab())
     _click_visible('.submit-add')
     clicked = True
+    wait(0.5)
+    diagnostics = submission_diagnostics()
+    if diagnostics["reason"] in {"form_validation_failed", "confirmation_required", "platform_rejected"}:
+        return {"identity": identity, "submitted": False, "status": "not_accepted",
+                "reason": diagnostics["reason"], "diagnostics": diagnostics,
+                "submit_clicks": int(clicked)}
     deadline = time.monotonic() + timeout
     archive = None
     last_manager_error = ""
@@ -673,13 +748,20 @@ def submit_once(title: str, expected_mid: int, expected_name: str | None = None,
                 last_manager_error = manager.get("text") or "Bilibili manager schedule evidence is not ready"
         elif len(matches) > 1:
             raise RuntimeError("Bilibili archive title matched multiple records")
+        diagnostics = submission_diagnostics()
+        if diagnostics["reason"] in {"form_validation_failed", "confirmation_required", "platform_rejected"}:
+            return {"identity": identity, "submitted": False, "status": "not_accepted",
+                    "reason": diagnostics["reason"], "diagnostics": diagnostics,
+                    "submit_clicks": int(clicked)}
         wait(min(3, max(0, deadline - time.monotonic())))
     if archive is not None:
         return {"identity": identity, "submitted": True,
                 "status": "accepted_but_schedule_unverified", "archive": archive,
                 "expected_schedule": expected_schedule, "manager_error": last_manager_error,
                 "submit_clicks": int(clicked)}
-    raise TimeoutError("Bilibili submission has no creator archive evidence after waiting; do not retry blindly")
+    return {"identity": identity, "submitted": False, "status": "not_accepted",
+            "reason": diagnostics["reason"], "diagnostics": diagnostics,
+            "submit_clicks": int(clicked)}
 
 
 def _self_check() -> None:
