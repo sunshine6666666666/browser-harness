@@ -94,6 +94,10 @@ PY
 | `expand_all_user_messages()` | Click only visible 展开/Show more controls; return count |
 | `full_conversation(max_pages, wait_s)` | Read top-to-bottom with two stable boundaries and overlap/ID dedupe |
 | `switch_chat(url_or_id)` | Navigate only to an exact Gemini `/app/<conversation_id>` URL or ID |
+| `rename_conversation(title)` | Under a write lease, rename only the current canonical `/app/<conversation_id>` via its exact sidebar row; returns `definitely_renamed`, `unknown`, or `failed` |
+| `conversation_snapshot(max_pages, wait_s)` | Read a virtualized conversation in order and return `coverage=full|partial|missing` |
+| `request_conversation_summary(prompt, wait_timeout)` | Detect an existing exact user request in the full snapshot, otherwise send one in-place summary request and never retry an unknown send |
+| `conversation_summary(prompt, wait_timeout)` | Compatibility alias for `request_conversation_summary` |
 | `export_share_link()` | Require an exact run ID registered by this process's `send_message()` and present in the current turn, then create/copy the public share URL; idempotent per process |
 | `read_shared_conversation(url, close_after)` | Validate an official share URL, read structured turns, close only its new tab |
 | `start_deep_research()` | On the plan card, `scrollIntoView` then click 开始研究 |
@@ -148,6 +152,22 @@ pill text is the current model. Menu rows are `[role="menuitem"]`:
   `skid` query is allowed; reject all other query strings and fragments.
   The copy control requires one real CDP coordinate click after tab activation;
   a synthetic JS click may leave the clipboard empty.
+- Current-conversation rename: `rename_conversation(title)` derives the ID only
+  from the current canonical `/app/<id>` URL, opens the explicit `打开边栏` /
+  `Open sidebar` control when needed, then finds exactly one visible sidebar
+  anchor with that exact href, and then uses that row's observed options button
+  and exact `重命名`/`Rename` menu action. It never searches by title fragment.
+  The helper sets the observed editor once, submits it with one real `Enter`, and
+  returns `definitely_renamed` only
+  after two stable exact title reads with the editor gone. If the write started
+  but persistence is ambiguous, it returns `unknown`; never retry that result.
+- Ordinary summary: `conversation_snapshot()` pages to both stable boundaries,
+  merges virtualized pages by message ID or adjacent edge overlap, and reports
+  `full`, `partial`, or `missing` rather than silently treating a visible slice
+  as a complete transcript. `request_conversation_summary()` compares the exact
+  normalized prompt against the full ordered user turns before sending; an
+  existing match returns `already_requested`, and an `unknown` send is never
+  retried.
 - Deep Research plan card: after submitting, a card shows the research title,
   numbered plan steps, `修改方案`, `开始研究`, and `不使用 Deep Research，再试一次`.
   **`开始研究` may be BELOW the viewport — scrollIntoView before clicking.**

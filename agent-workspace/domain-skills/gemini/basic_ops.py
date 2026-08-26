@@ -5,9 +5,10 @@ Runs inside this checkout's `./browser-harness` (script via stdin, then
 and call the functions below). Verified 2026-08-05 against gemini.google.com
 Chinese UI (Pro account, Quill `ql-editor` composer, Angular/Material menus).
 
-Covered lifecycle: open site, new chat, switch chat, select model, toggle
-Deep Research tool, send message, wait for reply, read conversation,
-scroll, start Deep Research and detect its progress/completion.
+Covered lifecycle: open site, new chat, switch chat, exact-current-conversation
+rename, ordered conversation snapshot/summary request, select model, toggle
+Deep Research tool, send message, wait for reply, read conversation, scroll,
+start Deep Research and detect its progress/completion.
 
 IMPORTANT platform quirks (all verified):
 - Clicking: CDP `Input.dispatchMouseEvent` mousePressed/Released intermittently
@@ -468,6 +469,11 @@ def _turn_matches(expected: str, actual: str) -> bool:
             break
     if actual == expected:
         return True
+    # The rendered user turn may include a short UI/accessibility wrapper
+    # around the submitted text. The caller still requires a new turn ID/count
+    # before accepting this as post-send evidence.
+    if expected and expected in actual:
+        return True
     # Gemini may render a collapsed long prompt; require both ends before
     # accepting the visible excerpt as the just-sent turn.
     return (len(actual) >= 160 and len(expected) >= len(actual) and
@@ -864,6 +870,266 @@ def switch_chat(url_or_id: str) -> dict[str, Any]:
         raise RuntimeError("switch_chat: composer or conversation turns not found")
     return {"status": "switched", "url": url, "conversation_id": url.rsplit("/", 1)[-1],
             "composer_found": bool(composer.get("found")), "turn_count": len(turns)}
+
+
+def _exact_conversation_row(conversation_id: str) -> dict[str, Any]:
+    """Find the visible sidebar row for exactly one canonical conversation ID."""
+    return js(r"""
+    (() => {
+      const wanted = %s;
+      const norm = s => (s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+      const visible = e => e && e.offsetParent && e.getBoundingClientRect().width > 0;
+      const anchors = [...document.querySelectorAll('a[href]')].filter(a => {
+        if (!visible(a)) return false;
+        const url = new URL(a.href, location.href);
+        return url.origin === 'https://gemini.google.com' &&
+          url.pathname === '/app/' + wanted && !url.search && !url.hash;
+      });
+      if (anchors.length !== 1) return {found: false, count: anchors.length};
+      const anchor = anchors[0];
+      const row = anchor.closest('[role="treeitem"],li') || anchor.parentElement;
+      if (!row) return {found: false, count: 1, reason: 'exact_row_missing'};
+      const buttons = [...row.querySelectorAll('button,[role="button"]')].filter(visible);
+      const menu = buttons.find(button => {
+        const label = norm([
+          button.getAttribute('aria-label'), button.getAttribute('title'),
+          button.getAttribute('data-tooltip'), button.innerText || button.textContent
+        ].filter(Boolean).join(' '));
+        return /更多|选项|菜单|more|option/i.test(label) &&
+          !/发起新对话|设置|帮助|反馈/i.test(label);
+      });
+      return {
+        found: !!menu,
+        count: 1,
+        title: norm(anchor.innerText || anchor.textContent),
+        menu_present: !!menu,
+        menu_label: menu ? norm(menu.getAttribute('aria-label') || menu.getAttribute('title') || '') : ''
+      };
+    })()
+    """ % json.dumps(conversation_id)) or {"found": False, "count": 0}
+
+
+def _ensure_conversation_sidebar() -> bool:
+    """Expand the sidebar only when Gemini exposes its explicit open control."""
+    r = _click_js(r"""
+      const el = [...document.querySelectorAll('button,[role="button"]')].find(e => {
+        if (!e.offsetParent) return false;
+        const label = norm(e.getAttribute('aria-label') || e.innerText || e.textContent);
+        return label === '打开边栏' || /^Open sidebar$/i.test(label);
+      });
+    """)
+    if r and r.get("found"):
+        wait(0.8)
+        return True
+    return False
+
+
+def _open_exact_conversation_options(conversation_id: str) -> dict[str, Any]:
+    """Open options for the row whose href is exactly `/app/<conversation_id>`."""
+    r = _click_js(r"""
+      const wanted = %s;
+      const anchors = [...document.querySelectorAll('a[href]')].filter(a => {
+        if (!a.offsetParent) return false;
+        const url = new URL(a.href, location.href);
+        return url.origin === 'https://gemini.google.com' &&
+          url.pathname === '/app/' + wanted && !url.search && !url.hash;
+      });
+      const anchor = anchors.length === 1 ? anchors[0] : null;
+      const row = anchor && (anchor.closest('[role="treeitem"],li') || anchor.parentElement);
+      const buttons = row ? [...row.querySelectorAll('button,[role="button"]')].filter(e => e.offsetParent) : [];
+      const menu = buttons.find(button => {
+        const label = norm([
+          button.getAttribute('aria-label'), button.getAttribute('title'),
+          button.getAttribute('data-tooltip'), button.innerText || button.textContent
+        ].filter(Boolean).join(' '));
+        return /更多|选项|菜单|more|option/i.test(label) &&
+          !/发起新对话|设置|帮助|反馈/i.test(label);
+      });
+      const el = menu;
+    """ % json.dumps(conversation_id))
+    return r or {"found": False}
+
+
+def _rename_menu_item() -> dict[str, Any]:
+    """Click the exact visible rename action, never a title or text fragment."""
+    return _click_js(r"""
+      const els = [...document.querySelectorAll('[role="menuitem"],button,[role="button"]')]
+        .filter(e => e.offsetParent && norm(e.innerText || e.textContent) &&
+          ['重命名', 'Rename'].includes(norm(e.innerText || e.textContent)));
+      const el = els.length === 1 ? els[0] : null;
+    """)
+
+
+def _rename_input_state() -> dict[str, Any]:
+    """Read the visible rename input without returning private conversation text."""
+    return js(r"""
+    (() => {
+      const visible = e => e && e.offsetParent && e.getBoundingClientRect().width > 0;
+      const inputs = [...document.querySelectorAll('input')].filter(e =>
+        visible(e) && (e.type || 'text') === 'text');
+      const el = inputs.find(e => /重命名|rename/i.test(
+        [e.getAttribute('aria-label'), e.getAttribute('placeholder'), e.getAttribute('data-testid')]
+          .filter(Boolean).join(' '))) || (inputs.length === 1 ? inputs[0] : null);
+      return el ? {found: true, value: (el.value || '').slice(0, 200)} : {found: false};
+    })()
+    """) or {"found": False}
+
+
+def _set_rename_title(title: str) -> dict[str, Any]:
+    """Set the observed rename input once, leaving it focused for Enter commit."""
+    return js(r"""
+    (() => {
+      const wanted = %s;
+      const visible = e => e && e.offsetParent && e.getBoundingClientRect().width > 0;
+      const inputs = [...document.querySelectorAll('input')].filter(e =>
+        visible(e) && (e.type || 'text') === 'text');
+      const el = inputs.find(e => /重命名|rename/i.test(
+        [e.getAttribute('aria-label'), e.getAttribute('placeholder'), e.getAttribute('data-testid')]
+          .filter(Boolean).join(' '))) || (inputs.length === 1 ? inputs[0] : null);
+      if (!el) return {found: false};
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(el, wanted);
+      el.dispatchEvent(new Event('input', {bubbles: true}));
+      el.dispatchEvent(new Event('change', {bubbles: true}));
+      el.focus();
+      return {found: true, focused: true, value_set: el.value === wanted};
+    })()
+    """ % json.dumps(title, ensure_ascii=False)) or {"found": False}
+
+
+def _read_exact_conversation_title(conversation_id: str) -> dict[str, Any]:
+    """Read the exact row title and whether its rename editor is gone."""
+    return js(r"""
+    (() => {
+      const wanted = %s;
+      const norm = s => (s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+      const visible = e => e && e.offsetParent && e.getBoundingClientRect().width > 0;
+      const anchors = [...document.querySelectorAll('a[href]')].filter(a => {
+        if (!visible(a)) return false;
+        const url = new URL(a.href, location.href);
+        return url.origin === 'https://gemini.google.com' &&
+          url.pathname === '/app/' + wanted && !url.search && !url.hash;
+      });
+      if (anchors.length !== 1) return {found: false, count: anchors.length};
+      const anchor = anchors[0];
+      const row = anchor.closest('[role="treeitem"],li') || anchor.parentElement;
+      const input = row && [...row.querySelectorAll('input')].find(visible);
+      return {found: true, count: 1, input_present: !!input,
+              title: norm(anchor.innerText || anchor.textContent)};
+    })()
+    """ % json.dumps(conversation_id)) or {"found": False, "count": 0}
+
+
+def rename_conversation(title: str) -> dict[str, Any]:
+    """Rename only the current canonical conversation and verify exact persistence.
+
+    The caller must invoke this helper under an Agent Pool ``--mode write`` lease.
+    It performs one observed menu transaction and never retries an ambiguous write.
+    ``definitely_renamed`` is returned only after two stable exact title reads with
+    the editor gone; otherwise the result is ``unknown`` after a write was started,
+    or ``failed`` when the exact row/menu/action was not available beforehand.
+    """
+    title = _norm(title)
+    if not title:
+        raise ValueError("rename_conversation: title must not be empty")
+    url = _canonical_url()
+    conversation_id = url.rsplit("/", 1)[-1]
+    _ensure_conversation_sidebar()
+    row = _exact_conversation_row(conversation_id)
+    if not row.get("found"):
+        return {"status": "failed", "reason": "exact_current_conversation_menu_not_found", "url": url}
+    opened = _open_exact_conversation_options(conversation_id)
+    if not opened.get("found"):
+        return {"status": "failed", "reason": "exact_current_conversation_menu_not_opened", "url": url}
+    wait(0.8)
+    action = _rename_menu_item()
+    if not action.get("found"):
+        return {"status": "failed", "reason": "exact_rename_action_not_found", "url": url}
+    wait(0.5)
+    if not _rename_input_state().get("found"):
+        return {"status": "unknown", "reason": "rename_editor_not_observed", "url": url}
+    applied = _set_rename_title(title)
+    if not applied.get("found") or not applied.get("value_set"):
+        return {"status": "unknown", "reason": "rename_value_commit_unobserved", "url": url}
+    press_key("Enter")
+    stable_reads = 0
+    for _ in range(10):
+        wait(0.5)
+        state = _read_exact_conversation_title(conversation_id)
+        if (state.get("found") and not state.get("input_present") and
+                state.get("title") == title):
+            stable_reads += 1
+            if stable_reads >= 2:
+                return {"status": "definitely_renamed", "url": url,
+                        "conversation_id": conversation_id, "title": title}
+        else:
+            stable_reads = 0
+    return {"status": "unknown", "reason": "exact_title_persistence_unobserved", "url": url,
+            "conversation_id": conversation_id}
+
+
+def conversation_snapshot(max_pages: int = 120, wait_s: float = 0.8) -> dict[str, Any]:
+    """Return ordered turns plus a truthful full/partial/missing coverage marker."""
+    if not isinstance(max_pages, int) or max_pages < 1:
+        raise ValueError("conversation_snapshot: max_pages must be at least 1")
+    if wait_s < 0:
+        raise ValueError("conversation_snapshot: wait_s must not be negative")
+    url = js("location.href") or ""
+    try:
+        result = full_conversation(max_pages=max_pages, wait_s=wait_s)
+        turns = result.get("turns") or []
+        coverage = "full" if turns else "missing"
+        return {"status": "complete" if turns else "missing", "coverage": coverage,
+                "turns": turns, "text": result.get("text", ""),
+                "pages": result.get("pages", 0), "url": result.get("url") or url}
+    except Exception as exc:
+        try:
+            turns = conversation_turns()
+        except Exception:
+            turns = []
+        coverage = "partial" if turns else "missing"
+        return {"status": "partial" if turns else "missing", "coverage": coverage,
+                "turns": turns, "text": "\n".join(
+                    f"[{turn['role']}] {turn['text']}" for turn in turns),
+                "pages": 0, "url": url, "error": type(exc).__name__}
+
+
+DEFAULT_SUMMARY_PROMPT = "Please provide a concise summary of this conversation so far."
+
+
+def request_conversation_summary(prompt: str = DEFAULT_SUMMARY_PROMPT,
+                                 wait_timeout: float = 90.0) -> dict[str, Any]:
+    """Request one in-place summary after full-snapshot duplicate detection."""
+    prompt = _norm(prompt)
+    if not prompt:
+        raise ValueError("request_conversation_summary: prompt must not be empty")
+    snapshot = conversation_snapshot()
+    turns = snapshot.get("turns") or []
+    if snapshot.get("coverage") == "missing":
+        return {"status": "missing", "coverage": "missing", "turns": []}
+    if any(turn.get("role") == "user" and _turn_matches(prompt, turn.get("text", ""))
+           for turn in turns):
+        return {"status": "already_requested", "coverage": snapshot.get("coverage"),
+                "turns": turns, "url": snapshot.get("url", "")}
+    try:
+        sent = send_message(prompt)
+    except Exception as exc:
+        return {"status": "failed", "reason": type(exc).__name__,
+                "coverage": snapshot.get("coverage"), "turns": turns}
+    if sent.get("status") != "definitely_sent":
+        return {"status": "unknown", "send": sent,
+                "coverage": snapshot.get("coverage"), "turns": turns}
+    reply = wait_for_reply(timeout=wait_timeout)
+    after = conversation_snapshot()
+    return {"status": "definitely_requested", "send": sent, "reply": reply,
+            "coverage": after.get("coverage"), "turns": after.get("turns", []),
+            "url": after.get("url", "")}
+
+
+def conversation_summary(prompt: str = DEFAULT_SUMMARY_PROMPT,
+                         wait_timeout: float = 90.0) -> dict[str, Any]:
+    """Compatibility alias for the one-shot ordinary-chat summary request."""
+    return request_conversation_summary(prompt, wait_timeout)
 
 
 def start_deep_research() -> dict[str, Any]:

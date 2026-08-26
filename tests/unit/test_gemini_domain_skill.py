@@ -72,6 +72,15 @@ def test_wait_for_reply_ignores_old_reply_and_requires_stable_new_reply():
     assert len(observed) == 4
 
 
+def test_turn_match_accepts_a_visible_wrapper_around_submitted_text():
+    namespace = load_skill()
+
+    assert namespace["_turn_matches"](
+        "BH-GEMINI-AUDIT-20260827-014800",
+        "You said: BH-GEMINI-AUDIT-20260827-014800 (submitted)",
+    )
+
+
 def test_skill_does_not_close_arbitrary_tabs_or_claim_bilibili_port():
     namespace = load_skill()
     assert "close_extra_tab" not in namespace
@@ -115,3 +124,133 @@ def test_share_url_allowlist_rejects_userinfo_ports_and_malformed_uuid():
         "https://gemini.google.com/share/abcdef"
         "?skid=------------------------------------"
     )
+
+
+def test_rename_conversation_targets_exact_current_url_and_observes_persistence():
+    namespace = load_skill()
+    conversation_id = "abc12345_exact"
+    title = "2026-08-27 English Coach"
+    calls = []
+    title_reads = {"n": 0}
+
+    def fake_js(script, target_id=None):
+        calls.append(script)
+        if script == "location.href":
+            return f"https://gemini.google.com/app/{conversation_id}"
+        if "url.pathname === '/app/' + wanted" in script and "menu_present" in script:
+            return {"found": True, "count": 1, "menu_present": True}
+        if "const wanted =" in script and "url.pathname === '/app/' + wanted" in script and "menu_present" not in script:
+            title_reads["n"] += 1
+            return {"found": True, "count": 1, "input_present": False, "title": title}
+        if "['重命名', 'Rename'].includes" in script:
+            return {"found": True}
+        if "(e.type || 'text') === 'text'" in script and "value_set" not in script:
+            return {"found": True, "value": "old title"}
+        if "value_set" in script:
+            return {"found": True, "blurred": True, "value_set": True}
+        raise AssertionError(f"unexpected JS: {script[:160]}")
+
+    namespace["js"] = fake_js
+    namespace["_click_js"] = lambda script: (
+        {"found": True} if "const wanted" in script or "重命名" in script or "打开边栏" in script else
+        (_ for _ in ()).throw(AssertionError(f"unexpected click script: {script[:120]}"))
+    )
+    namespace["wait"] = lambda seconds=0: None
+
+    result = namespace["rename_conversation"](title)
+
+    assert result["status"] == "definitely_renamed"
+    assert result["conversation_id"] == conversation_id
+    assert title_reads["n"] == 2
+    assert all(conversation_id in script for script in calls if "url.pathname" in script)
+
+
+def test_rename_conversation_does_not_touch_browser_for_ambiguous_exact_rows():
+    namespace = load_skill()
+    calls = []
+
+    def fake_js(script, target_id=None):
+        calls.append(script)
+        if script == "location.href":
+            return "https://gemini.google.com/app/abc12345_exact"
+        if "menu_present" in script:
+            return {"found": False, "count": 2}
+        raise AssertionError(f"unexpected JS after exact-row failure: {script[:120]}")
+
+    namespace["js"] = fake_js
+    namespace["_click_js"] = lambda script: {"found": False}
+    result = namespace["rename_conversation"]("new title")
+
+    assert result["status"] == "failed"
+    assert len(calls) == 2
+
+
+def test_conversation_snapshot_marks_partial_without_claiming_full_coverage():
+    namespace = load_skill()
+    visible = [{"role": "user", "text": "visible prompt", "id": "u1"}]
+    namespace["js"] = lambda script, target_id=None: "https://gemini.google.com/app/abc12345_exact" if script == "location.href" else None
+    namespace["full_conversation"] = lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boundary"))
+    namespace["conversation_turns"] = lambda: visible
+
+    result = namespace["conversation_snapshot"]()
+
+    assert result["coverage"] == "partial"
+    assert result["turns"] == visible
+    assert result["status"] == "partial"
+
+
+def test_full_conversation_reads_virtualized_pages_to_stable_boundaries():
+    namespace = load_skill()
+    page_turns = iter([
+        [{"role": "user", "text": "one", "id": "u1"}],
+        [{"role": "user", "text": "one", "id": "u1"}],
+        [{"role": "user", "text": "one", "id": "u1"}],
+        [{"role": "user", "text": "one", "id": "u1"}],
+        [{"role": "user", "text": "one", "id": "u1"},
+         {"role": "assistant", "text": "first", "id": "a1"}],
+        [{"role": "assistant", "text": "first", "id": "a1"},
+         {"role": "user", "text": "two", "id": "u2"},
+         {"role": "assistant", "text": "second", "id": "a2"}],
+        [{"role": "user", "text": "two", "id": "u2"},
+         {"role": "assistant", "text": "second", "id": "a2"}],
+        [{"role": "user", "text": "two", "id": "u2"},
+         {"role": "assistant", "text": "second", "id": "a2"}],
+    ])
+    page_states = iter([
+        {"moved": True}, {"moved": False}, {"moved": False},
+        {"moved": True}, {"moved": False}, {"moved": False},
+        {"moved": False}, {"moved": False},
+    ])
+    namespace["conversation_turns"] = lambda: next(page_turns)
+    namespace["_page_or_static"] = lambda direction, wait_s: next(page_states)
+    namespace["expand_all_user_messages"] = lambda: 0
+    namespace["js"] = lambda script, target_id=None: "https://gemini.google.com/app/abc12345_exact" if script == "location.href" else None
+
+    result = namespace["full_conversation"](max_pages=20, wait_s=0)
+
+    assert result["status"] == "complete"
+    assert [(turn["role"], turn["text"]) for turn in result["turns"]] == [
+        ("user", "one"), ("assistant", "first"),
+        ("user", "two"), ("assistant", "second"),
+    ]
+    assert result["pages"] == 8
+
+
+def test_summary_request_is_idempotent_against_full_ordered_turns():
+    namespace = load_skill()
+    prompt = "Please summarize this conversation once."
+    namespace["conversation_snapshot"] = lambda: {
+        "coverage": "full",
+        "url": "https://gemini.google.com/app/abc12345_exact",
+        "turns": [
+            {"role": "user", "text": prompt, "id": "u1"},
+            {"role": "assistant", "text": "summary", "id": "a1"},
+        ],
+    }
+    sent = []
+    namespace["send_message"] = lambda text: sent.append(text)
+
+    result = namespace["request_conversation_summary"](prompt)
+
+    assert result["status"] == "already_requested"
+    assert sent == []
