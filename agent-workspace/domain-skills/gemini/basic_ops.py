@@ -756,39 +756,46 @@ def expand_all_user_messages() -> int:
 
 
 def _merge_turn_page(accumulated: list[dict[str, Any]], page: list[dict[str, Any]]) -> int:
-    """Merge one rendered page, preferring stable IDs and then edge overlap."""
+    """Merge one rendered page without changing its conversation order."""
     if not page:
         return 0
-    added = 0
-    ids = {turn.get("id") for turn in accumulated if turn.get("id")}
-    pending: list[dict[str, Any]] = []
-    for turn in page:
-        message_id = turn.get("id")
-        if message_id and message_id in ids:
-            for index, existing in enumerate(accumulated):
-                if existing.get("id") == message_id and len(turn.get("text", "")) > len(existing.get("text", "")):
-                    accumulated[index] = turn
-                    break
-            continue
-        if message_id:
-            ids.add(message_id)
-            accumulated.append(turn)
-            added += 1
-        else:
-            pending.append(turn)
-    if pending:
-        def key(turn: dict[str, Any]) -> tuple[str, str]:
-            return turn.get("role", ""), _norm(turn.get("text", ""))
 
-        overlap = 0
-        # ponytail: edge overlap is the smallest safe fallback without DOM IDs;
-        # upgrade to a DOM identity map if Gemini exposes stable IDs later.
-        for size in range(min(len(accumulated), len(pending)), 0, -1):
-            if [key(x) for x in accumulated[-size:]] == [key(x) for x in pending[:size]]:
-                overlap = size
-                break
-        accumulated.extend(pending[overlap:])
-        added += len(pending) - overlap
+    def key(turn: dict[str, Any]) -> tuple[str, str]:
+        message_id = turn.get("id")
+        return ("id", message_id) if message_id else (
+            turn.get("role", ""), _norm(turn.get("text", ""))
+        )
+
+    overlap = 0
+    for size in range(min(len(accumulated), len(page)), 0, -1):
+        if [key(x) for x in accumulated[-size:]] == [key(x) for x in page[:size]]:
+            overlap = size
+            break
+
+    by_id = {
+        turn.get("id"): index
+        for index, turn in enumerate(accumulated)
+        if turn.get("id")
+    }
+    for turn in page[:overlap]:
+        message_id = turn.get("id")
+        if message_id in by_id:
+            index = by_id[message_id]
+            if len(turn.get("text", "")) > len(accumulated[index].get("text", "")):
+                accumulated[index] = turn
+
+    added = 0
+    for turn in page[overlap:]:
+        message_id = turn.get("id")
+        if message_id in by_id:
+            index = by_id[message_id]
+            if len(turn.get("text", "")) > len(accumulated[index].get("text", "")):
+                accumulated[index] = turn
+            continue
+        accumulated.append(turn)
+        if message_id:
+            by_id[message_id] = len(accumulated) - 1
+        added += 1
     return added
 
 
@@ -996,19 +1003,28 @@ def _share_url_allowed(value: str) -> bool:
     if not isinstance(value, str):
         return False
     parsed = urlparse((value or "").strip().rstrip("/"))
-    if parsed.scheme != "https" or parsed.fragment:
+    host = parsed.hostname or ""
+    if (
+        parsed.scheme != "https"
+        or parsed.fragment
+        or parsed.netloc.lower() != host
+    ):
         return False
     short_link = (
-        parsed.hostname == "g.co" and not parsed.query and
+        host == "g.co" and not parsed.query and
         re.fullmatch(r"/gemini/share/[A-Za-z0-9_-]{6,}", parsed.path)
     ) or (
-        parsed.hostname == "share.gemini.google" and not parsed.query and
+        host == "share.gemini.google" and not parsed.query and
         re.fullmatch(r"/[A-Za-z0-9_-]{6,}", parsed.path)
     )
     redirect = (
-        parsed.hostname == "gemini.google.com" and
+        host == "gemini.google.com" and
         re.fullmatch(r"/share/[A-Za-z0-9_-]{6,}", parsed.path) and
-        re.fullmatch(r"skid=[0-9a-fA-F-]{36}", parsed.query)
+        re.fullmatch(
+            r"skid=[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            parsed.query,
+        )
     )
     return bool(short_link or redirect)
 
