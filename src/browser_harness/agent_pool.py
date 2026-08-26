@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import fcntl
 import json
+import math
 import os
 import re
 import subprocess
@@ -21,6 +22,10 @@ from . import paths
 
 LEASE_TTL_SECONDS = 30 * 60
 HEARTBEAT_SECONDS = 60
+# A dead runner is given two heartbeat intervals before its lease becomes
+# reclaimable. This tolerates one missed heartbeat and scheduler jitter while
+# releasing leases well before the normal 30-minute TTL after a caller timeout.
+DEAD_RUNNER_GRACE_SECONDS = 2 * HEARTBEAT_SECONDS
 WRITE_WAIT_SECONDS = 30 * 60
 FLEET_SCRIPT = Path(os.environ.get(
     "BH_BROWSER_FLEET_SCRIPT",
@@ -160,6 +165,8 @@ def reserve(owner: str, site: str, account: str, mode: str, *, browser: dict | N
 
 def reserve_wait(owner: str, site: str, account: str, mode: str,
                  timeout: float = WRITE_WAIT_SECONDS, browser_name: str | None = None) -> dict:
+    if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout < 0:
+        raise PoolError("wait timeout must be a finite non-negative number")
     browser = _resolve_browser(browser_name)
     deadline = time.monotonic() + timeout
     while True:
@@ -417,19 +424,34 @@ def reap(*, apply: bool = False, now: float | None = None) -> list[dict]:
     results = []
     with _locked_state() as state:
         for lease_id, lease in list(state["leases"].items()):
-            expired = timestamp - float(lease.get("heartbeat_at", timestamp)) > LEASE_TTL_SECONDS
+            heartbeat_at = float(lease.get("heartbeat_at", timestamp))
+            heartbeat_age = max(0.0, timestamp - heartbeat_at)
+            ttl_remaining = max(0.0, LEASE_TTL_SECONDS - heartbeat_age)
             runner_dead = not _pid_alive(lease.get("runner_pid"))
-            ok = expired and runner_dead
+            dead_runner_window_elapsed = heartbeat_age > DEAD_RUNNER_GRACE_SECONDS
+            ok = runner_dead and dead_runner_window_elapsed
             if ok and (
                 "baseline_target_ids" not in lease or "browser_identity" not in lease
             ):
                 reason = "legacy stale shared lease; no target cleanup evidence"
+            elif ok:
+                reason = "dead runner grace elapsed"
+            elif runner_dead:
+                wait_seconds = max(0.0, DEAD_RUNNER_GRACE_SECONDS - heartbeat_age)
+                reason = f"runner PID is dead; controlled reap window has {wait_seconds:g} seconds remaining"
             else:
-                reason = "stale shared lease" if ok else "shared lease is active"
+                reason = "shared lease is active"
             item = {
                 "lease_id": lease_id,
                 "eligible": ok,
                 "reason": reason,
+                "runner_dead": runner_dead,
+                "heartbeat_age_seconds": round(heartbeat_age, 3),
+                "remaining_ttl_seconds": round(ttl_remaining, 3),
+                "reap_in_seconds": 0.0 if ok else (
+                    round(max(0.0, DEAD_RUNNER_GRACE_SECONDS - heartbeat_age), 3)
+                    if runner_dead else None
+                ),
                 "deleted": False,
                 "released": False,
                 "terminated": False,
@@ -508,8 +530,16 @@ def _cleanup_managed_lease(lease: dict, daemon_name: str) -> list[str]:
 
 
 def _run_with_lease(owner: str, site: str, account: str, mode: str, child_runner,
-                    browser_name: str | None = None) -> int:
-    lease = reserve_wait(owner, site, account, mode, browser_name=browser_name)
+                    browser_name: str | None = None,
+                    wait_timeout: float = WRITE_WAIT_SECONDS) -> int:
+    lease = reserve_wait(
+        owner,
+        site,
+        account,
+        mode,
+        timeout=wait_timeout,
+        browser_name=browser_name,
+    )
     stop = threading.Event()
     thread = None
     daemon_name = f"pool-{lease['id'][:16]}"
@@ -541,7 +571,8 @@ def _run_with_lease(owner: str, site: str, account: str, mode: str, child_runner
 
 
 def run_managed(owner: str, site: str, account: str, mode: str, code: str,
-                browser_name: str | None = None) -> int:
+                browser_name: str | None = None,
+                wait_timeout: float = WRITE_WAIT_SECONDS) -> int:
     if not code.strip():
         raise PoolError("agent-pool run requires a Browser Harness script on stdin")
     return _run_with_lease(
@@ -556,11 +587,13 @@ def run_managed(owner: str, site: str, account: str, mode: str, code: str,
             env=env,
         ).returncode,
         browser_name,
+        wait_timeout=wait_timeout,
     )
 
 
 def run_command_managed(owner: str, site: str, account: str, mode: str, command: list[str],
-                        browser_name: str | None = None) -> int:
+                        browser_name: str | None = None,
+                        wait_timeout: float = WRITE_WAIT_SECONDS) -> int:
     if not command:
         raise PoolError("command must be non-empty")
     if (
@@ -576,6 +609,7 @@ def run_command_managed(owner: str, site: str, account: str, mode: str, command:
         mode,
         lambda lease, env: subprocess.run(command, env=env).returncode,
         browser_name,
+        wait_timeout=wait_timeout,
     )
 
 
@@ -640,12 +674,16 @@ def run_cli(argv: list[str]) -> int:
     run.add_argument("--account", default="default")
     run.add_argument("--mode", choices=("read", "write"), default="read")
     run.add_argument("--browser")
+    run.add_argument("--wait-timeout", type=float, default=WRITE_WAIT_SECONDS,
+                     help="maximum seconds to wait for a lease (default: 1800)")
     exec_parser = sub.add_parser("exec")
     exec_parser.add_argument("--owner", default=_default_owner())
     exec_parser.add_argument("--site", required=True)
     exec_parser.add_argument("--account", default="default")
     exec_parser.add_argument("--mode", choices=("read", "write"), default="read")
     exec_parser.add_argument("--browser")
+    exec_parser.add_argument("--wait-timeout", type=float, default=WRITE_WAIT_SECONDS,
+                             help="maximum seconds to wait for a lease (default: 1800)")
     exec_parser.add_argument("command_argv", nargs=argparse.REMAINDER)
     reap_parser = sub.add_parser("reap")
     reap_parser.add_argument("--apply", action="store_true")
@@ -664,12 +702,16 @@ def run_cli(argv: list[str]) -> int:
             if not command:
                 raise PoolError("agent-pool exec requires a command after --")
             return run_command_managed(
-                args.owner, args.site, args.account, args.mode, command, args.browser
+                args.owner, args.site, args.account, args.mode, command, args.browser,
+                wait_timeout=args.wait_timeout,
             )
         code = sys.stdin.read()
         if not code.strip():
             raise PoolError("agent-pool run requires a Browser Harness script on stdin")
-        return run_managed(args.owner, args.site, args.account, args.mode, code, args.browser)
+        return run_managed(
+            args.owner, args.site, args.account, args.mode, code, args.browser,
+            wait_timeout=args.wait_timeout,
+        )
     except PoolError as exc:
         print(f"browser-harness agent-pool: {exc}", file=sys.stderr)
         return 1

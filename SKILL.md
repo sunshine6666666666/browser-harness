@@ -77,7 +77,7 @@ print(page_info())
 PY
 ```
 
-Use `--mode write --account default` for publishing, sending, uploading, deleting, checkout, or account-state changes. The pool derives the owner from Hermes environment. Tasks sharing one browser wait and run serially; different managed browsers may run in parallel. Browser Harness never creates another Chrome, Profile, or CDP port. Uncertain or conflicting fleet state is always busy. Never run `agent-pool reap --apply` from an ordinary browser task.
+Use `--mode write --account default` for publishing, sending, uploading, deleting, checkout, or account-state changes. The pool derives the owner from Hermes environment. Tasks sharing one browser wait and run serially; different managed browsers may run in parallel. Browser Harness never creates another Chrome, Profile, or CDP port. Use `--wait-timeout SECONDS` on `run` or `exec` to bound queue wait (default 1800 seconds); it does not stop a task that has already started. Uncertain or conflicting fleet state is always busy. Never run `agent-pool reap --apply` from an ordinary browser task.
 
 ## Remote Browsers
 

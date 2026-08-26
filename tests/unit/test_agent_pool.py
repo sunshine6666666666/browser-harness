@@ -1,3 +1,4 @@
+import io
 import json
 import types
 
@@ -146,6 +147,75 @@ def test_heartbeat_refreshes_lease(isolated):
     assert updated["heartbeat_at"] == 99
 
 
+def test_reap_reports_dead_runner_window_and_remaining_ttl(isolated):
+    pool.reserve("one", "example.com", "a", "write", now=0)
+    now = pool.DEAD_RUNNER_GRACE_SECONDS - 1
+
+    result = pool.reap(now=now)
+
+    assert result[0]["eligible"] is False
+    assert result[0]["runner_dead"] is True
+    assert result[0]["heartbeat_age_seconds"] == now
+    assert result[0]["remaining_ttl_seconds"] == pool.LEASE_TTL_SECONDS - now
+    assert result[0]["reap_in_seconds"] == 1
+    assert "controlled reap window" in result[0]["reason"]
+
+
+def test_reap_releases_dead_runner_after_controlled_window(isolated):
+    lease = pool.reserve("one", "example.com", "a", "write", now=0)
+    now = pool.DEAD_RUNNER_GRACE_SECONDS + 1
+
+    result = pool.reap(apply=True, now=now)
+
+    assert result[0]["lease_id"] == lease["id"]
+    assert result[0]["eligible"] is True
+    assert result[0]["runner_dead"] is True
+    assert result[0]["remaining_ttl_seconds"] == pool.LEASE_TTL_SECONDS - now
+    assert result[0]["released"] is True
+    assert pool.status()["leases"] == []
+
+
+def test_reap_keeps_live_runner_even_after_ttl(isolated, monkeypatch):
+    monkeypatch.setattr(pool, "_pid_alive", lambda pid: True)
+    pool.reserve("one", "example.com", "a", "write", now=0)
+
+    result = pool.reap(now=pool.LEASE_TTL_SECONDS + 1)
+
+    assert result[0]["eligible"] is False
+    assert result[0]["runner_dead"] is False
+    assert result[0]["remaining_ttl_seconds"] == 0.0
+    assert result[0]["reap_in_seconds"] is None
+    assert result[0]["reason"] == "shared lease is active"
+
+
+def test_run_managed_passes_configured_wait_timeout(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        pool,
+        "_run_with_lease",
+        lambda *args, **kwargs: seen.update(args=args, kwargs=kwargs) or 0,
+    )
+
+    assert pool.run_managed(
+        "owner", "example.com", "default", "read", "print(1)",
+        browser_name="browser", wait_timeout=12.5,
+    ) == 0
+    assert seen["kwargs"]["wait_timeout"] == 12.5
+
+
+def test_cli_exposes_wait_timeout(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        pool,
+        "run_managed",
+        lambda *args, **kwargs: seen.update(args=args, kwargs=kwargs) or 0,
+    )
+    monkeypatch.setattr(pool.sys, "stdin", io.StringIO("print(1)"))
+
+    assert pool.run_cli(["run", "--site", "example.com", "--wait-timeout", "7.5"]) == 0
+    assert seen["kwargs"]["wait_timeout"] == 7.5
+
+
 def test_default_owner_uses_profile_home(monkeypatch):
     monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
     monkeypatch.delenv("HERMES_PROFILE", raising=False)
@@ -267,6 +337,10 @@ def test_reap_releases_stale_shared_lease_without_touching_chrome(isolated):
         "lease_id": lease["id"],
         "eligible": True,
         "reason": "legacy stale shared lease; no target cleanup evidence",
+        "runner_dead": True,
+        "heartbeat_age_seconds": pool.LEASE_TTL_SECONDS + 1,
+        "remaining_ttl_seconds": 0.0,
+        "reap_in_seconds": 0.0,
         "deleted": False,
         "released": True,
         "terminated": False,
