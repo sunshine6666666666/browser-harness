@@ -1,5 +1,6 @@
 import io
 import json
+import sys
 import types
 
 import pytest
@@ -337,13 +338,16 @@ def test_reap_releases_stale_shared_lease_without_touching_chrome(isolated):
         "lease_id": lease["id"],
         "eligible": True,
         "reason": "legacy stale shared lease; no target cleanup evidence",
-        "runner_dead": True,
-        "heartbeat_age_seconds": pool.LEASE_TTL_SECONDS + 1,
-        "remaining_ttl_seconds": 0.0,
-        "reap_in_seconds": 0.0,
         "deleted": False,
         "released": True,
         "terminated": False,
+        "runner_alive": False,
+        "runner_dead": True,
+        "child_alive": None,
+        "heartbeat_age_seconds": pool.LEASE_TTL_SECONDS + 1,
+        "remaining_ttl_seconds": 0.0,
+        "reclaimable_in_seconds": 0.0,
+        "reap_in_seconds": 0.0,
     }]
     assert pool.status()["leases"] == []
 
@@ -375,6 +379,96 @@ def test_reap_keeps_stale_shared_lease_when_target_cleanup_fails(isolated, monke
     assert pool.status()["leases"][0]["id"] == lease["id"]
 
 
+def test_reap_reclaims_tracked_orphan_after_short_grace(isolated, monkeypatch):
+    lease = pool.reserve("shared", "a.example", "a", "write", now=0)
+    with pool._locked_state() as state:
+        state["leases"][lease["id"]].update({
+            "child_pid": 999_999,
+            "baseline_target_ids": ["keep-a"],
+            "browser_identity": "browser-a",
+        })
+    monkeypatch.setattr(pool, "close_task_targets", lambda *args: {
+        "closed": [], "remaining": [], "baseline_preserved": True,
+        "browser_restarted": False,
+    })
+
+    waiting = pool.reap(now=pool.DEAD_RUNNER_GRACE_SECONDS - 1)[0]
+    assert waiting["eligible"] is False
+    assert "controlled reap window has 1 seconds remaining" in waiting["reason"]
+    assert waiting["reclaimable_in_seconds"] == 1
+
+    reclaimed = pool.reap(apply=True, now=pool.DEAD_RUNNER_GRACE_SECONDS + 1)[0]
+    assert reclaimed["eligible"] is True
+    assert reclaimed["released"] is True
+    assert reclaimed["terminated"] is False
+    assert pool.status()["leases"] == []
+
+
+def test_reap_terminates_tracked_orphan_before_releasing(isolated, monkeypatch):
+    lease = pool.reserve("shared", "a.example", "a", "write", now=0)
+    with pool._locked_state() as state:
+        state["leases"][lease["id"]].update({
+            "child_pid": 123,
+            "child_pgid": 123,
+            "baseline_target_ids": ["keep-a"],
+            "browser_identity": "browser-a",
+        })
+    monkeypatch.setattr(pool, "_child_alive", lambda current: True)
+    terminated = []
+    monkeypatch.setattr(
+        pool, "_terminate_lease_child",
+        lambda current: terminated.append(current["child_pid"]) or True,
+    )
+    monkeypatch.setattr(pool, "close_task_targets", lambda *args: {
+        "closed": [], "remaining": [], "baseline_preserved": True,
+        "browser_restarted": False,
+    })
+
+    result = pool.reap(apply=True, now=pool.DEAD_RUNNER_GRACE_SECONDS + 1)[0]
+    assert terminated == [123]
+    assert result["terminated"] is True
+    assert result["released"] is True
+    assert pool.status()["leases"] == []
+
+
+def test_status_reports_runner_child_and_reclaim_timing(isolated):
+    lease = pool.reserve("shared", "a.example", "a", "read", now=0)
+    with pool._locked_state() as state:
+        state["leases"][lease["id"]]["child_pid"] = 999_999
+    current = pool.status()["leases"][0]
+    assert current["runner_alive"] is False
+    assert current["child_alive"] is False
+    assert current["heartbeat_age_seconds"] >= 0
+    assert current["reclaimable_in_seconds"] == 0
+
+
+def test_run_child_records_process_group_and_exit_code(isolated):
+    lease = pool.reserve("shared", "a.example", "a", "read")
+    assert pool._run_child(
+        lease,
+        [sys.executable, "-c", "raise SystemExit(7)"],
+        {},
+    ) == 7
+    recorded = pool._read_state()["leases"][lease["id"]]
+    assert recorded["child_pid"] > 0
+    if pool.os.name == "posix":
+        assert recorded["child_pgid"] == recorded["child_pid"]
+
+
+def test_terminate_process_stops_real_process_group():
+    process = pool.subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=pool.os.name == "posix",
+    )
+    try:
+        pool._terminate_process(process)
+        assert process.returncode != 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
 def test_managed_shared_run_releases_lease_and_daemon(isolated, monkeypatch):
     lease = {
         "id": "a" * 32,
@@ -395,16 +489,48 @@ def test_managed_shared_run_releases_lease_and_daemon(isolated, monkeypatch):
         "browser_restarted": False,
     })
     calls = {}
-    monkeypatch.setattr(pool.subprocess, "run", lambda command, **kwargs: calls.update(command=command, kwargs=kwargs) or types.SimpleNamespace(returncode=0))
+    monkeypatch.setattr(pool, "_run_child", lambda lease, command, env, input_text=None: (
+        calls.update(command=command, env=env, input_text=input_text) or 0
+    ))
     stopped = []
     forgotten = []
     monkeypatch.setattr(pool, "_stop_daemon", stopped.append)
     monkeypatch.setattr(pool, "forget", forgotten.append)
     assert pool.run_managed("researchbot", "example.com", "default", "read", "print(1)") == 0
-    assert calls["kwargs"]["env"]["BH_AGENT_POOL_CHILD"] == "1"
-    assert calls["kwargs"]["env"]["BU_CDP_URL"] == PRIMARY["cdp_url"]
+    assert calls["env"]["BH_AGENT_POOL_CHILD"] == "1"
+    assert calls["env"]["BU_CDP_URL"] == PRIMARY["cdp_url"]
+    assert calls["input_text"] == "print(1)"
     assert stopped == ["pool-" + "a" * 16]
     assert forgotten == ["a" * 32]
+
+
+def test_sigterm_stops_child_and_releases_lease(isolated, monkeypatch):
+    monkeypatch.setattr(pool, "_cdp_alive", lambda url: True)
+    monkeypatch.setattr(pool, "browser_identity", lambda url: "browser-a")
+    monkeypatch.setattr(pool, "list_page_targets", lambda url: set())
+    monkeypatch.setattr(pool, "close_task_targets", lambda *args: {
+        "closed": [], "remaining": [], "baseline_preserved": True,
+        "browser_restarted": False,
+    })
+    monkeypatch.setattr(pool, "_stop_daemon", lambda name: None)
+    timer = pool.threading.Timer(
+        0.1,
+        lambda: pool.os.kill(pool.os.getpid(), pool.signal.SIGTERM),
+    )
+    timer.start()
+    try:
+        result = pool.run_command_managed(
+            "researchbot",
+            "example.com",
+            "default",
+            "write",
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+        )
+    finally:
+        timer.cancel()
+    assert result == 128 + pool.signal.SIGTERM
+    assert pool.status()["leases"] == []
+    assert pool.status()["write_locks"] == {}
 
 
 def test_unavailable_shared_browser_does_not_leave_a_lease(isolated, monkeypatch):
@@ -434,9 +560,7 @@ def test_managed_shared_run_records_baseline_and_cleans_new_targets(isolated, mo
         "closed": ["new-c"], "remaining": [], "baseline_preserved": True,
         "browser_restarted": False,
     })
-    monkeypatch.setattr(pool, "subprocess", types.SimpleNamespace(
-        run=lambda command, **kwargs: types.SimpleNamespace(returncode=0),
-    ))
+    monkeypatch.setattr(pool, "_run_child", lambda *args, **kwargs: 0)
     monkeypatch.setattr(pool, "_stop_daemon", lambda name: None)
     monkeypatch.setattr(pool, "forget", lambda lease_id: None)
     assert pool.run_managed("researchbot", "example.com", "default", "read", "print(1)") == 0
@@ -459,9 +583,7 @@ def test_managed_shared_run_keeps_lease_when_target_cleanup_fails(isolated, monk
     monkeypatch.setattr(pool, "browser_identity", lambda url: "browser-a")
     monkeypatch.setattr(pool, "list_page_targets", lambda url: {"keep-a"})
     monkeypatch.setattr(pool, "close_task_targets", lambda *args: (_ for _ in ()).throw(pool.PoolError("cleanup failed")))
-    monkeypatch.setattr(pool, "subprocess", types.SimpleNamespace(
-        run=lambda command, **kwargs: types.SimpleNamespace(returncode=0),
-    ))
+    monkeypatch.setattr(pool, "_run_child", lambda *args, **kwargs: 0)
     monkeypatch.setattr(pool, "_stop_daemon", lambda name: None)
     forgotten = []
     monkeypatch.setattr(pool, "forget", forgotten.append)
@@ -489,17 +611,17 @@ def test_exec_passes_argv_without_shell_and_exports_pool_environment(isolated, m
         "browser_restarted": False,
     })
     calls = {}
-    monkeypatch.setattr(pool, "subprocess", types.SimpleNamespace(
-        run=lambda command, **kwargs: calls.update(command=command, kwargs=kwargs) or types.SimpleNamespace(returncode=7),
+    monkeypatch.setattr(pool, "_run_child", lambda lease, command, env, input_text=None: (
+        calls.update(command=command, env=env, input_text=input_text) or 7
     ))
     monkeypatch.setattr(pool, "_stop_daemon", lambda name: None)
     monkeypatch.setattr(pool, "forget", lambda lease_id: None)
     assert pool.run_command_managed("researchbot", "example.com", "default", "read", ["printf", "hello world"]) == 7
     assert calls["command"] == ["printf", "hello world"]
-    assert calls["kwargs"]["env"]["BH_AGENT_POOL_CHILD"] == "1"
-    assert calls["kwargs"]["env"]["BH_AGENT_POOL_LEASE_ID"] == "e" * 32
-    assert calls["kwargs"]["env"]["BU_CDP_URL"] == PRIMARY["cdp_url"]
-    assert calls["kwargs"].get("shell", False) is False
+    assert calls["env"]["BH_AGENT_POOL_CHILD"] == "1"
+    assert calls["env"]["BH_AGENT_POOL_LEASE_ID"] == "e" * 32
+    assert calls["env"]["BU_CDP_URL"] == PRIMARY["cdp_url"]
+    assert calls["input_text"] is None
 
 
 def test_exec_rejects_empty_command():

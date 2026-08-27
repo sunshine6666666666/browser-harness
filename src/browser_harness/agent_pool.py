@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -34,6 +35,8 @@ FLEET_SCRIPT = Path(os.environ.get(
 CDP_TIMEOUT_SECONDS = 2
 TARGET_CLOSE_ATTEMPTS = 10
 TARGET_CLOSE_DELAY_SECONDS = 0.1
+PROCESS_TERMINATION_SECONDS = 5
+FORCE_KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
 class PoolError(RuntimeError):
@@ -153,6 +156,7 @@ def reserve(owner: str, site: str, account: str, mode: str, *, browser: dict | N
             "created_at": timestamp,
             "heartbeat_at": timestamp,
             "runner_pid": os.getpid(),
+            "child_tracking": True,
             "chrome_pid": None,
             "cdp_url": cdp_url,
             "profile_dir": None,
@@ -216,6 +220,116 @@ def _pid_alive(pid: int | None) -> bool:
         return False
     except PermissionError:
         return True
+
+
+def _child_alive(lease: dict) -> bool | None:
+    pid = lease.get("child_pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    pgid = lease.get("child_pgid")
+    if os.name == "posix" and isinstance(pgid, int) and pgid > 0:
+        try:
+            os.killpg(pgid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+    return _pid_alive(pid)
+
+
+def _record_child(lease_id: str, pid: int) -> None:
+    with _locked_state() as state:
+        lease = state["leases"].get(lease_id)
+        if not lease:
+            raise PoolError(f"unknown lease {lease_id}")
+        lease["child_pid"] = pid
+        lease["child_pgid"] = pid if os.name == "posix" else None
+        lease["child_started_at"] = _now()
+
+
+def _lease_activity(lease: dict, timestamp: float) -> dict:
+    heartbeat_age = max(0.0, timestamp - float(lease.get("heartbeat_at", timestamp)))
+    runner_alive = _pid_alive(lease.get("runner_pid"))
+    child_alive = _child_alive(lease)
+    tracked_child = lease.get("child_tracking") is True or child_alive is not None
+    grace = DEAD_RUNNER_GRACE_SECONDS if tracked_child else LEASE_TTL_SECONDS
+    reclaimable_in = None if runner_alive else max(0.0, grace - heartbeat_age)
+    return {
+        "runner_alive": runner_alive,
+        "runner_dead": not runner_alive,
+        "child_alive": child_alive,
+        "heartbeat_age_seconds": round(heartbeat_age, 3),
+        "remaining_ttl_seconds": round(
+            max(0.0, LEASE_TTL_SECONDS - heartbeat_age), 3
+        ),
+        "reclaimable_in_seconds": (
+            None if reclaimable_in is None else round(reclaimable_in, 3)
+        ),
+        "reap_in_seconds": (
+            None if reclaimable_in is None else round(reclaimable_in, 3)
+        ),
+    }
+
+
+def _terminate_lease_child(lease: dict) -> bool:
+    if _child_alive(lease) is not True:
+        return False
+    pid = lease["child_pid"]
+    pgid = lease.get("child_pgid")
+
+    def send(sig: int) -> None:
+        if os.name == "posix" and isinstance(pgid, int) and pgid > 0:
+            os.killpg(pgid, sig)
+        else:
+            os.kill(pid, sig)
+
+    try:
+        send(signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    deadline = time.monotonic() + PROCESS_TERMINATION_SECONDS
+    while _child_alive(lease) is True and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if _child_alive(lease) is True:
+        try:
+            send(FORCE_KILL_SIGNAL)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + PROCESS_TERMINATION_SECONDS
+        while _child_alive(lease) is True and time.monotonic() < deadline:
+            time.sleep(0.05)
+    if _child_alive(lease) is True:
+        raise PoolError("orphaned child process group did not terminate")
+    return True
+
+
+def _terminate_process(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+
+    def send(sig: int) -> None:
+        if os.name == "posix":
+            os.killpg(process.pid, sig)
+        elif sig == signal.SIGTERM:
+            process.terminate()
+        else:
+            process.kill()
+
+    try:
+        send(signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=PROCESS_TERMINATION_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        send(FORCE_KILL_SIGNAL)
+        process.wait(timeout=PROCESS_TERMINATION_SECONDS)
+    except (ProcessLookupError, subprocess.TimeoutExpired) as exc:
+        raise PoolError("child process group did not terminate") from exc
 
 
 def _cdp_alive(url: str | None, timeout: float = 0.3) -> bool:
@@ -424,39 +538,45 @@ def reap(*, apply: bool = False, now: float | None = None) -> list[dict]:
     results = []
     with _locked_state() as state:
         for lease_id, lease in list(state["leases"].items()):
-            heartbeat_at = float(lease.get("heartbeat_at", timestamp))
-            heartbeat_age = max(0.0, timestamp - heartbeat_at)
-            ttl_remaining = max(0.0, LEASE_TTL_SECONDS - heartbeat_age)
-            runner_dead = not _pid_alive(lease.get("runner_pid"))
-            dead_runner_window_elapsed = heartbeat_age > DEAD_RUNNER_GRACE_SECONDS
-            ok = runner_dead and dead_runner_window_elapsed
-            if ok and (
+            activity = _lease_activity(lease, timestamp)
+            tracked_child = (
+                lease.get("child_tracking") is True
+                or activity["child_alive"] is not None
+            )
+            grace = DEAD_RUNNER_GRACE_SECONDS if tracked_child else LEASE_TTL_SECONDS
+            eligible = activity["runner_dead"] and activity["heartbeat_age_seconds"] > grace
+            if eligible and activity["child_alive"]:
+                reason = "orphaned shared lease; child process group will be terminated"
+            elif eligible and (
                 "baseline_target_ids" not in lease or "browser_identity" not in lease
             ):
                 reason = "legacy stale shared lease; no target cleanup evidence"
-            elif ok:
+            elif eligible:
                 reason = "dead runner grace elapsed"
-            elif runner_dead:
-                wait_seconds = max(0.0, DEAD_RUNNER_GRACE_SECONDS - heartbeat_age)
-                reason = f"runner PID is dead; controlled reap window has {wait_seconds:g} seconds remaining"
-            else:
+            elif activity["runner_alive"]:
                 reason = "shared lease is active"
+            else:
+                remaining = activity["reap_in_seconds"] or 0.0
+                reason = (
+                    "runner PID is dead; controlled reap window has "
+                    f"{remaining:g} seconds remaining"
+                )
             item = {
                 "lease_id": lease_id,
-                "eligible": ok,
+                "eligible": eligible,
                 "reason": reason,
-                "runner_dead": runner_dead,
-                "heartbeat_age_seconds": round(heartbeat_age, 3),
-                "remaining_ttl_seconds": round(ttl_remaining, 3),
-                "reap_in_seconds": 0.0 if ok else (
-                    round(max(0.0, DEAD_RUNNER_GRACE_SECONDS - heartbeat_age), 3)
-                    if runner_dead else None
-                ),
                 "deleted": False,
                 "released": False,
                 "terminated": False,
+                **activity,
             }
-            if apply and ok:
+            if apply and eligible:
+                try:
+                    item["terminated"] = _terminate_lease_child(lease)
+                except PoolError as exc:
+                    item["reason"] = f"orphaned child cleanup failed: {exc}"
+                    results.append(item)
+                    continue
                 if (
                     "baseline_target_ids" in lease
                     and "browser_identity" in lease
@@ -506,6 +626,8 @@ def _record_shared_baseline(lease: dict) -> None:
 
 def _cleanup_managed_lease(lease: dict, daemon_name: str) -> list[str]:
     errors = []
+    if _child_alive(lease) is True:
+        return ["child process group is still active; lease retained"]
     try:
         _stop_daemon(daemon_name)
     except Exception as exc:
@@ -529,6 +651,57 @@ def _cleanup_managed_lease(lease: dict, daemon_name: str) -> list[str]:
     return errors
 
 
+class _TerminationRequested(BaseException):
+    def __init__(self, signum: int):
+        self.signum = signum
+
+
+@contextlib.contextmanager
+def _termination_handlers():
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = {}
+
+    def interrupt(signum, _frame):
+        raise _TerminationRequested(signum)
+
+    for signum in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+        if signum is not None:
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, interrupt)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def _run_child(lease: dict, command: list[str], env: dict, input_text: str | None = None) -> int:
+    process = subprocess.Popen(
+        command,
+        env=env,
+        stdin=subprocess.PIPE if input_text is not None else None,
+        text=input_text is not None,
+        start_new_session=os.name == "posix",
+    )
+    child = {
+        "child_pid": process.pid,
+        "child_pgid": process.pid if os.name == "posix" else None,
+        "child_started_at": _now(),
+    }
+    lease.update(child)
+    try:
+        _record_child(lease["id"], process.pid)
+        if input_text is None:
+            return process.wait()
+        process.communicate(input_text)
+        return process.returncode
+    except BaseException:
+        _terminate_process(process)
+        raise
+
+
 def _run_with_lease(owner: str, site: str, account: str, mode: str, child_runner,
                     browser_name: str | None = None,
                     wait_timeout: float = WRITE_WAIT_SECONDS) -> int:
@@ -546,19 +719,25 @@ def _run_with_lease(owner: str, site: str, account: str, mode: str, child_runner
     child_returncode = None
     cleanup_errors = []
     try:
-        if not _cdp_alive(lease["cdp_url"]):
-            raise PoolError(f"managed browser is unavailable: {lease['browser_name']}")
-        _record_shared_baseline(lease)
-        env = {
-            **os.environ,
-            "BU_NAME": daemon_name,
-            "BU_CDP_URL": lease["cdp_url"],
-            "BH_AGENT_POOL_CHILD": "1",
-            "BH_AGENT_POOL_LEASE_ID": lease["id"],
-        }
-        thread = threading.Thread(target=_heartbeat_loop, args=(lease["id"], stop), daemon=True)
-        thread.start()
-        child_returncode = child_runner(lease, env)
+        with _termination_handlers():
+            try:
+                if not _cdp_alive(lease["cdp_url"]):
+                    raise PoolError(f"managed browser is unavailable: {lease['browser_name']}")
+                _record_shared_baseline(lease)
+                env = {
+                    **os.environ,
+                    "BU_NAME": daemon_name,
+                    "BU_CDP_URL": lease["cdp_url"],
+                    "BH_AGENT_POOL_CHILD": "1",
+                    "BH_AGENT_POOL_LEASE_ID": lease["id"],
+                }
+                thread = threading.Thread(
+                    target=_heartbeat_loop, args=(lease["id"], stop), daemon=True
+                )
+                thread.start()
+                child_returncode = child_runner(lease, env)
+            except _TerminationRequested as exc:
+                child_returncode = 128 + exc.signum
     finally:
         stop.set()
         if thread:
@@ -580,12 +759,12 @@ def run_managed(owner: str, site: str, account: str, mode: str, code: str,
         site,
         account,
         mode,
-        lambda lease, env: subprocess.run(
+        lambda lease, env: _run_child(
+            lease,
             [sys.executable, "-m", "browser_harness.run"],
-            input=code,
-            text=True,
-            env=env,
-        ).returncode,
+            env,
+            code,
+        ),
         browser_name,
         wait_timeout=wait_timeout,
     )
@@ -607,7 +786,7 @@ def run_command_managed(owner: str, site: str, account: str, mode: str, command:
         site,
         account,
         mode,
-        lambda lease, env: subprocess.run(command, env=env).returncode,
+        lambda lease, env: _run_child(lease, command, env),
         browser_name,
         wait_timeout=wait_timeout,
     )
@@ -632,7 +811,10 @@ def status(browser_name: str | None = None) -> dict:
         "browser_error": browser_error,
         "mode": "per-browser",
         "state_error": error,
-        "leases": list(state["leases"].values()),
+        "leases": [
+            {**lease, **_lease_activity(lease, _now())}
+            for lease in state["leases"].values()
+        ],
         "write_locks": state["write_locks"],
     }
 
