@@ -9,3 +9,5 @@ build/
 dist/
 .idea/
 .claude/
+.understand-anything/
+agent-workspace/recordings/

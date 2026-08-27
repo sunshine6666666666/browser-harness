@@ -27,5 +27,12 @@ An agent operating the harness only edits inside `agent-workspace/`:
 - `agent_helpers.py` — task-specific browser helpers the agent adds
 - `domain-skills/` — skills the agent writes and reads
 
+# Hermes Profile collaboration repositories
+- English workflow source of truth: `/Users/yelin/Developer/linye-english-news-workflow`.
+  Treat this repository as read-only: never modify, commit, or push there.
+  Do not use the legacy `/Users/yelin/Developer/agent-tools/express` checkout as evidence.
+- Social Auto Upload: `/Users/yelin/Developer/agent-tools/social-auto-upload`.
+- Browser Harness: `/Users/yelin/Developer/agent-tools/browser-harness`.
+
 # Contributing
 Consider what is really needed. Prefer the smallest diff that fixes the bug.
