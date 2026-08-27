@@ -536,6 +536,126 @@ def set_description(text: str, timeout: float = 10) -> str:
     return _normalized_text(js("document.querySelector('.ql-editor[contenteditable=\"true\"]')?.innerText || ''"))
 
 
+def _schedule_date_diagnostics() -> dict[str, Any]:
+    return js("""(() => {
+      /* bh:schedule-date-diagnostics */
+      const visible = node => {
+        const r = node.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      };
+      return {
+        current_date: document.querySelector('.date-picker-date .date-show')?.innerText.trim() || '',
+        current_month: document.querySelector('.date-picker-nav-title')?.innerText.trim() || '',
+        options: Array.from(document.querySelectorAll('.date-picker-body-item'))
+          .filter(visible)
+          .map(node => ({
+            day: (node.innerText || '').trim(),
+            state: node.classList.contains('date-item-disabled') ? 'disabled'
+              : node.classList.contains('date-item-selected') ? 'selected' : 'available'
+          }))
+      };
+    })()""") or {"current_date": "", "current_month": "", "options": []}
+
+
+def _schedule_date_failure(requested: str) -> RuntimeError:
+    diagnostics = _schedule_date_diagnostics()
+    return RuntimeError(
+        "Bilibili schedule date was not accepted: requested=%s diagnostics=%s"
+        % (requested, json.dumps(diagnostics, ensure_ascii=False, sort_keys=True))
+    )
+
+
+def _set_schedule_date_value(target: datetime, timeout: float) -> str:
+    requested = target.strftime("%Y-%m-%d")
+    if _schedule_state().get("schedule_date") == requested:
+        return requested
+
+    date_set = js("""(() => {
+      const input = Array.from(document.querySelectorAll('input[type=date],.date-picker-date input')).find(node => {
+        const r = node.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+      if (!input) return false;
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(input, %s);
+      input.dispatchEvent(new Event('input', {bubbles: true}));
+      input.dispatchEvent(new Event('change', {bubbles: true}));
+      return true;
+    })()""" % json.dumps(requested))
+    if date_set:
+        try:
+            _wait_until(
+                lambda: _schedule_state().get("schedule_date") == requested,
+                timeout,
+                "Bilibili schedule date readback did not match",
+            )
+            return requested
+        except TimeoutError as exc:
+            raise _schedule_date_failure(requested) from exc
+
+    opened = js("""(() => {
+      const node = document.querySelector('.date-picker-date');
+      if (!node) return false;
+      node.click();
+      return true;
+    })()""")
+    if not opened:
+        raise _schedule_date_failure(requested)
+    wait(0.3)
+
+    target_month = (target.year, target.month)
+    for _ in range(2):
+        diagnostics = _schedule_date_diagnostics()
+        match = re.fullmatch(r"(\d{4})年(\d{1,2})月", diagnostics.get("current_month", ""))
+        if not match:
+            raise _schedule_date_failure(requested)
+        current_month = (int(match.group(1)), int(match.group(2)))
+        if current_month == target_month:
+            break
+        direction = "next" if current_month < target_month else "prev"
+        moved = js("""(() => {
+          /* bh:schedule-month-navigation */
+          const direction = %s;
+          const node = document.querySelector(
+            '.date-picker-nav-wrp .' + (direction === 'next' ? 'next-btn-month' : 'prev-btn-month')
+          );
+          if (!node || node.classList.contains('date-select-disabled')) return false;
+          node.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+          return true;
+        })()""" % json.dumps(direction))
+        if not moved:
+            raise _schedule_date_failure(requested)
+        wait(0.3)
+    else:
+        raise _schedule_date_failure(requested)
+
+    selected = js("""(() => {
+      /* bh:schedule-day-selection */
+      const day = %s;
+      const node = Array.from(document.querySelectorAll('.date-picker-body-item'))
+        .find(item => {
+          const r = item.getBoundingClientRect();
+          return r.width > 0 && r.height > 0
+            && item.innerText.trim() === day
+            && !item.classList.contains('date-item-disabled');
+        });
+      if (!node) return false;
+      if (!node.classList.contains('date-item-selected')) node.click();
+      return true;
+    })()""" % json.dumps(str(target.day)))
+    if not selected:
+        raise _schedule_date_failure(requested)
+    try:
+        _wait_until(
+            lambda: _schedule_state().get("schedule_date") == requested,
+            timeout,
+            "Bilibili schedule date readback did not match",
+        )
+    except TimeoutError as exc:
+        raise _schedule_date_failure(requested) from exc
+    return requested
+
+
 def _set_schedule_time_value(hour: int, minute: int) -> str:
     active = js("document.querySelector('.time-switch-wrp .switch-container')?.classList.contains('switch-container-active')")
     if not active:
@@ -593,43 +713,12 @@ def set_schedule_datetime(value: str, timeout: float = 15) -> dict[str, str]:
         raise ValueError("Bilibili schedule must be at least five minutes in the future")
     if target > now + timedelta(days=15):
         raise ValueError("Bilibili schedule cannot be more than fifteen days ahead")
-    date, clock = value.split(" ", 1)
+    _, clock = value.split(" ", 1)
     active = js("document.querySelector('.time-switch-wrp .switch-container')?.classList.contains('switch-container-active')")
     if not active:
         js("document.querySelector('.time-switch-wrp .switch-container')?.click()")
         wait(0.4)
-    date_set = js("""(() => {
-      const input = Array.from(document.querySelectorAll('input[type=date],.date-picker-date input')).find(node => {
-        const r = node.getBoundingClientRect();
-        return r.width > 0 && r.height > 0;
-      });
-      if (!input) return false;
-      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-      setter.call(input, %s);
-      input.dispatchEvent(new Event('input', {bubbles: true}));
-      input.dispatchEvent(new Event('change', {bubbles: true}));
-      return true;
-    })()""" % json.dumps(date))
-    if not date_set:
-        opened = js("""(() => {
-          const node = document.querySelector('.date-picker-date');
-          if (!node) return false;
-          node.click();
-          return true;
-        })()""")
-        if not opened:
-            raise RuntimeError("Bilibili schedule date control not found")
-        wait(0.3)
-        selected = js("""(() => {
-          const day = %s;
-          const node = Array.from(document.querySelectorAll('.date-picker-body-item.date-item'))
-            .find(item => item.getBoundingClientRect().width > 0 && item.innerText.trim() === day);
-          if (!node) return false;
-          node.click();
-          return true;
-        })()""" % json.dumps(str(target.day)))
-        if not selected:
-            _click_visible_text(str(target.day), ".date-picker-body-item.date-item,button,[role=option],.calendar-day,.date-picker-panel *")
+    date = _set_schedule_date_value(target, timeout)
     hour, minute = map(int, clock.split(":", 1))
     _set_schedule_time_value(hour, minute)
     state = _wait_until(

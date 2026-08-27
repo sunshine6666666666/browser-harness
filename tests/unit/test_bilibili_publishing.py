@@ -37,6 +37,11 @@ class FakePage:
         self.last_option = ""
         self.pending_hour = ""
         self.upload_calls = []
+        self.has_date_input = True
+        self.calendar_month = "2026年8月"
+        self.calendar_navigation = True
+        self.month_moves = []
+        self.day_selections = []
 
     def js(self, script):
         if script.strip().startswith("Boolean(document.querySelector('.cover-empty-pill'))"):
@@ -93,6 +98,8 @@ class FakePage:
         if "scheduled: document" in script:
             return dict(self.schedule)
         if "input[type=date]" in script:
+            if not self.has_date_input:
+                return False
             value = json.loads(re.search(r"setter\.call\(input, (.*?)\);", script).group(1))
             self.schedule["schedule_date"] = value
             return True
@@ -111,6 +118,37 @@ class FakePage:
             return True
         if ".date-picker-timer .date-show" in script:
             return self.schedule["schedule_time"]
+        if "bh:schedule-date-diagnostics" in script:
+            selected = str(int(self.schedule["schedule_date"][-2:]))
+            return {
+                "current_date": self.schedule["schedule_date"],
+                "current_month": self.calendar_month,
+                "options": [
+                    {"day": selected, "state": "selected"},
+                    {"day": "1", "state": "available"},
+                ],
+            }
+        if "bh:schedule-month-navigation" in script:
+            direction = json.loads(re.search(r"const direction = (.*?);", script).group(1))
+            if not self.calendar_navigation:
+                return False
+            year, month = map(int, re.fullmatch(r"(\d{4})年(\d{1,2})月", self.calendar_month).groups())
+            month += 1 if direction == "next" else -1
+            if month == 13:
+                year, month = year + 1, 1
+            elif month == 0:
+                year, month = year - 1, 12
+            self.calendar_month = f"{year}年{month}月"
+            self.month_moves.append(direction)
+            return True
+        if "bh:schedule-day-selection" in script:
+            day = int(json.loads(re.search(r"const day = (.*?);", script).group(1)))
+            year, month = map(int, re.fullmatch(r"(\d{4})年(\d{1,2})月", self.calendar_month).groups())
+            self.schedule["schedule_date"] = f"{year:04d}-{month:02d}-{day:02d}"
+            self.day_selections.append(day)
+            return True
+        if "const node = document.querySelector('.date-picker-date')" in script:
+            return True
         if "input[placeholder=\"请输入稿件标题\"]" in script:
             return self.title
         if "input[placeholder*=\"创作声明\"]" in script:
@@ -248,6 +286,78 @@ def test_schedule_datetime_accepts_date_and_time_and_enforces_bounds(monkeypatch
         namespace["set_schedule_datetime"]("2020-01-01 00:00")
     with pytest.raises(ValueError, match="fifteen"):
         namespace["set_schedule_datetime"]("2099-01-01 00:00")
+
+
+def test_schedule_datetime_keeps_already_selected_same_day(monkeypatch):
+    namespace, page = load_publishing()
+    page.has_date_input = False
+    page.schedule = {
+        "scheduled": True,
+        "schedule_date": "2026-08-27",
+        "schedule_time": "08:00",
+    }
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 8, 27, 8, tzinfo=tz)
+
+    monkeypatch.setitem(namespace, "datetime", FixedDateTime)
+    assert namespace["set_schedule_datetime"]("2026-08-27 12:00", timeout=0) == {
+        "schedule_date": "2026-08-27",
+        "schedule_time": "12:00",
+        "schedule": "2026-08-27 12:00",
+    }
+    assert page.month_moves == []
+    assert page.day_selections == []
+
+
+def test_schedule_datetime_navigates_to_next_month(monkeypatch):
+    namespace, page = load_publishing()
+    page.has_date_input = False
+    page.schedule = {
+        "scheduled": True,
+        "schedule_date": "2026-08-27",
+        "schedule_time": "08:00",
+    }
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 8, 27, 8, tzinfo=tz)
+
+    monkeypatch.setitem(namespace, "datetime", FixedDateTime)
+    assert namespace["set_schedule_datetime"]("2026-09-01 12:00", timeout=0) == {
+        "schedule_date": "2026-09-01",
+        "schedule_time": "12:00",
+        "schedule": "2026-09-01 12:00",
+    }
+    assert page.month_moves == ["next"]
+    assert page.day_selections == [1]
+
+
+def test_schedule_datetime_failure_reports_month_and_options(monkeypatch):
+    namespace, page = load_publishing()
+    page.has_date_input = False
+    page.calendar_navigation = False
+    page.schedule = {
+        "scheduled": True,
+        "schedule_date": "2026-08-27",
+        "schedule_time": "08:00",
+    }
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 8, 27, 8, tzinfo=tz)
+
+    monkeypatch.setitem(namespace, "datetime", FixedDateTime)
+    with pytest.raises(RuntimeError) as caught:
+        namespace["set_schedule_datetime"]("2026-09-01 12:00", timeout=0)
+    message = str(caught.value)
+    assert "requested=2026-09-01" in message
+    assert '"current_month": "2026年8月"' in message
+    assert '"options":' in message
 
 
 def test_snapshot_contains_real_contract_fields():
