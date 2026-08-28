@@ -860,10 +860,11 @@ def submit_once(title: str, expected_mid: int, expected_name: str | None = None,
                 manager = manager_evidence(
                     title, expected_schedule, strict=False, attempts=1
                 )
-            except RuntimeError as exc:
+            except (RuntimeError, TimeoutError) as exc:
                 last_manager_error = str(exc)
             else:
-                if manager.get("schedule_match"):
+                # ponytail: Bilibili hides the schedule while the card is under review.
+                if manager.get("schedule_match") or "审核中" in manager.get("text", ""):
                     result = {
                         "identity": identity, "submitted": True, "status": "verified",
                         "manager": manager, "verification_source": "manager_latest",

@@ -100,6 +100,9 @@ not depend on SAU or biliup at runtime.
   manager list under one deadline. An exact latest manager card can verify
   acceptance before the archive API catches up; the result then has
   `verification_source="manager_latest"` and may not yet contain `archive`.
+  When the exact latest manager card says `审核中`, that is terminal publishing
+  evidence even if Bilibili has not rendered the scheduled time on the card;
+  later review state is outside this skill's scope.
   Upload/processing success notices are positive toasts, never form errors.
   A true rejection returns `status="not_accepted"`, concrete diagnostics, and
   `submit_clicks=1`.
@@ -128,7 +131,7 @@ print(result)
 
 | Result | Required action |
 | --- | --- |
-| `status="verified"` | Finish when `manager.latest=true`, retain manager evidence, and retain AID/BVID too when the archive API has caught up. |
+| `status="verified"` | Finish when `manager.latest=true`; an exact scheduled time or an exact latest-card `审核中` state is sufficient. Retain AID/BVID too when the archive API has caught up. |
 | `status="accepted_but_schedule_unverified"` | Poll only `manager_evidence(title, schedule)` read-only. Its default three list loads are the bounded refresh procedure. Never call `prepare_upload`, any `set_*`, `_click_visible`, or `submit_once` again. |
 | `status="not_accepted"` | Preserve `diagnostics`, inspect the exact reason, then call only `manager_evidence(title, schedule)` for bounded read-only reconciliation. Do not click or submit again automatically. |
 | multiple exact-title records or pre-existing exact-title record | Hard stop. Never submit, duplicate, delete, retract, or invent a new title. |
@@ -149,7 +152,9 @@ or immediate-publication dialogs.
 - [ ] Two snapshots taken two seconds apart are identical.
 - [ ] `submit_once` is called once; no recovery path clicks it again.
 - [ ] After bounded list reloads, the manager's first/latest card has the exact
-  title, `latest=true`, and the exact Chinese schedule when scheduled.
+  title and `latest=true`; for scheduled posts, the exact Chinese schedule is
+  preferred, while `审核中` is terminal publication evidence when the platform
+  hides the schedule during review.
 - [ ] AID/BVID is retained when the archive API has caught up; manager-latest
   evidence remains sufficient while that API is delayed.
 - [ ] Agent Pool leases and write locks are empty after cleanup.

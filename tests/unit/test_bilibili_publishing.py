@@ -470,6 +470,51 @@ def test_submit_once_accepts_latest_manager_record_before_archive_api_catches_up
     assert clicks == [".submit-add"]
 
 
+def test_submit_once_accepts_latest_manager_card_in_review_without_schedule_text():
+    namespace, _ = load_publishing()
+    clicks = []
+    manager = {
+        "title": "标题", "text": "标题\n审核中",
+        "schedule_match": False, "latest": True, "list_loads": 1,
+    }
+    _configure_submit(namespace, [[], [{"aid": 9, "bvid": "BV9"}]], [manager], clicks)
+    result = namespace["submit_once"](
+        "标题", 518800384, "水蜜桃英语", "2026-08-30 22:00", timeout=0.1
+    )
+    assert result["status"] == "verified"
+    assert result["submitted"] is True
+    assert result["manager"] == manager
+    assert result["submit_clicks"] == 1
+    assert clicks == [".submit-add"]
+
+
+def test_submit_once_recovers_from_manager_navigation_timeout():
+    namespace, _ = load_publishing()
+    clicks = []
+    manager = {
+        "title": "标题", "text": "标题\n审核中",
+        "schedule_match": False, "latest": True, "list_loads": 1,
+    }
+    _configure_submit(namespace, [[], [{"aid": 10, "bvid": "BV10"}]], [], clicks)
+    manager_results = iter([TimeoutError("manager navigation timed out"), manager])
+
+    def flaky_manager(title, schedule, strict=False, attempts=3):
+        value = next(manager_results)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    namespace["manager_evidence"] = flaky_manager
+    result = namespace["submit_once"](
+        "标题", 518800384, "水蜜桃英语", "2026-08-30 22:00", timeout=0.1
+    )
+    assert result["status"] == "verified"
+    assert result["submitted"] is True
+    assert result["manager"] == manager
+    assert result["submit_clicks"] == 1
+    assert clicks == [".submit-add"]
+
+
 def test_submit_once_loads_manager_at_most_three_times():
     namespace, _ = load_publishing()
     clicks = []
