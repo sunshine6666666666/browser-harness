@@ -50,7 +50,7 @@ PY
 | `delete_chat(fragment, confirm=True)` | Hover item → options (history-item-N-options) → 删除 → confirm dialog (`delete-conversation-confirm-button`). **Destructive — requires confirm=True** |
 | `select_model(name)` | Open the advanced or direct model submenu, select an exact visible radio, then reopen and require `aria-checked="true"` |
 | `set_reasoning_effort(level)` | Select the exact reasoning radio in either UI variant, then reopen and require `aria-checked="true"` |
-| `send_message(text)` | Require an initially empty unified composer, send once, and return `definitely_sent` or non-retryable `unknown` evidence. Long collapsed prompts can be proven by the rendered prefix, an unseen `data-message-id`, an increasing `conversation-turn-N`, and an emptied composer; transient `/c/WEB:...` routes are rejected until the canonical URL appears |
+- `send_message(text)` | Require an initially empty unified composer, send once, and return `definitely_sent`, `definitely_not_sent` (no click was issued), or non-retryable `unknown` evidence. The live send button accepts `发送提示词`, legacy `发送提示`, and `Send prompt`. Long collapsed prompts can be proven by the rendered prefix, an unseen `data-message-id`, an increasing `conversation-turn-N`, and an emptied composer; transient `/c/WEB:...` routes are rejected until the canonical URL appears |
 | `scroll_conversation(direction, amount)` | Wheel on the main `overflowY:auto` container; returns scrollTop. Use only for ordinary viewport movement |
 | `page_conversation(direction, steps)` | Focus the main conversation scroller and send real PageUp/PageDown keys so ChatGPT's virtualizer renders the next page; returns scroll/message evidence |
 | `conversation_text(limit)` | Read last user/assistant turns from `[data-message-author-role]` nodes |
@@ -118,7 +118,7 @@ DR UI facts:
 - Delete confirm: `[data-testid="delete-conversation-confirm-button"]`.
 - Composer model picker: a composer-scoped `button[aria-haspopup="menu"]`. The current Radix trigger requires a full pointerdown/mousedown/pointerup/mouseup/click sequence; a bare DOM click or Escape-only cleanup may leave the menu unchanged.
 - Picker panel has two live variants. The advanced variant exposes 模型 / 推理强度 / 速度 menu items. The current direct variant exposes reasoning radios at the top level and a current-model `[role="menuitem"][aria-haspopup="menu"]` that opens exact model radios. Both must be verified by reopening and reading `aria-checked`.
-- Send button: `aria-label="发送提示"` (do not rely on Return).
+- Send button: current `aria-label="发送提示词"`, with legacy `发送提示` and `Send prompt` compatibility (do not rely on Return).
 - Main scroll container: the largest `div` with `overflowY:auto` and
   `scrollHeight > clientHeight + 50`. Note: the side "输出内容" pane is
   `overflowY:clip` (custom scroll) — not scrollable via wheel.

@@ -315,8 +315,7 @@ def run_deep_research(
       const form = document.querySelector('form[data-type="unified-composer"]');
       if (!form) return {found: false};
       const btn = [...form.querySelectorAll('button')].find(b =>
-        norm(b.getAttribute('aria-label') || '') === '发送提示' ||
-        norm(b.getAttribute('aria-label') || '') === 'Send prompt');
+        ['发送提示', '发送提示词', 'Send prompt'].includes(norm(b.getAttribute('aria-label') || '')));
       if (!btn) return {found: false};
       for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
         btn.dispatchEvent(new PointerEvent(type, {bubbles: true, cancelable: true,
