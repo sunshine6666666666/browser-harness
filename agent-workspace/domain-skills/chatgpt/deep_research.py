@@ -43,8 +43,8 @@ React for the small composer + button).
 
 from __future__ import annotations
 
-import os
 import re
+import signal
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -84,6 +84,17 @@ def arm_deep_research() -> dict[str, Any]:
     Returns {'armed': True, 'pill': <composer form text tail>}. Safe to call
     on a fresh home or existing conversation; does NOT send anything.
     """
+    existing = js(r"""
+    (() => {
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+      const form = document.querySelector('form[data-type="unified-composer"]');
+      const tokens = form ? [...form.querySelectorAll('[data-inline-selection-pill][data-id="plugin:connector_openai_deep_research"]')].filter(el =>
+        el.offsetParent && norm(el.innerText || el.textContent) === '深度研究') : [];
+      return {count: tokens.length};
+    })()
+    """) or {"count": 0}
+    if existing.get("count", 0) > 0:
+        return {"armed": True, "already": True, "pill": "深度研究"}
     plus = js(r"""
     (() => {
       const plus = document.querySelector('[data-testid="composer-plus-btn"]');
@@ -123,8 +134,8 @@ def arm_deep_research() -> dict[str, Any]:
     (() => {
       const norm = s => (s || '').replace(/\s+/g, ' ').trim();
       const form = document.querySelector('form[data-type="unified-composer"]');
-      const txt = form ? norm(form.innerText || '') : '';
-      return {pill: /深度研究/.test(txt), text: txt.slice(0, 120)};
+      const token = form && form.querySelector('[data-inline-selection-pill][data-id="plugin:connector_openai_deep_research"]');
+      return {pill: !!(token && token.offsetParent), text: token ? norm(token.innerText) : ''};
     })()
     """)
     if not check or not check.get("pill"):
@@ -133,36 +144,40 @@ def arm_deep_research() -> dict[str, Any]:
 
 
 def disarm_deep_research() -> dict[str, Any]:
-    """Remove the 深度研究 pill (click token then Backspace)."""
-    token = js(r"""
-    (() => {
-      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-      const form = document.querySelector('form[data-type="unified-composer"]');
-      if (!form) return {found: false};
-      const hits = [...form.querySelectorAll('span, div, button')].filter(el =>
-        el.offsetParent && norm(el.innerText || el.textContent || '') === '深度研究');
-      if (!hits.length) return {found: false};
-      const interactive = hits.find(h => /cursor-t/.test((h.className || '').toString())) || hits[hits.length - 1];
-      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-        interactive.dispatchEvent(new PointerEvent(type, {bubbles: true, cancelable: true,
-          pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0}));
-      }
-      return {found: true};
-    })()
-    """)
-    if token and token.get("found"):
-        wait(0.8)
+    """Remove every actual 深度研究 composer token."""
+    removed = 0
+    for _ in range(3):
+        token = js(r"""
+        (() => {
+          const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+          const form = document.querySelector('form[data-type="unified-composer"]');
+          const el = form && [...form.querySelectorAll('[data-inline-selection-pill][data-id="plugin:connector_openai_deep_research"]')].find(x =>
+            x.offsetParent && norm(x.innerText || x.textContent) === '深度研究');
+          if (!el) return {found: false};
+          for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+            const C = type.startsWith('pointer') ? PointerEvent : MouseEvent;
+            el.dispatchEvent(new C(type, {bubbles: true, cancelable: true, pointerId: 1,
+              pointerType: 'mouse', isPrimary: true, button: 0}));
+          }
+          return {found: true};
+        })()
+        """) or {"found": False}
+        if not token.get("found"):
+            break
+        wait(0.5)
         press_key("Backspace")
-        wait(1.0)
+        wait(0.8)
+        removed += 1
     check = js(r"""
     (() => {
       const norm = s => (s || '').replace(/\s+/g, ' ').trim();
       const form = document.querySelector('form[data-type="unified-composer"]');
-      const txt = form ? norm(form.innerText || '') : '';
-      return {pill: /深度研究/.test(txt)};
+      const count = form ? [...form.querySelectorAll('[data-inline-selection-pill][data-id="plugin:connector_openai_deep_research"]')].filter(x =>
+        x.offsetParent && norm(x.innerText || x.textContent) === '深度研究').length : 0;
+      return {count};
     })()
-    """)
-    return {"disarmed": not (check or {}).get("pill", True)}
+    """) or {"count": 1}
+    return {"disarmed": check.get("count", 1) == 0, "removed": removed}
 
 
 # ---------------------------------------------------------------------------
@@ -170,11 +185,40 @@ def disarm_deep_research() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _connector_target() -> str:
-    """Resolve the Deep Research sandbox connector iframe targetId."""
+    """Resolve only the connector owned by the currently attached page."""
     try:
-        return iframe_target("connector-openai-deep-research")
+        root = cdp("DOM.getDocument", depth=0)["root"]["nodeId"]
+        nodes = cdp("DOM.querySelectorAll", nodeId=root,
+                    selector='iframe[src*="connector-openai-deep-research"]')["nodeIds"]
+        if not nodes:
+            raise RuntimeError("deep_research: connector iframe absent")
+        if len(nodes) != 1:
+            raise RuntimeError("deep_research: ambiguous current-page connectors")
+        frame_id = cdp("DOM.describeNode", nodeId=nodes[0])["node"].get("frameId")
+        targets = cdp("Target.getTargets")["targetInfos"]
+        matches = [t["targetId"] for t in targets if t["type"] == "iframe" and
+                   t["targetId"] == frame_id and "connector-openai-deep-research" in t.get("url", "")]
+        if len(matches) != 1:
+            raise RuntimeError("deep_research: current connector target not attached")
+        return matches[0]
     except Exception as e:
-        raise RuntimeError(f"deep_research: connector iframe not found: {e}") from e
+        if "connector iframe absent" in str(e):
+            raise RuntimeError("deep_research: connector iframe absent") from e
+        raise RuntimeError(f"deep_research: connector target lookup failed: {e}") from e
+
+
+def _connector_js(expression: str, target_id: str, timeout: float = 10.0) -> Any:
+    """Bound cross-target reads so an unresponsive connector cannot hang the runner."""
+    def interrupt(_signum: int, _frame: Any) -> None:
+        raise TimeoutError("connector read timed out")
+
+    previous = signal.signal(signal.SIGALRM, interrupt)
+    signal.setitimer(signal.ITIMER_REAL, timeout)
+    try:
+        return js(expression, target_id=target_id)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def deep_research_progress() -> dict[str, Any]:
@@ -189,22 +233,37 @@ def deep_research_progress() -> dict[str, Any]:
     """
     try:
         tid = _connector_target()
-    except RuntimeError:
-        return {"state": "idle", "len": 0, "text": ""}
-    r = js(r"""
-    (() => {
-      const root = document.querySelector('iframe#root');
-      if (!root) return {found: false};
-      try {
-        const doc = root.contentDocument;
-        const txt = doc && doc.body ? doc.body.innerText || '' : '';
-        return {found: true, text: txt};
-      } catch (e) {
-        return {found: false, error: String(e).slice(0, 120)};
-      }
-    })()
-    """, target_id=tid) or {"found": False, "text": ""}
+    except RuntimeError as exc:
+        if "connector iframe absent" in str(exc):
+            return {"state": "idle", "len": 0, "text": ""}
+        return {"state": "unknown", "len": 0, "text": "",
+                "reason": f"connector_target_error: {str(exc)[:120]}"}
+    try:
+        r = _connector_js(r"""
+        (() => {
+          const root = document.querySelector('iframe#root');
+          if (!root) return {found: false, reason: 'nested_root_missing'};
+          try {
+            const doc = root.contentDocument;
+            const txt = doc && doc.body ? doc.body.innerText || '' : '';
+            return {found: true, text: txt};
+          } catch (e) {
+            return {found: false, reason: 'nested_root_unreadable', error: String(e).slice(0, 120)};
+          }
+        })()
+        """, target_id=tid) or {"found": False, "reason": "nested_root_unreadable"}
+    except TimeoutError as exc:
+        return {"state": "unknown", "len": 0, "text": "",
+                "reason": f"connector_read_timeout: {exc}"}
+    except Exception as exc:
+        return {"state": "unknown", "len": 0, "text": "",
+                "reason": f"nested_connector_read_error: {str(exc)[:120]}"}
+    if not r.get("found"):
+        return {"state": "unknown", "len": 0, "text": "",
+                "reason": r.get("reason", "nested_root_unreadable")}
     txt = r.get("text") or ""
+    if not txt.strip():
+        return {"state": "unknown", "len": 0, "text": "", "reason": "nested_root_empty"}
     norm = _norm(txt)
     if "研究完成" in norm and ("次引用" in norm or "次搜索" in norm) and "停止研究" not in norm:
         state = "done"
@@ -231,7 +290,20 @@ def export_deep_research_markdown(timeout: float = 30.0) -> str:
     absolute downloaded file path. Raises RuntimeError on timeout.
     """
     tid = _connector_target()
-    clicked = js(r"""
+    downloads = Path.home() / "Downloads"
+
+    def snapshot() -> dict[str, tuple[int, int]]:
+        result = {}
+        for path in downloads.glob("deep-research-report*.md"):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            result[str(path)] = (stat.st_mtime_ns, stat.st_size)
+        return result
+
+    before = snapshot()
+    clicked = _connector_js(r"""
     (() => {
       const root = document.querySelector('iframe#root');
       if (!root) return {found: false};
@@ -252,11 +324,11 @@ def export_deep_research_markdown(timeout: float = 30.0) -> str:
         return {found: false, error: String(e).slice(0, 120)};
       }
     })()
-    """, target_id=tid)
+    """, tid)
     if not clicked or not clicked.get("found"):
         raise RuntimeError("export_deep_research_markdown: 导出 button not found in connector iframe")
     wait(1.5)
-    md = js(r"""
+    md = _connector_js(r"""
     (() => {
       const root = document.querySelector('iframe#root');
       if (!root) return {found: false};
@@ -273,22 +345,16 @@ def export_deep_research_markdown(timeout: float = 30.0) -> str:
         return {found: false, error: String(e).slice(0, 120)};
       }
     })()
-    """, target_id=tid)
+    """, tid)
     if not md or not md.get("found"):
         raise RuntimeError("export_deep_research_markdown: 导出到 Markdown menu item not found")
-    deadline = time.time() + timeout
-    downloads = Path.home() / "Downloads"
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         wait(2.0)
-        candidates = sorted(
-            downloads.glob("deep-research-report*.md"),
-            key=lambda p: p.stat().st_mtime, reverse=True,
-        )
-        if candidates:
-            newest = candidates[0]
-            if newest.stat().st_size > 0:
-                return str(newest)
-    raise RuntimeError(f"export_deep_research_markdown: no non-empty report downloaded within {timeout}s")
+        for path, metadata in snapshot().items():
+            if metadata[1] > 0 and before.get(path) != metadata:
+                return path
+    raise RuntimeError(f"timeout: export_deep_research_markdown: no fresh non-empty report downloaded within {timeout}s")
 
 
 # ---------------------------------------------------------------------------
@@ -306,39 +372,30 @@ def run_deep_research(
     Returns {'state': 'done'|'unknown', 'question': ..., 'text': ..., 'export_path': ...}.
     This sends a real Deep Research request and consumes a Pro quota run.
     """
+    sender = globals().get("send_message")
+    if not callable(sender):
+        raise RuntimeError("precondition: run_deep_research requires shared send_message")
     arm_deep_research()
-    type_text(question)
-    wait(0.8)
-    sent = js(r"""
-    (() => {
-      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-      const form = document.querySelector('form[data-type="unified-composer"]');
-      if (!form) return {found: false};
-      const btn = [...form.querySelectorAll('button')].find(b =>
-        norm(b.getAttribute('aria-label') || '') === '发送提示' ||
-        norm(b.getAttribute('aria-label') || '') === 'Send prompt');
-      if (!btn) return {found: false};
-      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-        btn.dispatchEvent(new PointerEvent(type, {bubbles: true, cancelable: true,
-          pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0}));
-      }
-      return {found: true};
-    })()
-    """)
-    if not sent or not sent.get("found"):
-        raise RuntimeError("run_deep_research: send button not found after arming DR")
-    deadline = time.time() + timeout
-    last = ""
-    while time.time() < deadline:
-        wait(poll_interval)
+    sent = sender(question)
+    if sent.get("status") != "definitely_sent":
+        return {"state": "unknown", "reason": "result_unknown: deep research send status",
+                "submission_count": 1, "text": "", "send": sent}
+    deadline = time.monotonic() + timeout
+    last: dict[str, Any] = {"state": "unknown", "text": ""}
+    while time.monotonic() < deadline:
         prog = deep_research_progress()
-        last = prog.get("text", "")
+        last = prog
         if prog.get("state") == "done":
-            result: dict[str, Any] = {"state": "done", "text": last}
+            result: dict[str, Any] = {"state": "done", "text": prog.get("text", ""),
+                                      "submission_count": 1, "send": sent}
             if export:
                 result["export_path"] = export_deep_research_markdown()
             return result
-    return {"state": "unknown", "text": last}
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            wait(min(max(poll_interval, 0.1), remaining))
+    return {"state": "unknown", "reason": "timeout", "submission_count": 1,
+            "text": last.get("text", ""), "progress": last, "send": sent}
 
 
 def run(script: str | None = None) -> None:

@@ -17,6 +17,8 @@ at runtime via getBoundingClientRect, never hardcoded.
 
 from __future__ import annotations
 
+import base64
+import json
 import re
 import time
 from urllib.parse import urlparse
@@ -32,10 +34,17 @@ if TYPE_CHECKING:
     def wait_for_load(timeout: float = 15.0) -> bool: ...
     def wait(seconds: float = 1.0) -> None: ...
     def cdp(method: str, session_id: str | None = None, **params: Any) -> Any: ...
+    def drain_events() -> list[dict[str, Any]]: ...
     def list_tabs(include_chrome: bool = True) -> list[dict[str, Any]]: ...
+    def current_tab() -> dict[str, Any]: ...
+    def activate_tab(target: str | None = None) -> None: ...
     def switch_tab(target: str) -> None: ...
     def close_tab(target: str | None = None) -> None: ...
     def capture_screenshot(path: str | None = None, full: bool = False, max_dim: int | None = None) -> str: ...
+
+
+_TASK_OWNED_TABS: set[str] = set()
+_SHARE_RESULTS: dict[str, dict[str, Any]] = {}
 
 
 def _norm(s: str | None) -> str:
@@ -63,6 +72,68 @@ def _is_canonical_conversation_url(url: str) -> bool:
     )
 
 
+def observe_chatgpt_state() -> dict[str, Any]:
+    """Read the current page state without changing the page."""
+    raw = js(r"""
+    (() => {
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+      const visible = el => {
+        if (!el || !el.offsetParent) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && r.x >= 0 && r.y >= 0 &&
+               r.right <= innerWidth && r.bottom <= innerHeight;
+      };
+      const visibleText = el => visible(el) && norm(el.innerText || el.textContent || el.getAttribute('aria-label'));
+      const form = document.querySelector('form[data-type="unified-composer"]');
+      const editor = form && (form.querySelector('[contenteditable="true"]') ||
+                              form.querySelector('textarea, [role="textbox"]'));
+      const draft = editor && editor.cloneNode(true);
+      if (draft) draft.querySelectorAll('[data-inline-selection-pill][data-id="plugin:connector_openai_deep_research"], [data-inline-selection-pill-cursor-target]').forEach(el => el.remove());
+      const controls = [...document.querySelectorAll('button, [role="button"], [role="status"]')]
+        .filter(visible).map(visibleText).filter(Boolean);
+      const body = norm(document.body && (document.body.innerText || document.body.textContent));
+      const auth_required = [...document.querySelectorAll('button, a, h1, h2, input')]
+        .some(el => /登录|log in|sign in|password|验证码|MFA|账号选择|choose account/i.test(visibleText(el) || ''));
+      const paywall_or_quota = [...document.querySelectorAll('button, a, h1, h2, [role="dialog"]')]
+        .some(el => /升级|付款|购买|quota|upgrade|subscribe|payment/i.test(visibleText(el) || ''));
+      const dialog = [...document.querySelectorAll('[role="dialog"]')].some(visible);
+      const generating = [...document.querySelectorAll('[data-testid="stop-button"]')].some(visible) ||
+        controls.some(t => /停止回答|停止生成|停止研究|正在生成|正在研究|stop generating|stop streaming/i.test(t));
+      const url = location.href;
+      const match = url.match(/^https:\/\/chatgpt\.com\/c\/([A-Za-z0-9-]{8,})$/);
+      const composer_visible = !!(editor && visible(editor));
+      return {
+        url,
+        conversation_id: match ? match[1] : null,
+        composer_visible,
+        composer_empty: composer_visible && !norm(draft.textContent || draft.value),
+        generating,
+        auth_required,
+        paywall_or_quota,
+        dialog,
+        body_nonempty: !!body
+      };
+    })()
+    """) or {}
+    url = str(raw.get("url", ""))
+    canonical = _is_canonical_conversation_url(url)
+    if raw.get("auth_required"):
+        state = "auth_required"
+    elif raw.get("paywall_or_quota"):
+        state = "paywall_or_quota"
+    elif raw.get("dialog"):
+        state = "dialog"
+    elif canonical and raw.get("generating"):
+        state = "generating"
+    elif url == "https://chatgpt.com/" and raw.get("composer_visible") and raw.get("composer_empty"):
+        state = "ready_home"
+    elif canonical and raw.get("composer_visible") and raw.get("composer_empty"):
+        state = "ready_conversation"
+    else:
+        state = "unknown"
+    return {**raw, "state": state, "conversation_id": raw.get("conversation_id") if canonical else None}
+
+
 def _click_element_center(js_find: str, expect: str = "element") -> dict[str, Any]:
     """Run a JS snippet that returns {found, x, y} (center of target)."""
     r = js(js_find)
@@ -83,7 +154,8 @@ def _composer_state() -> str:
         const r = b.getBoundingClientRect();
         if (r.width < 20) return false;
         const inComposer = !!b.closest('form[data-type="unified-composer"]');
-        const isPicker = b.matches('[aria-haspopup="menu"]') || b.classList.contains('__composer-pill');
+        const isPicker = (b.matches('[aria-haspopup="menu"]') || b.classList.contains('__composer-pill')) &&
+                         b.getAttribute('data-testid') !== 'composer-plus-btn';
         if (inComposer && isPicker) return true;
         if (r.y < innerHeight * 0.8) return false; // legacy fallback outside composer form
         return /^5\.\d\s+\S+/.test(t) || /^GPT-5\./.test(t) ||
@@ -100,7 +172,8 @@ def _find_composer_picker() -> dict[str, Any]:
     (() => {
       const norm = s => (s || '').replace(/\s+/g, ' ').trim();
       const scoped = [...document.querySelectorAll('form[data-type="unified-composer"] button')].filter(b =>
-        b.offsetParent && (b.matches('[aria-haspopup="menu"]') || b.classList.contains('__composer-pill'))
+        b.offsetParent && b.getAttribute('data-testid') !== 'composer-plus-btn' &&
+        (b.matches('[aria-haspopup="menu"]') || b.classList.contains('__composer-pill'))
       );
       const btns = scoped.length ? scoped : [...document.querySelectorAll('button')].filter(b => {
         const t = norm(b.innerText || b.textContent);
@@ -118,14 +191,31 @@ def _find_composer_picker() -> dict[str, Any]:
     return r
 
 
-def open_chatgpt(url: str = "https://chatgpt.com/") -> None:
-    """Open ChatGPT in a new tab and wait for load."""
-    new_tab(url)
-    wait_for_load(timeout=15)
-    wait(2.0)
-    st = js("location.href")
-    if "chatgpt.com" not in st:
-        raise RuntimeError(f"open_chatgpt: landed on unexpected URL {st}")
+def open_chatgpt(url: str = "https://chatgpt.com/") -> dict[str, Any]:
+    """Open the home page or one exact conversation in a task-owned tab."""
+    if url == "https://chatgpt.com/":
+        target_url = url
+    else:
+        conversation_id = _conversation_id(url)
+        target_url = f"https://chatgpt.com/c/{conversation_id}"
+    target_id = new_tab(target_url)
+    _TASK_OWNED_TABS.add(target_id)
+    try:
+        wait_for_load(timeout=20)
+        deadline = time.monotonic() + 20
+        state: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            state = observe_chatgpt_state()
+            if state.get("state") != "unknown":
+                break
+            wait(0.5)
+        if state.get("state") == "unknown":
+            raise RuntimeError("unknown: ChatGPT page state did not stabilize")
+        return {"target_id": target_id, **state}
+    except Exception:
+        _TASK_OWNED_TABS.discard(target_id)
+        close_tab(target_id)
+        raise
 
 
 def new_chat() -> dict[str, Any]:
@@ -170,71 +260,32 @@ def new_chat() -> dict[str, Any]:
     return state
 
 
-def switch_chat(title_fragment: str) -> None:
-    """Switch to a sidebar conversation whose visible title contains the fragment."""
-    r = js(r"""
-    (() => {
-      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-      const frag = %r;
-      const a = [...document.querySelectorAll('a[href*="/c/"]')].find(x =>
-        x.offsetParent && norm(x.innerText).includes(frag));
-      if (!a) return {found: false};
-      const b = a.getBoundingClientRect();
-      return {found: true, x: Math.round(b.x + b.width / 2), y: Math.round(b.y + b.height / 2)};
-    })()
-    """ % title_fragment)
-    if not r or not r.get("found"):
-        raise RuntimeError(f"switch_chat: no sidebar item containing {title_fragment!r}")
-    click_at_xy(r["x"], r["y"])
-    wait(2.0)
-    url = js("location.href")
-    if "/c/" not in url:
-        raise RuntimeError(f"switch_chat: did not navigate to a conversation ({url})")
+def switch_chat(conversation: str) -> dict[str, Any]:
+    """Switch to one exact conversation URL, path, or ID."""
+    conversation_id = _conversation_id(conversation)
+    target_url = f"https://chatgpt.com/c/{conversation_id}"
+    current = observe_chatgpt_state()
+    if (current.get("url") == target_url and
+            current.get("state") in {"ready_conversation", "generating"}):
+        return current
+    goto_url(target_url)
+    wait_for_load(timeout=25)
+    deadline = time.monotonic() + 25
+    state: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        state = observe_chatgpt_state()
+        if state.get("url") == target_url and state.get("state") in {"ready_conversation", "generating"}:
+            return state
+        wait(0.5)
+    raise RuntimeError(f"postcondition_failed: exact conversation {target_url} did not become readable")
 
 
-def _hover_and_get_options_button(title_fragment: str) -> dict[str, Any]:
-    """Hover the sidebar item and CLICK its '对话选项' (options) button via JS.
-
-    CDP mouse events were observed to time out repeatedly on this page; JS
-    click + synthetic hover events are the stable path. Returns {'found': True}
-    when the options menu is expected to be open.
-    """
-    r = js(r"""
-    (() => {
-      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-      const frag = %r;
-      const matches = [...document.querySelectorAll('a[href*="/c/"]')].filter(x =>
-        x.offsetParent && norm(x.innerText).includes(frag));
-      if (matches.length !== 1) return {found: false, ambiguous: matches.length > 1, count: matches.length};
-      const a = matches[0];
-      // synthetic hover so the trailing options button becomes active
-      for (const type of ['mouseover', 'mouseenter', 'mousemove', 'pointerover']) {
-        a.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true}));
-      }
-      const item = a.closest('li') || a.parentElement;
-      const btn = [...item.querySelectorAll('button')].find(b =>
-        /history-item-\d+-options/i.test(b.getAttribute('data-testid') || ''));
-      if (!btn) return {found: false};
-      btn.click();
-      return {found: true};
-    })()
-    """ % title_fragment)
-    if not r or not r.get("found"):
-        raise RuntimeError(f"options: options button for {title_fragment!r} did not appear on hover")
-    wait(1.2)
-    return r
-
-
-def delete_chat(title_fragment: str, confirm: bool = True) -> None:
-    """Delete a conversation via sidebar options menu (destructive!).
-
-    Requires confirm=True (default) — never auto-delete without the caller
-    explicitly confirming. Deletes ONLY the conversation whose visible title
-    contains title_fragment.
-    """
+def delete_chat(conversation: str, confirm: bool = False) -> dict[str, Any]:
+    """Delete one exact conversation after explicit confirmation."""
     if not confirm:
-        raise RuntimeError("delete_chat: confirm must be True (destructive operation)")
-    opt = _hover_and_get_options_button(title_fragment)
+        raise RuntimeError("precondition: delete_chat requires confirm=True")
+    conversation_id = _conversation_id(conversation)
+    _open_exact_conversation_options(conversation_id)
     dl = js(r"""
     (() => {
       const norm = s => (s || '').replace(/\s+/g, ' ').trim();
@@ -246,7 +297,7 @@ def delete_chat(title_fragment: str, confirm: bool = True) -> None:
     })()
     """)
     if not dl or not dl.get("found"):
-        raise RuntimeError("delete_chat: no 删除 menu item")
+        raise RuntimeError("not_found: delete menu item")
     wait(1.5)
     conf = js(r"""
     (() => {
@@ -257,27 +308,28 @@ def delete_chat(title_fragment: str, confirm: bool = True) -> None:
     })()
     """)
     if not conf or not conf.get("found"):
-        raise RuntimeError("delete_chat: confirmation dialog did not appear")
+        raise RuntimeError("dialog: delete confirmation did not appear")
     wait(3.0)
     gone = js(r"""
     (() => {
-      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-      const frag = %r;
-      return ![...document.querySelectorAll('a[href*="/c/"]')].some(x => norm(x.innerText).includes(frag));
+      const suffix = '/c/' + %r;
+      return ![...document.querySelectorAll('a[href*="/c/"]')].some(x =>
+        x.offsetParent && new URL(x.href, location.href).pathname === suffix);
     })()
-    """ % title_fragment)
+    """ % conversation_id)
     if not gone:
         # sidebar may still be animating; retry once after a longer wait
         wait(2.5)
         gone = js(r"""
         (() => {
-          const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-          const frag = %r;
-          return ![...document.querySelectorAll('a[href*="/c/"]')].some(x => norm(x.innerText).includes(frag));
+          const suffix = '/c/' + %r;
+          return ![...document.querySelectorAll('a[href*="/c/"]')].some(x =>
+            x.offsetParent && new URL(x.href, location.href).pathname === suffix);
         })()
-        """ % title_fragment)
+        """ % conversation_id)
     if not gone:
-        raise RuntimeError(f"delete_chat: {title_fragment!r} still present after delete")
+        raise RuntimeError(f"postcondition_failed: exact conversation /c/{conversation_id} still present after delete")
+    return {"deleted": True, "conversation_id": conversation_id}
 
 
 def _visible_menu_count() -> int:
@@ -308,7 +360,8 @@ def _activate_composer_picker() -> dict[str, Any]:
         return r.width > 0 && r.height > 0 && r.x >= 0 && r.y >= 0 &&
                r.right <= innerWidth && r.bottom <= innerHeight;
       });
-      const el = visible.find(b => b.getAttribute('aria-haspopup') === 'menu' &&
+      const el = visible.find(b => b.getAttribute('data-testid') !== 'composer-plus-btn' &&
+        b.getAttribute('aria-haspopup') === 'menu' &&
         !/添加文件|attach|语音|voice|听写|dictation/i.test(norm((b.innerText || '') + ' ' + (b.getAttribute('aria-label') || '')))) ||
         visible.find(b => /GPT|推理|Reasoning|快速|Fast|极高|High|中|Medium|低|Low/i.test(
           norm((b.innerText || '') + ' ' + (b.getAttribute('aria-label') || ''))));
@@ -462,12 +515,13 @@ def _open_model_choices() -> None:
     r = js(r"""
     (() => {
       const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-      const el = [...document.querySelectorAll('[role="menuitem"][aria-haspopup="menu"], [role="menuitem"][data-has-submenu]')]
+      const el = [...document.querySelectorAll('[role="menuitem"][aria-haspopup="menu"], [role="menuitem"][data-has-submenu], [role="menuitem"]')]
         .find(i => {
           if (!i.offsetParent) return false;
           const t = norm(i.innerText || i.textContent);
+          const aria = norm(i.getAttribute('aria-label') || '');
           const b = i.getBoundingClientRect();
-          return (/^GPT-|^o\d|模型|Model/i.test(t)) && b.width > 0 && b.height > 0 &&
+          return (/^GPT-|^o\d|模型|Model|选择模型|Select model/i.test(t + ' ' + aria)) && b.width > 0 && b.height > 0 &&
                  b.x >= 0 && b.y >= 0 && b.right <= innerWidth && b.bottom <= innerHeight;
         });
       if (!el) return {found: false};
@@ -606,7 +660,9 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
       const r = editor.getBoundingClientRect();
       if (r.width <= 0 || r.height <= 0 || r.x < 0 || r.y < 0 ||
           r.right > innerWidth || r.bottom > innerHeight) return {found: false};
-      const content = (editor.innerText || editor.value || '').trim();
+      const draft = editor.cloneNode(true);
+      draft.querySelectorAll('[data-inline-selection-pill][data-id="plugin:connector_openai_deep_research"], [data-inline-selection-pill-cursor-target]').forEach(el => el.remove());
+      const content = (draft.textContent || draft.value || '').trim();
       editor.focus();
       return {
         found: true,
@@ -632,7 +688,9 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
       const form = document.querySelector('form[data-type="unified-composer"]');
       const send_button = form && [...form.querySelectorAll('button')].find(el => {
         const label = norm(el.getAttribute('aria-label') || '');
-        return (label === '发送提示' || label === 'Send prompt') && el.offsetParent &&
+        const testid = el.getAttribute('data-testid') || '';
+        return (testid === 'send-button' || label === '发送提示词' ||
+                label === '发送提示' || label === 'Send prompt') && el.offsetParent &&
                !el.disabled && el.getAttribute('aria-disabled') !== 'true';
       });
       if (!send_button) return {found: false};
@@ -653,7 +711,9 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
           const form = document.querySelector('form[data-type="unified-composer"]');
           const activate_send_button = form && [...form.querySelectorAll('button')].find(el => {
             const label = norm(el.getAttribute('aria-label') || '');
-            return (label === '发送提示' || label === 'Send prompt') && el.offsetParent &&
+            const testid = el.getAttribute('data-testid') || '';
+            return (testid === 'send-button' || label === '发送提示词' ||
+                    label === '发送提示' || label === 'Send prompt') && el.offsetParent &&
                    !el.disabled && el.getAttribute('aria-disabled') !== 'true';
           });
           if (!activate_send_button) return {found: false, clicked: false};
@@ -686,10 +746,10 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
             "expected_user_message_found": False,
         }
 
-    deadline = time.time() + evidence_timeout
+    deadline = time.monotonic() + evidence_timeout
     latest: dict[str, Any] = {}
     evidence_read_failed = False
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         wait(0.5)
         try:
             latest = js(r"""
@@ -698,6 +758,8 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
               const form = document.querySelector('form[data-type="unified-composer"]');
               const editor = form && (form.querySelector('[contenteditable="true"]') ||
                                       form.querySelector('textarea, [role="textbox"]'));
+              const draft = editor && editor.cloneNode(true);
+              if (draft) draft.querySelectorAll('[data-inline-selection-pill][data-id="plugin:connector_openai_deep_research"], [data-inline-selection-pill-cursor-target]').forEach(el => el.remove());
               const users = [...document.querySelectorAll('[data-message-author-role="user"]')];
               const last_user = users.length ? users[users.length - 1] : null;
               const last_user_message = last_user ? norm(last_user.innerText || last_user.textContent) : '';
@@ -705,7 +767,7 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
               const last_turn_match = last_turn_testid.match(/conversation-turn-(\d+)/);
               return {
                 url: location.href,
-                composer_empty: !!editor && norm(editor.innerText || editor.value) === '',
+                composer_empty: !!draft && norm(draft.textContent || draft.value) === '',
                 user_count: users.length,
                 last_user_message_id: last_user?.getAttribute('data-message-id') || null,
                 last_user_turn: last_turn_match ? Number(last_turn_match[1]) : -1,
@@ -777,146 +839,91 @@ def scroll_conversation(direction: str = "down", amount: int = 600, wait_s: floa
     """)
 
 
-def close_extra_tab(keep_url_fragment: str | None = None) -> int:
-    """Close the most recently opened content tab. Returns remaining tab count.
-
-    If keep_url_fragment is given, never close a tab whose URL contains it.
-    """
-    tabs = [t for t in list_tabs(include_chrome=False) if t["url"] and not t["url"].startswith("chrome://")]
-    if keep_url_fragment:
-        protect = [t for t in tabs if keep_url_fragment in t["url"]]
-        closeable = [t for t in tabs if t not in protect]
-    else:
-        closeable = tabs
-    if not closeable:
-        raise RuntimeError("close_extra_tab: no closeable tabs")
-    target = closeable[-1]
-    close_tab(target["targetId"])
+def close_extra_tab(target_id: str) -> int:
+    """Close one exact task-owned tab, never a tab selected by URL order."""
+    if target_id not in _TASK_OWNED_TABS:
+        raise RuntimeError("destructive_scope_violation: tab is not task-owned")
+    try:
+        owner = tab_owner(target_id)
+    except (NameError, RuntimeError):
+        owner = None
+    owner_name = owner.get("owner") if isinstance(owner, dict) else None
+    if owner_name and owner_name not in {"chatgpt-domain-skill", "chatgpt-domain-skill-live-audit"}:
+        raise RuntimeError("destructive_scope_violation: tab is protected by another owner")
+    close_tab(target_id)
+    _TASK_OWNED_TABS.discard(target_id)
     wait(1.5)
-    return len([t for t in list_tabs(include_chrome=False) if t["url"] and not t["url"].startswith("chrome://")])
+    return len(_TASK_OWNED_TABS)
 
 
-def export_share_link(chat_title_fragment: str | None = None) -> str:
-    """Export the current (or named) conversation as a public share link.
-
-    Primary path: click the header share-chat-button — it copies the
-    conversation-level public link to the clipboard directly (toast: 公开链接
-    已复制到剪贴板; no dialog). Fallback: message-level share button
-    (share-prompt-link-turn-action-button) which yields a message-level
-    /s/p_... link (single message only) for conversations whose header share
-    button is disabled (e.g. workspace conversations).
-
-    Reads the clipboard via `pbpaste`. Returns the chatgpt.com/share/... URL.
-
-    NOTE: the returned link is PUBLIC on the internet once created. The
-    conversation remains shared until the user revokes it in ChatGPT.
-    """
+def export_share_link(conversation: str | None = None) -> dict[str, Any]:
+    """Create or read one conversation-level public share link."""
     import subprocess
-    if chat_title_fragment:
-        switch_chat(chat_title_fragment)
-    wait(1.0)
-    # -- path 1: header share button (conversation-level link) --
-    r = js(r"""
-    (() => {
-      const b = [...document.querySelectorAll('button')].find(x => x.getAttribute('data-testid') === 'share-chat-button');
-      if (!b || b.disabled) return {found: false};
-      const r = b.getBoundingClientRect();
-      return {found: true, x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2)};
-    })()
-    """)
-    if r.get("found"):
-        cdp("Input.dispatchMouseEvent", type="mouseMoved", x=r["x"], y=r["y"])
-        wait(0.4)
-        cdp("Input.dispatchMouseEvent", type="mousePressed", x=r["x"], y=r["y"], button="left", clickCount=1)
-        wait(0.15)
-        cdp("Input.dispatchMouseEvent", type="mouseReleased", x=r["x"], y=r["y"], button="left", clickCount=1)
-        wait(1.5)
-        link = subprocess.run(["pbpaste"], capture_output=True, text=True).stdout.strip()
-        if link.startswith("https://chatgpt.com/share/"):
-            return link
-
-    # -- path 2: message-level share button (hover + click) --
-    r = js(r"""
-    (() => {
-      const btns = [...document.querySelectorAll('button[data-testid="share-prompt-link-turn-action-button"]')].filter(b => {
-        const r = b.getBoundingClientRect();
-        return r.width > 0 && r.y > 0 && r.y < innerHeight;
-      });
-      if (!btns.length) return {found: false};
-      const b = btns[0];
-      const r = b.getBoundingClientRect();
-      return {found: true, x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2)};
-    })()
-    """)
-    if not r or not r.get("found"):
-        # message action buttons only appear on hover — hover the last visible message
-        h = js(r"""
-        (() => {
-          const msgs = [...document.querySelectorAll('[data-message-author-role]')].filter(m => {
-            const r = m.getBoundingClientRect();
-            return r.width > 0 && r.y > 0 && r.y < innerHeight * 0.7;
-          });
-          if (!msgs.length) return {found: false};
-          const m = msgs[msgs.length - 1];
-          const r = m.getBoundingClientRect();
-          return {found: true, x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2)};
-        })()
-        """)
-        if not h or not h.get("found"):
-            raise RuntimeError("export_share_link: no visible share button (header disabled, no message buttons)")
-        cdp("Input.dispatchMouseEvent", type="mouseMoved", x=h["x"], y=h["y"])
-        wait(0.8)
-        r = js(r"""
-        (() => {
-          const btns = [...document.querySelectorAll('button[data-testid="share-prompt-link-turn-action-button"]')].filter(b => {
-            const r = b.getBoundingClientRect();
-            return r.width > 0 && r.y > 0 && r.y < innerHeight;
-          });
-          if (!btns.length) return {found: false};
-          const b = btns[0];
-          const r = b.getBoundingClientRect();
-          return {found: true, x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2)};
-        })()
-        """)
-    if not r or not r.get("found"):
-        raise RuntimeError("export_share_link: no visible share button")
-    cdp("Input.dispatchMouseEvent", type="mouseMoved", x=r["x"], y=r["y"])
-    wait(0.3)
-    cdp("Input.dispatchMouseEvent", type="mousePressed", x=r["x"], y=r["y"], button="left", clickCount=1)
-    wait(0.2)
-    cdp("Input.dispatchMouseEvent", type="mouseReleased", x=r["x"], y=r["y"], button="left", clickCount=1)
-    wait(2.0)
-    # dialog: 分享提示 with 复制链接 button
-    cp = js(r"""
-    (() => {
-      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-      const els = [...document.querySelectorAll('button, [role="button"]')].filter(el => {
-        const t = norm(el.innerText || el.textContent);
-        return (t === '复制链接' || t === 'Copy link') && el.offsetParent;
-      });
-      if (!els.length) return {found: false};
-      const b = els[0].getBoundingClientRect();
-      return {found: true, x: Math.round(b.x + b.width / 2), y: Math.round(b.y + b.height / 2)};
-    })()
-    """)
-    if not cp or not cp.get("found"):
-        raise RuntimeError("export_share_link: share dialog with 复制链接 did not appear")
-    cdp("Input.dispatchMouseEvent", type="mouseMoved", x=cp["x"], y=cp["y"])
-    wait(0.3)
-    cdp("Input.dispatchMouseEvent", type="mousePressed", x=cp["x"], y=cp["y"], button="left", clickCount=1)
-    wait(0.2)
-    cdp("Input.dispatchMouseEvent", type="mouseReleased", x=cp["x"], y=cp["y"], button="left", clickCount=1)
-    wait(2.0)
-    link = subprocess.run(["pbpaste"], capture_output=True, text=True).stdout.strip()
-    if not (link.startswith("https://chatgpt.com/share/") or link.startswith("https://chatgpt.com/s/")):
-        raise RuntimeError(f"export_share_link: clipboard does not contain a share link: {link[:60]!r}")
-    # close the dialog
-    press_key("Escape")
+    if conversation is None:
+        current = observe_chatgpt_state()
+        if current.get("state") not in {"ready_conversation", "generating"}:
+            raise RuntimeError("precondition: current exact conversation is required")
+        conversation_id = current["conversation_id"]
+    else:
+        conversation_id = _conversation_id(conversation)
+        current = switch_chat(conversation_id)
+    target_url = f"https://chatgpt.com/c/{conversation_id}"
+    if current.get("url") != target_url:
+        raise RuntimeError("postcondition_failed: share target conversation is not exact")
+    cached = _SHARE_RESULTS.get(conversation_id)
+    if cached:
+        return {**cached, "created": False}
     wait(0.5)
-    return link
+    previous_clipboard = subprocess.run(["pbpaste"], capture_output=True, text=True).stdout.strip()
+    r = js(r"""
+    (() => {
+      const b = [...document.querySelectorAll('button[data-testid="share-chat-button"]')]
+        .find(x => x.offsetParent && !x.disabled);
+      if (!b) return {found: false};
+      const r = b.getBoundingClientRect();
+      return {found: true, x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2)};
+    })()
+    """)
+    if not r or not r.get("found"):
+        raise RuntimeError("not_found: conversation-level share button")
+    # Persist uncertainty before activation: even a failed evidence read must not replay it.
+    _SHARE_RESULTS[conversation_id] = {
+        "status": "unknown", "reason": "share_result_unknown", "url": None,
+        "created": False, "conversation_id": conversation_id,
+    }
+    try:
+        click_at_xy(r["x"], r["y"])
+    except Exception:
+        result = {"status": "unknown", "reason": "share_activation_exception", "url": None,
+                  "created": False, "conversation_id": conversation_id}
+        _SHARE_RESULTS[conversation_id] = result
+        return result
+    deadline = time.monotonic() + 8
+    link = ""
+    confirmed = False
+    while time.monotonic() < deadline:
+        wait(0.5)
+        confirmed = bool(js(r"""
+        (() => {
+          const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+          return [...document.querySelectorAll('[role="status"], [role="alert"]')].some(el =>
+            el.offsetParent && /公开链接.*复制|链接已复制|link copied/i.test(norm(el.innerText || el.textContent)));
+        })()
+        """) or False)
+        link = subprocess.run(["pbpaste"], capture_output=True, text=True).stdout.strip()
+        if link.startswith("https://chatgpt.com/share/") and (confirmed or link != previous_clipboard):
+            break
+    if not link.startswith("https://chatgpt.com/share/") or not (confirmed or link != previous_clipboard):
+        result = {"status": "unknown", "reason": "share_result_unknown", "url": None,
+                  "created": False, "conversation_id": conversation_id}
+        _SHARE_RESULTS[conversation_id] = result
+        return result
+    result = {"status": "success", "url": link, "created": True, "conversation_id": conversation_id}
+    _SHARE_RESULTS[conversation_id] = result
+    return result
 
 
-def read_shared_conversation(url: str, close_after: bool = True) -> str:
+def read_shared_conversation(url: str, close_after: bool = True) -> dict[str, Any]:
     """Open a chatgpt.com/share/... or chatgpt.com/s/... link in a new tab and
     return the visible conversation text. Closes the tab when close_after.
 
@@ -926,25 +933,94 @@ def read_shared_conversation(url: str, close_after: bool = True) -> str:
     agent-browser-operations references/chatgpt-shared-extraction.md for the
     extraction fallback.
     """
-    new_tab(url)
-    wait(3.5)
-    body = js(r"""
-    (() => {
-      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-      const t = norm(document.body.innerText || document.body.textContent);
-      const idx = t.indexOf('这是已分享的 ChatGPT 对话副本');
-      return {url: location.href, title: document.title, body: (idx >= 0 ? t.slice(idx) : t)};
-    })()
-    """)
-    if close_after:
-        share_key = url.split("/")[-1]
-        for t in list_tabs(include_chrome=False):
-            if share_key in t["url"] or "/share/" in t["url"] or "/s/" in t["url"]:
-                if t["url"].startswith("https://chatgpt.com") and not t["url"].startswith("https://chatgpt.com/c/"):
-                    close_tab(t["targetId"])
-                    break
-        wait(1.0)
-    return body.get("body", "") or ""
+    parsed = urlparse(url)
+    if (parsed.scheme != "https" or parsed.hostname != "chatgpt.com" or
+            not (parsed.path.startswith("/share/") or parsed.path.startswith("/s/"))):
+        raise RuntimeError("precondition: official ChatGPT share URL is required")
+    target_id = new_tab(url)
+    _TASK_OWNED_TABS.add(target_id)
+    try:
+        try:
+            page_info()
+        except Exception:
+            pass
+        wait_for_load(timeout=20)
+        deadline = time.monotonic() + 20
+        records: dict[str, dict[str, Any]] = {}
+        body: dict[str, Any] = {}
+        direction = "up"
+        boundary_reads = 0
+        previous_signature = None
+        while time.monotonic() < deadline:
+            body = js(r"""
+            (() => {
+              const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+              const visible = el => !!(el.offsetParent && el.getBoundingClientRect().width > 0);
+              const toggles = [...document.querySelectorAll('button[data-testid="collapsible-user-message-toggle"]')]
+                .filter(el => visible(el) && norm(el.innerText || el.textContent) === '展开');
+              toggles.forEach(el => el.click());
+              const turns = [...document.querySelectorAll('[data-message-author-role]')].filter(visible).map(el => ({
+                role: el.getAttribute('data-message-author-role'),
+                id: el.getAttribute('data-message-id'),
+                turn: el.closest('[data-testid^="conversation-turn-"]')?.getAttribute('data-testid') || '',
+                text: norm(el.innerText || el.textContent)
+              })).filter(x => x.text);
+              const candidates = [document.scrollingElement, ...document.querySelectorAll('div')].filter(el =>
+                el && el.scrollHeight > el.clientHeight + 50 &&
+                ['auto', 'scroll'].includes(getComputedStyle(el).overflowY));
+              candidates.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+              const scroller = candidates[0];
+              if (scroller && !scroller.hasAttribute('tabindex')) scroller.setAttribute('tabindex', '-1');
+              if (scroller) scroller.focus({preventScroll: true});
+              const t = norm(document.body && (document.body.innerText || document.body.textContent));
+              return {url: location.href, body: t, turns,
+                      message_count: turns.length,
+                      scroll: scroller ? {found: true, top: scroller.scrollTop,
+                        height: scroller.scrollHeight, client: scroller.clientHeight} : {found: false}};
+            })()
+            """) or {}
+            if body.get("url") != url:
+                raise RuntimeError("postcondition_failed: share page changed URL")
+            turns = body.get("turns") or []
+            if direction == "down":
+                for turn in turns:
+                    key = turn.get("turn") or turn.get("id")
+                    if not key:
+                        raise RuntimeError("postcondition_failed: share turn has no stable identity")
+                    if len(turn.get("text", "")) >= len(records.get(key, {}).get("text", "")):
+                        records[key] = turn
+            if body.get("message_count", 0) > 0:
+                scroll = body.get("scroll") or {}
+                at_boundary = not scroll.get("found") or (
+                    scroll.get("top", 0) <= 1 if direction == "up" else
+                    scroll.get("top", 0) + scroll.get("client", 0) >= scroll.get("height", 0) - 1
+                )
+                signature = [(t.get("turn"), t.get("id"), t.get("text")) for t in turns]
+                boundary_reads = boundary_reads + 1 if at_boundary and signature == previous_signature else 0
+                previous_signature = signature
+                if boundary_reads >= 2:
+                    if direction == "down":
+                        break
+                    direction = "down"
+                    boundary_reads = 0
+                    previous_signature = None
+                    continue
+                if not at_boundary:
+                    press_key("PageUp" if direction == "up" else "PageDown")
+                wait(0.6)
+            else:
+                wait(0.5)
+        else:
+            raise RuntimeError("timeout: share conversation boundaries not verified")
+        if not records:
+            raise RuntimeError("postcondition_failed: share page has no readable turns")
+        text = "\n".join(f"[{turn.get('role')}] {turn.get('text')}" for turn in records.values())
+        return {"target_id": target_id, "url": body.get("url", ""), "text": text}
+    finally:
+        if close_after:
+            close_tab(target_id)
+            _TASK_OWNED_TABS.discard(target_id)
+            wait(1.0)
 
 
 def conversation_text(limit: int = 4000) -> str:
@@ -961,6 +1037,309 @@ def conversation_text(limit: int = 4000) -> str:
       return parts.slice(-20).join('\n').slice(-%d);
     })()
     """ % (limit, limit))
+
+
+def conversation_turns(limit_per_turn: int = 100_000) -> list[dict[str, Any]]:
+    """Read the currently rendered text turns with stable identities."""
+    if limit_per_turn < 1:
+        raise ValueError("conversation_turns: limit_per_turn must be at least 1")
+    return js(r"""
+    (() => {
+      const norm = s => (s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+      return [...document.querySelectorAll(
+        '[data-message-author-role="user"], [data-message-author-role="assistant"]'
+      )].filter(el => el.offsetParent).map(el => {
+        const clone = el.cloneNode(true);
+        const omitted = !!clone.querySelector(
+          'img, video, audio, [data-testid*="file"], [data-writing-block-fullscreen-editor], .writing-block-editor'
+        );
+        clone.querySelectorAll(
+          'button, [role="button"], svg, input, textarea, [aria-hidden="true"], [data-inline-selection-pill]'
+        ).forEach(node => node.remove());
+        const text = norm(clone.textContent);
+        const turn = el.closest('[data-testid^="conversation-turn-"]')?.getAttribute('data-testid') || '';
+        const id = el.getAttribute('data-message-id') || turn || null;
+        return {
+          role: el.getAttribute('data-message-author-role'),
+          id,
+          turn,
+          text: text.slice(0, %d),
+          truncated: text.length > %d,
+          non_text_omitted: omitted
+        };
+      }).filter(turn => turn.text);
+    })()
+    """ % (limit_per_turn, limit_per_turn)) or []
+
+
+def _conversation_api_page(
+    conversation_id: str,
+    before: str | None = None,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """Read one authorized conversation page without exposing auth headers."""
+    target_id = new_tab("about:blank")
+    _TASK_OWNED_TABS.add(target_id)
+    payload = None
+    status = None
+    try:
+        cdp("Fetch.enable", patterns=[
+            {"urlPattern": "*backend-api/conversations/*", "requestStage": "Request"},
+            {"urlPattern": "*backend-api/conversations/*", "requestStage": "Response"},
+        ])
+        goto_url(f"https://chatgpt.com/c/{conversation_id}")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and payload is None:
+            for event in drain_events():
+                if event.get("method") != "Fetch.requestPaused":
+                    continue
+                params = event["params"]
+                request_id = params["requestId"]
+                request_url = params["request"]["url"]
+                target_request = f"/backend-api/conversations/{conversation_id}" in request_url
+                if params.get("responseStatusCode") is None:
+                    if target_request:
+                        endpoint = f"https://chatgpt.com/backend-api/conversations/{conversation_id}"
+                        request_url = (
+                            f"{endpoint}/messages?before={before}&include_has_versions=true&num_turns=100"
+                            if before else f"{endpoint}?include_has_versions=true&num_turns=100"
+                        )
+                    cdp("Fetch.continueRequest", requestId=request_id, url=request_url)
+                    continue
+                if target_request:
+                    response = cdp("Fetch.getResponseBody", requestId=request_id)
+                    body = response["body"]
+                    if response.get("base64Encoded"):
+                        body = base64.b64decode(body).decode("utf-8")
+                    payload = json.loads(body)
+                    status = params["responseStatusCode"]
+                cdp("Fetch.continueRequest", requestId=request_id)
+            wait(0.1)
+        if status != 200 or not isinstance(payload, dict):
+            raise RuntimeError(f"incomplete_extraction: conversation page request failed ({status})")
+        if not isinstance(payload.get("messages"), list) or not isinstance(payload.get("page_info"), dict):
+            raise RuntimeError("incomplete_extraction: unexpected conversation page response")
+        return payload
+    finally:
+        try:
+            cdp("Fetch.disable")
+        except Exception:
+            pass
+        close_tab(target_id)
+        _TASK_OWNED_TABS.discard(target_id)
+
+
+def _api_message_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only visible user and final-assistant text from an API page."""
+    turns = []
+    for message in messages:
+        role = (message.get("author") or {}).get("role")
+        content = message.get("content") or {}
+        metadata = message.get("metadata") or {}
+        if (role not in {"user", "assistant"} or
+                content.get("content_type") not in {"text", "multimodal_text"} or
+                metadata.get("is_visually_hidden_from_conversation") is True or
+                message.get("recipient") not in {None, "all"} or
+                (role == "assistant" and message.get("channel") not in {None, "final"})):
+            continue
+        text_parts = []
+        omitted = False
+        for part in content.get("parts") or []:
+            if isinstance(part, str):
+                text_parts.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                text_parts.append(part["text"])
+            else:
+                omitted = True
+        text = "\n".join(text_parts).strip()
+        if text:
+            turns.append({
+                "id": message.get("id"),
+                "role": role,
+                "text": text,
+                "non_text_omitted": omitted,
+            })
+    return turns
+
+
+def full_conversation(max_pages: int = 120, wait_s: float = 0.8) -> dict[str, Any]:
+    """Read all authorized text pages until the server proves history start."""
+    if not isinstance(max_pages, int) or max_pages < 1:
+        raise ValueError("full_conversation: max_pages must be at least 1")
+    state = observe_chatgpt_state()
+    if state.get("state") != "ready_conversation":
+        raise RuntimeError("precondition: a complete, idle canonical conversation is required")
+    original_tab = current_tab()
+    original_target = original_tab.get("targetId") or original_tab.get("target_id")
+    conversation_id = state["conversation_id"]
+    before = None
+    accumulated: list[dict[str, Any]] = []
+    seen_cursors = set()
+    complete = False
+    pages = 0
+    try:
+        while pages < max_pages:
+            payload = _conversation_api_page(conversation_id, before)
+            page = _api_message_turns(payload["messages"])
+            page_ids = {turn["id"] for turn in page}
+            accumulated = page + [turn for turn in accumulated if turn["id"] not in page_ids]
+            pages += 1
+            page_info = payload["page_info"]
+            if not page_info.get("has_previous_page"):
+                complete = True
+                break
+            before = page_info.get("start_cursor")
+            if not before or before in seen_cursors:
+                break
+            seen_cursors.add(before)
+    finally:
+        if original_target:
+            switch_tab(original_target)
+    if not complete or not accumulated:
+        raise RuntimeError("incomplete_extraction: server history boundary was not verified")
+
+    final_state = observe_chatgpt_state()
+    if (final_state.get("state") != "ready_conversation" or
+            final_state.get("conversation_id") != state.get("conversation_id")):
+        raise RuntimeError("incomplete_extraction: conversation identity changed while reading")
+    return {
+        "status": "complete",
+        "url": final_state["url"],
+        "conversation_id": final_state["conversation_id"],
+        "pages": pages,
+        "turns": accumulated,
+        "source": "authorized_browser_response_pages",
+    }
+
+
+def find_conversation_by_title(title: str, timeout: float = 12.0) -> str:
+    """Return the canonical URL for one exact visible or searched title."""
+    title = _norm(title)
+    if not title:
+        raise ValueError("find_conversation_by_title: title must not be empty")
+
+    def matches() -> list[str]:
+        return js(r"""
+        (() => {
+          const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+          const title = %r;
+          const scope = document.querySelector('[role="dialog"]');
+          if (!scope) return [];
+          return [...scope.querySelectorAll('a[href*="/c/"]')].filter(a => {
+            if (!a.offsetParent) return false;
+            const firstLine = (a.innerText || a.textContent || '').split('\n').map(norm).find(Boolean) || '';
+            return firstLine === title;
+          }).map(a => new URL(a.href, location.href).pathname);
+        })()
+        """ % title) or []
+
+    opened = js(r"""
+    (() => {
+      const input = [...document.querySelectorAll('input')].find(el =>
+        el.offsetParent && /搜索|search/i.test(el.getAttribute('placeholder') || el.getAttribute('aria-label') || ''));
+      if (input) return true;
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+      const button = [...document.querySelectorAll('button')].find(el => {
+        const label = norm((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''));
+        return el.offsetParent && /^(搜索|Search|Search chats)$/.test(label);
+      });
+      if (!button) return false;
+      button.click();
+      return true;
+    })()
+    """)
+    if not opened:
+        raise RuntimeError("not_found: conversation search control")
+    deadline = time.monotonic() + timeout
+    typed = False
+    found: list[str] = []
+    previous_found: list[str] | None = None
+    stable_reads = 0
+    settled = False
+    while time.monotonic() < deadline:
+        if not typed:
+            typed = bool(js(r"""
+            (() => {
+              const title = %r;
+              const input = [...document.querySelectorAll('input')].find(el =>
+                el.offsetParent && /搜索|search/i.test(el.getAttribute('placeholder') || el.getAttribute('aria-label') || ''));
+              if (!input) return false;
+              const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+              setter.call(input, title);
+              input.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: title}));
+              return true;
+            })()
+            """ % title))
+        if typed:
+            found = matches()
+            if found:
+                stable_reads = stable_reads + 1 if found == previous_found else 1
+                previous_found = found
+                if stable_reads >= 3:
+                    settled = True
+                    break
+        wait(0.4)
+
+    unique = list(dict.fromkeys(found))
+    if not unique:
+        raise RuntimeError(f"conversation_unavailable: no exact title {title!r}")
+    if not settled:
+        raise RuntimeError(f"conversation_unavailable: title results did not stabilize for {title!r}")
+    if len(unique) != 1:
+        raise RuntimeError(f"ambiguous_conversation: {len(unique)} exact title matches for {title!r}")
+    conversation_id = _conversation_id(unique[0])
+    return f"https://chatgpt.com/c/{conversation_id}"
+
+
+def prepare_conversation_analysis(
+    conversation: str | None,
+    instruction: str,
+    max_pages: int = 120,
+) -> dict[str, Any]:
+    """Return a transient, complete transcript package for the calling Agent."""
+    instruction = _norm(instruction)
+    if not instruction:
+        raise ValueError("prepare_conversation_analysis: instruction must not be empty")
+
+    locator = _norm(conversation) if conversation is not None else "current"
+    if locator.lower() == "current":
+        state = observe_chatgpt_state()
+        if state.get("state") != "ready_conversation":
+            raise RuntimeError("conversation_unavailable: current page is not an idle canonical conversation")
+        acquisition_path = "current_conversation"
+    elif locator.lower().startswith("title:"):
+        switch_chat(find_conversation_by_title(locator.split(":", 1)[1]))
+        acquisition_path = "exact_title_search"
+    else:
+        try:
+            switch_chat(locator)
+            acquisition_path = "exact_url_or_id"
+        except RuntimeError as exc:
+            if "exact conversation URL or ID" not in str(exc):
+                raise
+            switch_chat(find_conversation_by_title(locator))
+            acquisition_path = "exact_title_search"
+
+    transcript = full_conversation(max_pages=max_pages)
+    turns = transcript["turns"]
+    warnings = []
+    omitted = sum(bool(turn.get("non_text_omitted")) for turn in turns)
+    if omitted:
+        warnings.append(f"{omitted} message(s) contained non-text content omitted from text extraction")
+    return {
+        "status": "ready_for_agent_analysis",
+        "instruction": instruction,
+        "conversation_id": transcript["conversation_id"],
+        "conversation_url": transcript["url"],
+        "locator_path": acquisition_path,
+        "acquisition_path": transcript.get("source", "rendered_conversation"),
+        "completeness": "complete",
+        "page_count": transcript["pages"],
+        "user_message_count": sum(turn["role"] == "user" for turn in turns),
+        "assistant_message_count": sum(turn["role"] == "assistant" for turn in turns),
+        "messages": turns,
+        "warnings": warnings,
+    }
 
 
 def _conversation_scroll_state() -> dict[str, Any]:
@@ -1039,7 +1418,7 @@ def _conversation_id(conversation: str) -> str:
     if (parsed.scheme == "https" and parsed.hostname == "chatgpt.com" and
             not parsed.query and not parsed.fragment and url_match):
         return url_match.group(1)
-    raise RuntimeError("rename_chat: exact conversation URL or ID is required; title fragments are unsafe")
+    raise RuntimeError("precondition: exact conversation URL or ID is required; title fragments are unsafe")
 
 
 def _open_exact_conversation_options(conversation_id: str) -> None:
@@ -1080,7 +1459,7 @@ def _open_exact_conversation_options(conversation_id: str) -> None:
         r = _query()
     if not r or not r.get("found"):
         raise RuntimeError(
-            f"rename_chat: exact sidebar row /c/{conversation_id} or its options button "
+            f"not_found: exact sidebar row /c/{conversation_id} or its options button "
             f"was not found (after {reloads} reload{'' if reloads == 1 else 's'})"
         )
     wait(1.2)
@@ -1257,55 +1636,99 @@ def expand_all_user_messages() -> int:
     return n
 
 
-def send_and_wait(text: str, timeout: int = 180) -> str:
-    """Send a message and wait until ChatGPT finishes replying.
-
-    Polls every 2s: generation is done when the composer's send button
-    (aria-label 发送提示) is visible again AND the last assistant message text
-    has been stable for 2 consecutive polls. Returns the last assistant
-    message text (truncated to 4000 chars).
-    """
+def send_and_wait(text: str, timeout: int = 180) -> dict[str, Any]:
+    """Send once, then wait for a new stable assistant turn."""
+    before = js(r"""
+    (() => {
+      const msgs = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+      return {
+        assistant_count: msgs.length,
+        assistant_message_ids: msgs.map(el => el.getAttribute('data-message-id')).filter(Boolean)
+      };
+    })()
+    """) or {}
     send_evidence = send_message(text)
     if send_evidence.get("status") != "definitely_sent":
         raise RuntimeError(
             f"send_and_wait: send status unknown at {send_evidence.get('url')}; do not retry automatically"
         )
-    last_txt = ""
+    before_ids = set(before.get("assistant_message_ids") or [])
+    before_count = int(before.get("assistant_count", 0))
+    last_txt = None
     stable = 0
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    saw_new_assistant = False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         wait(2.0)
         state = js(r"""
         (() => {
           const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-          const send_btn = [...document.querySelectorAll('button')].some(el =>
-            norm(el.getAttribute('aria-label') || '') === '发送提示' ||
-            norm(el.getAttribute('aria-label') || '') === 'Send prompt');
+          const send_btn = [...document.querySelectorAll('button')].some(el => {
+            const label = norm(el.getAttribute('aria-label') || '');
+            return el.getAttribute('data-testid') === 'send-button' ||
+              label === '发送提示词' || label === '发送提示' || label === 'Send prompt';
+          });
           const msgs = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
-          const last = msgs.length ? norm(msgs[msgs.length - 1].innerText || '') : '';
-          return {send_btn: send_btn, last_len: last.length, last_tail: last.slice(-120)};
+          const last = msgs.length ? msgs[msgs.length - 1] : null;
+          const last_text = last ? norm(last.innerText || '') : '';
+          const last_id = last?.getAttribute('data-message-id') || null;
+          const form = document.querySelector('form[data-type="unified-composer"]');
+          const editor = form && (form.querySelector('[contenteditable="true"]') ||
+                                  form.querySelector('textarea, [role="textbox"]'));
+          const draft = editor && editor.cloneNode(true);
+          if (draft) draft.querySelectorAll('[data-inline-selection-pill][data-id="plugin:connector_openai_deep_research"], [data-inline-selection-pill-cursor-target]').forEach(el => el.remove());
+          const controls = [...document.querySelectorAll('button, [role="status"]')]
+            .filter(el => el.offsetParent).map(el => norm(el.innerText || el.textContent || el.getAttribute('aria-label')));
+          const generating = !!(form && [...form.querySelectorAll('[data-testid="stop-button"]')].some(el => el.offsetParent)) ||
+            controls.some(t => /停止回答|停止生成|停止研究|正在生成|正在研究|stop generating|stop streaming/i.test(t));
+          return {
+            url: location.href,
+            send_btn,
+            generating,
+            assistant_count: msgs.length,
+            assistant_message_id: last_id,
+            composer_empty: !!draft && !norm(draft.textContent || draft.value),
+            last_len: last_text.length,
+            last_tail: last_text.slice(-120)
+          };
         })()
-        """)
-        txt = state.get("last_tail", "")
-        if state.get("send_btn") and state.get("last_len", 0) > 0:
+        """) or {}
+        state["new_assistant"] = bool(
+            (state.get("assistant_message_id") and state["assistant_message_id"] not in before_ids) or
+            state.get("assistant_count", 0) > before_count
+        )
+        saw_new_assistant = saw_new_assistant or bool(state.get("new_assistant"))
+        txt = (state.get("assistant_message_id"), state.get("last_len"), state.get("last_tail"))
+        if state.get("url") == send_evidence.get("url") and state.get("composer_empty") and not state.get("generating") and state.get("new_assistant") and state.get("last_len", 0) > 0:
             if txt == last_txt:
                 stable += 1
                 if stable >= 2:
-                    return js(r"""
+                    final_text = js(r"""
                     (() => {
                       const norm = s => (s || '').replace(/\s+/g, ' ').trim();
                       const msgs = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
                       const last = msgs.length ? msgs[msgs.length - 1] : null;
-                      return last ? norm(last.innerText || '').slice(0, 4000) : '';
+                      return last ? {
+                        text: norm(last.innerText || ''),
+                        message_id: last.getAttribute('data-message-id') || null
+                      } : null;
                     })()
-                    """)
+                    """) or {}
+                    if (final_text.get("text") and final_text.get("message_id") == state.get("assistant_message_id")
+                            and len(final_text["text"]) == state.get("last_len")
+                            and final_text["text"][-120:] == state.get("last_tail")):
+                        return {"status": "done", "text": final_text["text"],
+                                "message_id": final_text.get("message_id"),
+                                "url": state.get("url", "")}
             else:
                 stable = 1
             last_txt = txt
         else:
             stable = 0
-            last_txt = ""
-    raise RuntimeError(f"send_and_wait: reply not finished within {timeout}s")
+            last_txt = None
+    if not saw_new_assistant:
+        raise RuntimeError("postcondition_failed: no new assistant turn observed")
+    raise RuntimeError(f"timeout: reply not finished within {timeout}s")
 
 
 def switch_header_tab(tab: str) -> str:
@@ -1318,7 +1741,10 @@ def switch_header_tab(tab: str) -> str:
     NOTE: named switch_header_tab on purpose — browser-harness already exports
     a `switch_tab` helper for switching browser tabs; this would shadow it.
     """
-    target = '聊天' if tab.strip().lower() in ('聊天', 'chat') else '工作'
+    normalized = tab.strip().lower()
+    if normalized not in {'聊天', 'chat', '工作', 'work'}:
+        raise RuntimeError("precondition: header tab must be chat/聊天 or work/工作")
+    target = '聊天' if normalized in ('聊天', 'chat') else '工作'
     r = js(r"""
     (() => {
       const norm = s => (s || '').replace(/\s+/g, ' ').trim();

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import argparse
 import sys
 from pathlib import Path
 
@@ -13,6 +14,10 @@ DEFAULT_LINK = Path.home() / ".config" / "browser-harness" / "agent-workspace" /
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--runtime-workspace", type=Path,
+                        help="Explicit BH_AGENT_WORKSPACE used by the checkout launcher")
+    args = parser.parse_args()
     errors: list[str] = []
     try:
         data = json.loads(REGISTRY.read_text(encoding="utf-8"))
@@ -44,17 +49,20 @@ def main() -> int:
             if not isinstance(pattern, str) or "." not in pattern or "/" in pattern:
                 errors.append(f"{skill}: invalid host pattern {pattern!r}")
 
-    if not DEFAULT_LINK.is_symlink():
+    runtime_root = args.runtime_workspace / "domain-skills" if args.runtime_workspace else DEFAULT_LINK
+    if args.runtime_workspace and not runtime_root.is_dir():
+        errors.append(f"explicit runtime domain-skills directory missing: {runtime_root}")
+    elif not args.runtime_workspace and not DEFAULT_LINK.is_symlink():
         errors.append(f"default runtime path is not a symlink: {DEFAULT_LINK}")
-    elif DEFAULT_LINK.resolve() != ROOT.resolve():
-        errors.append(f"default runtime path targets {DEFAULT_LINK.resolve()}, expected {ROOT.resolve()}")
+    elif runtime_root.resolve() != ROOT.resolve():
+        errors.append(f"runtime path targets {runtime_root.resolve()}, expected {ROOT.resolve()}")
 
     if errors:
         for error in errors:
             print(f"FAIL {error}")
         return 1
 
-    print(f"PASS registry={len(registered)} skills; runtime_link={DEFAULT_LINK.resolve()}")
+    print(f"PASS registry={len(registered)} skills; runtime_root={runtime_root.resolve()}")
     return 0
 
 

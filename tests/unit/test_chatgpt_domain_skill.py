@@ -21,6 +21,9 @@ def load_ops(js_impl, *, click_impl=None, type_impl=None, press_impl=None, goto_
         "goto_url": goto_impl or (lambda url: None),
         "cdp": lambda *args, **kwargs: None,
         "list_tabs": lambda include_chrome=True: [],
+        "current_tab": lambda: {"targetId": "current-target"},
+        "activate_tab": lambda target=None: None,
+        "drain_events": lambda: [],
         "switch_tab": lambda target: None,
         "close_tab": lambda target=None: None,
         "capture_screenshot": lambda *args, **kwargs: None,
@@ -61,7 +64,7 @@ def test_new_chat_rejects_different_existing_conversation_with_empty_composer():
         if script == "location.href":
             return old_url
         if "const links" in script:
-            return {"found": True, "clicked": True}
+            return {"found": True, "x": 10, "y": 20}
         if "form[data-type=\"unified-composer\"]" in script:
             return {
                 "url": different_old_url,
@@ -71,7 +74,7 @@ def test_new_chat_rejects_different_existing_conversation_with_empty_composer():
             }
         raise AssertionError(f"unexpected JS: {script[:100]}")
 
-    ops = load_ops(fake_js)
+    ops = load_ops(fake_js, click_impl=lambda x, y: clicks.append((x, y)))
 
     with pytest.raises(RuntimeError, match="fresh home"):
         ops["new_chat"]()
@@ -601,6 +604,7 @@ def test_send_message_returns_unknown_when_post_send_evidence_keeps_raising():
 
 def test_send_message_rejects_nonempty_composer_before_typing_or_clicking():
     typed = []
+    js_calls = []
     clicks = []
     ops = load_ops(
         lambda script: {"found": True, "empty": False, "url": "https://chatgpt.com/", "user_count": 0},
@@ -795,3 +799,267 @@ def test_read_markdown_block_summary_returns_the_full_editor_text():
     ops = load_ops(fake_js)
 
     assert ops["read_markdown_block_summary"]() == full_markdown
+
+
+def test_observe_chatgpt_state_exposes_the_shared_state_contract():
+    def fake_js(script):
+        assert "composer_visible" in script
+        return {
+            "url": "https://chatgpt.com/",
+            "conversation_id": None,
+            "composer_visible": True,
+            "composer_empty": True,
+            "generating": False,
+            "auth_required": False,
+            "paywall_or_quota": False,
+            "dialog": False,
+        }
+
+    ops = load_ops(fake_js)
+    state = ops["observe_chatgpt_state"]()
+
+    assert state["state"] == "ready_home"
+    assert state["url"] == "https://chatgpt.com/"
+    assert state["composer_empty"] is True
+
+
+@pytest.mark.parametrize(
+    ("raw_state", "expected"),
+    [
+        ({"url": "https://chatgpt.com/c/abcdefgh", "composer_visible": True, "composer_empty": True, "generating": True}, "generating"),
+        ({"url": "https://chatgpt.com/", "auth_required": True}, "auth_required"),
+        ({"url": "https://chatgpt.com/", "paywall_or_quota": True}, "paywall_or_quota"),
+        ({"url": "https://chatgpt.com/", "dialog": True}, "dialog"),
+        ({"url": "https://chatgpt.com/c/abcdefgh", "composer_visible": True, "composer_empty": True}, "ready_conversation"),
+        ({"url": "https://chatgpt.com/c/WEB:temporary-id", "composer_visible": True, "composer_empty": True}, "unknown"),
+    ],
+)
+def test_observe_chatgpt_state_classifies_each_stable_state(raw_state, expected):
+    ops = load_ops(lambda script: raw_state)
+    assert ops["observe_chatgpt_state"]()["state"] == expected
+
+
+def test_switch_chat_rejects_title_fragments_before_touching_browser():
+    touched = []
+    ops = load_ops(lambda script: touched.append(script))
+
+    with pytest.raises(RuntimeError, match="exact conversation URL or ID"):
+        ops["switch_chat"]("English Review")
+    assert touched == []
+
+
+def test_delete_chat_requires_explicit_confirmation():
+    import inspect
+
+    ops = load_ops(lambda script: None)
+    assert inspect.signature(ops["delete_chat"]).parameters["confirm"].default is False
+
+
+def test_close_extra_tab_rejects_unknown_target_without_scanning_or_closing():
+    closed = []
+    ops = load_ops(lambda script: None)
+    ops["close_tab"] = closed.append
+
+    with pytest.raises(RuntimeError, match="destructive_scope_violation"):
+        ops["close_extra_tab"]("not-owned")
+    assert closed == []
+
+
+def test_read_shared_conversation_closes_the_new_tab_return_value():
+    closed = []
+
+    def fake_js(script):
+        if "document.body.innerText" in script:
+            return {"url": "https://chatgpt.com/share/test", "message_count": 1,
+                    "turns": [{"id": "message-1", "role": "user", "text": "synthetic"}]}
+        if "candidates" in script:
+            return False
+        if "data-message-author-role" in script:
+            return []
+        raise AssertionError(f"unexpected JS: {script[:100]}")
+
+    ops = load_ops(fake_js)
+    ops["new_tab"] = lambda url="about:blank": "new-share-target"
+    ops["close_tab"] = closed.append
+
+    result = ops["read_shared_conversation"]("https://chatgpt.com/share/test")
+
+    assert result["text"] == "[user] synthetic"
+    assert closed == ["new-share-target"]
+
+
+def test_send_message_accepts_the_current_send_button_variant():
+    def fake_js(script):
+        if "existing_user_messages" in script:
+            return {"found": True, "empty": True, "url": "https://chatgpt.com/", "user_count": 0,
+                    "user_message_ids": [], "last_user_turn": -1}
+        if "activate_send_button" in script:
+            return {"found": True, "clicked": True}
+        if "send_button" in script:
+            assert "send-button" in script or "发送提示词" in script
+            return {"found": True}
+        if "last_user_message" in script:
+            return {"url": "https://chatgpt.com/c/current-variant", "composer_empty": True,
+                    "user_count": 1, "last_user_message_id": "new", "last_user_turn": 1,
+                    "last_user_message": "variant prompt"}
+        raise AssertionError(f"unexpected JS: {script[:100]}")
+
+    ops = load_ops(fake_js)
+    assert ops["send_message"]("variant prompt")["status"] == "definitely_sent"
+
+
+def test_send_and_wait_requires_a_new_assistant_turn():
+    ops = load_ops(lambda script: {
+        "assistant_count": 1,
+        "assistant_message_ids": ["old-assistant"],
+        "send_btn": True,
+        "generating": False,
+        "last_len": 12,
+        "last_tail": "old reply",
+    })
+    ops["send_message"] = lambda text: {"status": "definitely_sent", "url": "https://chatgpt.com/c/existing-chat"}
+
+    with pytest.raises(RuntimeError, match="new assistant"):
+        ops["send_and_wait"]("new prompt", timeout=0)
+
+
+def test_export_share_link_clicks_once_and_reuses_the_cached_url(monkeypatch):
+    import subprocess
+
+    clipboard = iter(["", "https://chatgpt.com/share/synthetic"])
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: type("R", (), {"stdout": next(clipboard)})())
+    js_calls = []
+    clicks = []
+
+    def fake_js(script):
+        if "share-chat-button" in script:
+            js_calls.append(script)
+            return {"found": True, "x": 10, "y": 20}
+        if "role=\"status\"" in script:
+            return False
+        if "composer_visible" in script:
+            return {"url": "https://chatgpt.com/c/synthetic-chat", "conversation_id": "synthetic-chat",
+                    "composer_visible": True, "composer_empty": True, "generating": False,
+                    "auth_required": False, "paywall_or_quota": False, "dialog": False}
+        raise AssertionError(f"unexpected JS: {script[:100]}")
+
+    ops = load_ops(fake_js, click_impl=lambda x, y: clicks.append((x, y)))
+    ops["switch_chat"] = lambda conversation: {"url": "https://chatgpt.com/c/synthetic-chat",
+                                                "conversation_id": "synthetic-chat",
+                                                "state": "ready_conversation"}
+    first = ops["export_share_link"]("synthetic-chat")
+    second = ops["export_share_link"]("synthetic-chat")
+
+    assert first == {"status": "success", "url": "https://chatgpt.com/share/synthetic",
+                     "created": True, "conversation_id": "synthetic-chat"}
+    assert second["url"] == first["url"]
+    assert second["created"] is False
+    assert clicks == [(10, 20)]
+
+
+def test_share_evidence_exception_cannot_replay_activation(monkeypatch):
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: type("R", (), {"stdout": ""})())
+    clicks = []
+    def fake_js(script):
+        if "share-chat-button" in script:
+            return {"found": True, "x": 10, "y": 20}
+        raise RuntimeError("context destroyed after share click")
+    ops = load_ops(fake_js, click_impl=lambda *a: clicks.append(a))
+    ops["switch_chat"] = lambda c: {"url": "https://chatgpt.com/c/synthetic-chat"}
+    with pytest.raises(RuntimeError, match="context destroyed"):
+        ops["export_share_link"]("synthetic-chat")
+    assert ops["export_share_link"]("synthetic-chat")["status"] == "unknown"
+    assert len(clicks) == 1
+
+
+def test_reply_same_tail_with_growing_length_is_not_complete():
+    polls = []
+    url = "https://chatgpt.com/c/synthetic-chat"
+    tail = "x" * 120
+    def fake_js(script):
+        if "assistant_message_ids" in script:
+            return {"assistant_message_ids": [], "assistant_count": 0}
+        if "last_len" in script:
+            polls.append(1)
+            length = 120 if len(polls) == 1 else 121
+            return {"url": url, "composer_empty": True, "generating": False,
+                    "assistant_message_id": "new", "assistant_count": 1,
+                    "last_len": length, "last_tail": tail}
+        assert len(polls) == 3
+        return {"message_id": "new", "text": "a" + tail}
+    ops = load_ops(fake_js)
+    ops["send_message"] = lambda text: {"status": "definitely_sent", "url": url}
+    assert ops["send_and_wait"]("synthetic")["text"] == "a" + tail
+
+
+def test_share_reader_visits_both_boundaries_and_keeps_duplicate_text_turns():
+    page = [1]
+    keys = []
+    def press(key):
+        keys.append(key)
+        page[0] += -1 if key == "PageUp" else 1
+    def fake_js(script):
+        return {"url": "https://chatgpt.com/share/test", "message_count": 1,
+                "scroll": {"found": True, "top": page[0] * 100, "height": 300, "client": 100},
+                "turns": [{"id": str(page[0]), "turn": f"conversation-turn-{page[0]}",
+                           "role": "user", "text": "same text"}]}
+    ops = load_ops(fake_js, press_impl=press)
+    result = ops["read_shared_conversation"]("https://chatgpt.com/share/test")
+    assert result["text"].splitlines() == ["[user] same text"] * 3
+    assert keys == ["PageUp", "PageDown", "PageDown"]
+
+
+def test_full_conversation_prepends_authorized_api_pages_and_filters_reasoning():
+    ops = load_ops(lambda script: None)
+    def message(message_id, role, text, content_type="text", channel=None):
+        return {"id": message_id, "author": {"role": role}, "recipient": "all",
+                "channel": channel, "content": {"content_type": content_type, "parts": [text]},
+                "metadata": {}}
+    pages = {
+        None: {"messages": [message("2", "assistant", "same")],
+               "page_info": {"has_previous_page": True, "start_cursor": "older"}},
+        "older": {"messages": [message("1", "user", "question"),
+                                 message("thought", "assistant", "private reasoning", "thoughts"),
+                                 message("2", "assistant", "same")],
+                  "page_info": {"has_previous_page": False}},
+    }
+    ops["observe_chatgpt_state"] = lambda: {
+        "state": "ready_conversation", "conversation_id": "abcdefgh",
+        "url": "https://chatgpt.com/c/abcdefgh",
+    }
+    ops["_conversation_api_page"] = lambda conversation_id, before=None: pages[before]
+    ops["switch_tab"] = lambda target: None
+    result = ops["full_conversation"]()
+    assert result["source"] == "authorized_browser_response_pages"
+    assert [(turn["id"], turn["text"]) for turn in result["turns"]] == [
+        ("1", "question"), ("2", "same")
+    ]
+
+
+def test_prepare_analysis_validates_instruction_before_browser_access():
+    touched = []
+    ops = load_ops(lambda script: touched.append(script))
+    with pytest.raises(ValueError, match="instruction"):
+        ops["prepare_conversation_analysis"]("current", "  ")
+    assert touched == []
+
+
+def test_prepare_analysis_returns_transient_complete_package():
+    ops = load_ops(lambda script: None)
+    ops["observe_chatgpt_state"] = lambda: {
+        "state": "ready_conversation", "conversation_id": "abcdefgh",
+        "url": "https://chatgpt.com/c/abcdefgh",
+    }
+    ops["full_conversation"] = lambda max_pages=120: {
+        "conversation_id": "abcdefgh", "url": "https://chatgpt.com/c/abcdefgh",
+        "pages": 1, "source": "authorized_browser_response_pages",
+        "turns": [
+            {"id": "1", "role": "user", "text": "question", "non_text_omitted": False},
+            {"id": "2", "role": "assistant", "text": "answer", "non_text_omitted": True},
+        ],
+    }
+    result = ops["prepare_conversation_analysis"]("current", "summarize")
+    assert result["status"] == "ready_for_agent_analysis"
+    assert result["user_message_count"] == result["assistant_message_count"] == 1
+    assert result["warnings"]
