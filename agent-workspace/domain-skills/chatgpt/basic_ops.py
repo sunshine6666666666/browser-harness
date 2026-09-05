@@ -682,28 +682,41 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
     wait(0.4)
     type_text(text)
     wait(0.5)
-    btn = js(r"""
-    (() => {
-      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-      const form = document.querySelector('form[data-type="unified-composer"]');
-      const send_button = form && [...form.querySelectorAll('button')].find(el => {
-        const label = norm(el.getAttribute('aria-label') || '');
-        const testid = el.getAttribute('data-testid') || '';
-        return (testid === 'send-button' || label === '发送提示词' ||
-                label === '发送提示' || label === 'Send prompt') && el.offsetParent &&
-               !el.disabled && el.getAttribute('aria-disabled') !== 'true';
-      });
-      if (!send_button) return {found: false};
-      const r = send_button.getBoundingClientRect();
-      const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
-      if (r.width <= 0 || r.height <= 0 || r.x < 0 || r.y < 0 ||
-          r.right > innerWidth || r.bottom > innerHeight ||
-          !hit || !(hit === send_button || send_button.contains(hit))) return {found: false};
-      return {found: true};
-    })()
-    """)
+    def definitely_not_sent(reason: str) -> dict[str, Any]:
+        return {
+            "status": "definitely_not_sent",
+            "reason": reason,
+            "url": before.get("url"),
+            "click_performed": False,
+            "composer_empty": False,
+            "expected_user_message_found": False,
+        }
+
+    try:
+        btn = js(r"""
+        (() => {
+          const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+          const form = document.querySelector('form[data-type="unified-composer"]');
+          const send_button = form && [...form.querySelectorAll('button')].find(el => {
+            const label = norm(el.getAttribute('aria-label') || '');
+            const testid = el.getAttribute('data-testid') || '';
+            return (testid === 'send-button' ||
+                    ['发送提示', '发送提示词', 'Send prompt'].includes(label)) && el.offsetParent &&
+                   !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+          });
+          if (!send_button) return {found: false};
+          const r = send_button.getBoundingClientRect();
+          const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+          if (r.width <= 0 || r.height <= 0 || r.x < 0 || r.y < 0 ||
+              r.right > innerWidth || r.bottom > innerHeight ||
+              !hit || !(hit === send_button || send_button.contains(hit))) return {found: false};
+          return {found: true};
+        })()
+        """)
+    except Exception:
+        return definitely_not_sent("send_preflight_exception")
     if not btn or not btn.get("found"):
-        raise RuntimeError("send_message: enabled unified-composer send button not found")
+        return definitely_not_sent("send_button_unavailable_after_typing")
     try:
         activated = js(r"""
         (() => {

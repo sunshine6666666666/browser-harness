@@ -351,6 +351,74 @@ def test_send_message_returns_definite_live_evidence_from_unified_composer():
     assert all("form[data-type=\"unified-composer\"]" in script for script in calls[:2])
 
 
+def test_send_message_accepts_current_chinese_send_prompt_label():
+    typed = []
+
+    def fake_js(script):
+        if "existing_user_messages" in script:
+            return {
+                "found": True,
+                "empty": True,
+                "url": "https://chatgpt.com/new",
+                "user_count": 0,
+                "user_message_ids": [],
+                "last_user_turn": -1,
+            }
+        if "activate_send_button" in script:
+            assert "发送提示词" in script
+            return {"found": True, "clicked": True}
+        if "send_button" in script:
+            assert "发送提示词" in script
+            return {"found": True}
+        if "last_user_message" in script:
+            return {
+                "url": "https://chatgpt.com/c/current-label-test",
+                "composer_empty": True,
+                "user_count": 1,
+                "last_user_message_id": "current-label-message",
+                "last_user_turn": 1,
+                "last_user_message": "current label regression",
+            }
+        raise AssertionError(f"unexpected JS: {script[:120]}")
+
+    ops = load_ops(fake_js, type_impl=typed.append)
+    evidence = ops["send_message"]("current label regression")
+
+    assert typed == ["current label regression"]
+    assert evidence["status"] == "definitely_sent"
+
+
+def test_send_message_classifies_post_type_send_preflight_failure_as_not_sent():
+    typed = []
+
+    def fake_js(script):
+        if "existing_user_messages" in script:
+            return {
+                "found": True,
+                "empty": True,
+                "url": "https://chatgpt.com/new",
+                "user_count": 0,
+                "user_message_ids": [],
+                "last_user_turn": -1,
+            }
+        if "send_button" in script:
+            return {"found": False}
+        raise AssertionError(f"unexpected JS: {script[:120]}")
+
+    ops = load_ops(fake_js, type_impl=typed.append)
+    evidence = ops["send_message"]("preflight failure stays local")
+
+    assert typed == ["preflight failure stays local"]
+    assert evidence == {
+        "status": "definitely_not_sent",
+        "reason": "send_button_unavailable_after_typing",
+        "url": "https://chatgpt.com/new",
+        "click_performed": False,
+        "composer_empty": False,
+        "expected_user_message_found": False,
+    }
+
+
 def test_send_message_accepts_a_collapsed_long_message_prefix_as_evidence():
     marker = "MAINTENANCE-LONG-SEND-2026-08-04"
     message = marker + " " + ("validated role artifact " * 300)
