@@ -191,7 +191,16 @@ def page_info():
     dialog = _send({"meta": "pending_dialog"}).get("dialog")
     if dialog:
         return {"dialog": dialog}
-    expression = "JSON.stringify({url:location.href,title:document.title,w:innerWidth,h:innerHeight,sx:scrollX,sy:scrollY,pw:document.documentElement.scrollWidth,ph:document.documentElement.scrollHeight})"
+    expression = (
+        "JSON.stringify((()=>{"
+        "const root=document.documentElement;const body=document.body;"
+        "return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,"
+        "sx:scrollX,sy:scrollY,"
+        "pw:root?.scrollWidth??body?.scrollWidth??0,"
+        "ph:root?.scrollHeight??body?.scrollHeight??0,"
+        "initializing:!root,readyState:document.readyState};"
+        "})())"
+    )
     raw = _runtime_evaluate(expression)
     if not isinstance(raw, str):
         raise RuntimeError(f"page_info expected JSON text, got {type(raw).__name__}")

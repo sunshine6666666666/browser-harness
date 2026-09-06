@@ -104,6 +104,34 @@ def test_page_info_includes_domain_skills_after_new_tab_flow(tmp_path, monkeypat
     assert result["domain_skills"] == ["scraping.md"]
 
 
+def test_page_info_returns_retryable_initializing_state_without_document_element(
+    monkeypatch,
+):
+    monkeypatch.delenv("BH_DOMAIN_SKILLS", raising=False)
+    raw = (
+        '{"url":"https://www.theguardian.com/lifeandstyle/sex",'
+        '"title":"","w":1280,"h":720,"sx":0,"sy":0,'
+        '"pw":0,"ph":0,"initializing":true,"readyState":"loading"}'
+    )
+    expressions = []
+
+    def fake_evaluate(expression):
+        expressions.append(expression)
+        return raw
+
+    with patch("browser_harness.helpers._send", return_value={}), patch(
+        "browser_harness.helpers._runtime_evaluate", side_effect=fake_evaluate
+    ):
+        result = helpers.page_info()
+
+    assert result["initializing"] is True
+    assert result["readyState"] == "loading"
+    assert result["pw"] == 0
+    assert result["ph"] == 0
+    assert "root?.scrollWidth??body?.scrollWidth??0" in expressions[0]
+    assert "root?.scrollHeight??body?.scrollHeight??0" in expressions[0]
+
+
 def test_unregistered_site_has_no_false_match(tmp_path, monkeypatch):
     monkeypatch.setenv("BH_DOMAIN_SKILLS", "1")
     monkeypatch.setattr(helpers, "AGENT_WORKSPACE", tmp_path)
