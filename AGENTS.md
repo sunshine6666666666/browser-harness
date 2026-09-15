@@ -27,6 +27,10 @@ An agent operating the harness only edits inside `agent-workspace/`:
 - `agent_helpers.py` — task-specific browser helpers the agent adds
 - `domain-skills/` — skills the agent writes and reads
 
+Before writing or editing any site-specific domain skill in
+`agent-workspace/domain-skills/`, read `DOMAIN_SKILL_DESIGN.md` at the repo
+root first. It is the design spec every domain skill must follow.
+
 # Hermes Profile collaboration repositories
 - English workflow source of truth: `/Users/yelin/Developer/linye-english-news-workflow`.
   Treat this repository as read-only: never modify, commit, or push there.
