@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     def current_tab() -> dict[str, Any]: ...
     def goto_url(url: str) -> None: ...
     def js(expression: str) -> Any: ...
+    def new_tab(url: str = "about:blank") -> str: ...
     def page_info() -> dict[str, Any]: ...
     def type_text(text: str) -> None: ...
     def upload_file(selector: str, path: str) -> None: ...
@@ -824,70 +825,79 @@ def submit_once(title: str, expected_mid: int, expected_name: str | None = None,
             snapshot.get("validation_errors") or
             (expected_schedule and observed_schedule != expected_schedule)):
         raise RuntimeError("Bilibili preflight failed: %s" % snapshot)
-    js("document.querySelector('input[placeholder=\"请输入稿件标题\"]')?.click()")
-    wait(0.3)
-    picker_open = js("""(() => {
-      const el = document.querySelector('.time-picker-container');
-      if (!el) return false;
-      const r = el.getBoundingClientRect();
-      return r.width > 0 && r.height > 0;
-    })()""")
-    if picker_open:
-        js("document.querySelector('.date-picker-timer')?.click()")
-        wait(0.3)
+    # ponytail: a real outside click closes Bilibili's focused time picker.
+    _click_visible('input[placeholder="请输入稿件标题"]')
+    press_key("Escape")
+    wait(1)
     activate_tab(current_tab())
     _click_visible('.submit-add')
     clicked = True
     wait(0.5)
-    diagnostics = submission_diagnostics()
-    if diagnostics["reason"] in {"form_validation_failed", "confirmation_required", "platform_rejected"}:
+    diagnostics = None
+    diagnostics_error = ""
+    try:
+        diagnostics = submission_diagnostics()
+    except (RuntimeError, TimeoutError) as exc:
+        diagnostics_error = str(exc)
+    if diagnostics and diagnostics["reason"] in {"form_validation_failed", "confirmation_required", "platform_rejected"}:
         return {"identity": identity, "submitted": False, "status": "not_accepted",
                 "reason": diagnostics["reason"], "diagnostics": diagnostics,
                 "submit_clicks": int(clicked)}
+    # ponytail: keep the submitting renderer alive; verify from one separate tab.
+    try:
+        new_tab()
+    except (RuntimeError, TimeoutError) as exc:
+        return {"identity": identity, "submitted": True,
+                "status": "submission_unverified", "reason": "verification_tab_failed",
+                "verification_tab_error": str(exc), "submit_clicks": int(clicked)}
     deadline = time.monotonic() + timeout
     archive = None
+    archive_error = ""
     last_manager_error = ""
-    manager_loads = 0
     while time.monotonic() < deadline:
-        matches = archive_matches(title)
+        try:
+            matches = archive_matches(title)
+        except (RuntimeError, TimeoutError) as exc:
+            archive_error = str(exc)
+            matches = []
         if len(matches) == 1:
             archive = matches[0]
         elif len(matches) > 1:
             raise RuntimeError("Bilibili archive title matched multiple records")
-        if manager_loads < 3:
-            manager_loads += 1
-            try:
-                manager = manager_evidence(
-                    title, expected_schedule, strict=False, attempts=1
-                )
-            except (RuntimeError, TimeoutError) as exc:
-                last_manager_error = str(exc)
-            else:
-                # ponytail: Bilibili hides the schedule while the card is under review.
-                if manager.get("schedule_match") or "审核中" in manager.get("text", ""):
-                    result = {
-                        "identity": identity, "submitted": True, "status": "verified",
-                        "manager": manager, "verification_source": "manager_latest",
-                        "submit_clicks": int(clicked),
-                    }
-                    if archive is not None:
-                        result["archive"] = archive
-                    return result
-                last_manager_error = (
-                    manager.get("text") or
-                    "Bilibili manager schedule evidence is not ready"
-                )
-        diagnostics = submission_diagnostics()
-        if diagnostics["reason"] in {
-                "form_validation_failed", "confirmation_required", "platform_rejected"}:
-            return {"identity": identity, "submitted": False, "status": "not_accepted",
-                    "reason": diagnostics["reason"], "diagnostics": diagnostics,
-                    "submit_clicks": int(clicked)}
-        wait(min(3, max(0, deadline - time.monotonic())))
+        try:
+            manager = manager_evidence(
+                title, expected_schedule, strict=False, attempts=1
+            )
+        except (RuntimeError, TimeoutError) as exc:
+            last_manager_error = str(exc)
+        else:
+            # ponytail: Bilibili hides the schedule while the card is under review.
+            if manager.get("schedule_match") or "审核中" in manager.get("text", ""):
+                result = {
+                    "identity": identity, "submitted": True, "status": "verified",
+                    "manager": manager, "verification_source": "manager_latest",
+                    "submit_clicks": int(clicked),
+                }
+                if archive is not None:
+                    result["archive"] = archive
+                return result
+            last_manager_error = (
+                manager.get("text") or
+                "Bilibili manager schedule evidence is not ready"
+            )
+        wait(min(10, max(0, deadline - time.monotonic())))
     if archive is not None:
         return {"identity": identity, "submitted": True,
                 "status": "accepted_but_schedule_unverified", "archive": archive,
                 "expected_schedule": expected_schedule, "manager_error": last_manager_error,
+                "submit_clicks": int(clicked)}
+    if diagnostics_error or archive_error:
+        reason = ("post_submit_diagnostics_timeout" if diagnostics_error
+                  else "post_submit_archive_timeout")
+        return {"identity": identity, "submitted": True,
+                "status": "submission_unverified", "reason": reason,
+                "diagnostics_error": diagnostics_error, "archive_error": archive_error,
+                "manager_error": last_manager_error,
                 "submit_clicks": int(clicked)}
     return {"identity": identity, "submitted": False, "status": "not_accepted",
             "reason": diagnostics["reason"], "diagnostics": diagnostics,

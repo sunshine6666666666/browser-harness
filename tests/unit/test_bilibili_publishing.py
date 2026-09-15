@@ -42,6 +42,8 @@ class FakePage:
         self.calendar_navigation = True
         self.month_moves = []
         self.day_selections = []
+        self.new_tabs = []
+        self.pressed_keys = []
 
     def js(self, script):
         if script.strip().startswith("Boolean(document.querySelector('.cover-empty-pill'))"):
@@ -188,6 +190,7 @@ class FakePage:
         self.pending_text = text
 
     def press_key(self, key, modifiers=0):
+        self.pressed_keys.append(key)
         if key == "Enter" and self.pending_text not in self.reject_tags:
             if self.pending_text not in self.tags:
                 self.tags.append(self.pending_text)
@@ -215,6 +218,7 @@ def load_publishing(page=None):
         "activate_tab": lambda target: None,
         "current_tab": lambda: {"targetId": "bili"},
         "goto_url": lambda url: None,
+        "new_tab": lambda url="about:blank": page.new_tabs.append(url) or "manager",
         "page_info": lambda: {"url": "https://member.bilibili.com/platform/upload/video/frame"},
     }
     exec(compile(PUBLISHING_PATH.read_text(), str(PUBLISHING_PATH), "exec"), namespace)
@@ -406,7 +410,7 @@ def _configure_submit(namespace, archive_values, manager_values, clicks, diagnos
     archive_last = archive_values[-1] if archive_values else []
     namespace["archive_matches"] = lambda title: next(archive_iter, archive_last)
     namespace["submission_snapshot"] = _valid_snapshot
-    namespace["_click_visible"] = lambda selector: clicks.append(selector)
+    namespace["_click_visible"] = lambda selector: clicks.append(selector) if selector == ".submit-add" else None
     manager_iter = iter(manager_values)
     manager_last = manager_values[-1] if manager_values else {"schedule_match": True}
     namespace["manager_evidence"] = lambda title, schedule, strict=False, attempts=3: next(manager_iter, manager_last)
@@ -423,7 +427,7 @@ def _configure_submit(namespace, archive_values, manager_values, clicks, diagnos
 
 
 def test_submit_once_clicks_once_when_manager_evidence_is_delayed():
-    namespace, _ = load_publishing()
+    namespace, page = load_publishing()
     clicks = []
     archive = [{"aid": 7, "bvid": "BV1"}]
     _configure_submit(namespace, [[], archive, archive, archive],
@@ -434,6 +438,7 @@ def test_submit_once_clicks_once_when_manager_evidence_is_delayed():
     assert result["status"] == "verified"
     assert result["archive"]["bvid"] == "BV1"
     assert result["submit_clicks"] == 1
+    assert page.pressed_keys == ["Escape"]
     assert clicks == [".submit-add"]
 
 
@@ -515,8 +520,110 @@ def test_submit_once_recovers_from_manager_navigation_timeout():
     assert clicks == [".submit-add"]
 
 
-def test_submit_once_loads_manager_at_most_three_times():
+def test_submit_once_recovers_from_post_submit_diagnostics_timeout():
     namespace, _ = load_publishing()
+    clicks = []
+    manager = {
+        "title": "标题", "text": "标题\n审核中",
+        "schedule_match": False, "latest": True, "list_loads": 1,
+    }
+    _configure_submit(namespace, [[], []], [manager], clicks)
+    namespace["submission_diagnostics"] = lambda: (_ for _ in ()).throw(
+        RuntimeError("Runtime.evaluate timed out")
+    )
+
+    result = namespace["submit_once"](
+        "标题", 518800384, "水蜜桃英语", "2026-08-30 22:00", timeout=0.1
+    )
+
+    assert result["status"] == "verified"
+    assert result["submitted"] is True
+    assert result["manager"] == manager
+    assert result["submit_clicks"] == 1
+    assert clicks == [".submit-add"]
+
+
+def test_submit_once_returns_unverified_when_post_submit_diagnostics_keep_timing_out():
+    namespace, _ = load_publishing()
+    clicks = []
+    _configure_submit(namespace, [[], []], [], clicks)
+    namespace["manager_evidence"] = lambda *args, **kwargs: (_ for _ in ()).throw(
+        RuntimeError("latest record not ready")
+    )
+    namespace["submission_diagnostics"] = lambda: (_ for _ in ()).throw(
+        RuntimeError("Runtime.evaluate timed out")
+    )
+
+    result = namespace["submit_once"](
+        "标题", 518800384, "水蜜桃英语", "2026-08-30 22:00", timeout=0.01
+    )
+
+    assert result["status"] == "submission_unverified"
+    assert result["submitted"] is True
+    assert result["reason"] == "post_submit_diagnostics_timeout"
+    assert "Runtime.evaluate timed out" in result["diagnostics_error"]
+    assert result["submit_clicks"] == 1
+    assert clicks == [".submit-add"]
+
+
+def test_submit_once_recovers_from_post_submit_archive_timeout():
+    namespace, _ = load_publishing()
+    clicks = []
+    manager = {
+        "title": "标题", "text": "标题\n审核中",
+        "schedule_match": False, "latest": True, "list_loads": 1,
+    }
+    _configure_submit(namespace, [[]], [manager], clicks)
+    archive_calls = []
+
+    def flaky_archive(title):
+        archive_calls.append(title)
+        if len(archive_calls) == 1:
+            return []
+        raise RuntimeError("Runtime.evaluate timed out")
+
+    namespace["archive_matches"] = flaky_archive
+    result = namespace["submit_once"](
+        "标题", 518800384, "水蜜桃英语", "2026-08-30 22:00", timeout=0.1
+    )
+
+    assert result["status"] == "verified"
+    assert result["submitted"] is True
+    assert result["manager"] == manager
+    assert result["submit_clicks"] == 1
+    assert clicks == [".submit-add"]
+
+
+def test_submit_once_returns_unverified_when_post_submit_archive_keeps_timing_out():
+    namespace, _ = load_publishing()
+    clicks = []
+    _configure_submit(namespace, [[]], [], clicks)
+    archive_calls = []
+
+    def broken_archive(title):
+        archive_calls.append(title)
+        if len(archive_calls) == 1:
+            return []
+        raise RuntimeError("Runtime.evaluate timed out")
+
+    namespace["archive_matches"] = broken_archive
+    namespace["manager_evidence"] = lambda *args, **kwargs: (_ for _ in ()).throw(
+        RuntimeError("latest record not ready")
+    )
+    result = namespace["submit_once"](
+        "标题", 518800384, "水蜜桃英语", "2026-08-30 22:00", timeout=0.01
+    )
+
+    assert result["status"] == "submission_unverified"
+    assert result["submitted"] is True
+    assert result["reason"] == "post_submit_archive_timeout"
+    assert "Runtime.evaluate timed out" in result["archive_error"]
+    assert result["submit_clicks"] == 1
+    assert clicks == [".submit-add"]
+
+
+def test_submit_once_keeps_polling_manager_until_deadline():
+    namespace, page = load_publishing()
     clicks = []
     _configure_submit(namespace, [[], []], [], clicks)
     manager_calls = []
@@ -530,8 +637,9 @@ def test_submit_once_loads_manager_at_most_three_times():
         "标题", 518800384, "水蜜桃英语", "2026-08-30 22:00", timeout=0.01
     )
     assert result["status"] == "not_accepted"
-    assert len(manager_calls) == 3
+    assert len(manager_calls) > 3
     assert all(call[3] == 1 for call in manager_calls)
+    assert page.new_tabs == ["about:blank"]
     assert clicks == [".submit-add"]
 
 
