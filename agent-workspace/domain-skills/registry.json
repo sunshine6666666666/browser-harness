@@ -449,6 +449,10 @@
     "gemini": [
       "gemini.google.com",
       "*.gemini.google.com"
+    ],
+    "ximalaya": [
+      "ximalaya.com",
+      "*.ximalaya.com"
     ]
   }
 }
