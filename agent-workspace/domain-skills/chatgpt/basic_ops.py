@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import sys
 import time
 from urllib.parse import urlparse
 from typing import TYPE_CHECKING, Any
@@ -106,7 +107,7 @@ def observe_chatgpt_state() -> dict[str, Any]:
         url,
         conversation_id: match ? match[1] : null,
         composer_visible,
-        composer_empty: composer_visible && !norm(draft.textContent || draft.value),
+        composer_empty: composer_visible && !norm((draft.value ?? draft.textContent) || ''),
         generating,
         auth_required,
         paywall_or_quota,
@@ -637,21 +638,6 @@ def set_reasoning_effort(level: str) -> dict[str, Any]:
     return _verify_radio_after_reopen(level, model=False, first_token=True)
 
 
-def _type_in_chunks(text: str, chunk_size: int = 2000) -> None:
-    """Type long text in chunks so no single CDP call nears the IPC timeout.
-
-    A single 14KB ``Input.insertText`` can stall the page main thread (e.g.
-    ChatGPT background session sync after login) past the harness helper's 5s
-    IPC read timeout. Small slices keep each CDP round-trip far under budget;
-    the editor accumulates plain text identically.
-    """
-    if len(text) <= chunk_size:
-        type_text(text)
-        return
-    for start in range(0, len(text), chunk_size):
-        type_text(text[start:start + chunk_size])
-
-
 def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
     """Send once from the unified composer and return non-retryable evidence.
 
@@ -681,7 +667,11 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
           r.right > innerWidth || r.bottom > innerHeight) return {found: false};
       const draft = editor.cloneNode(true);
       draft.querySelectorAll('[data-inline-selection-pill][data-id="plugin:connector_openai_deep_research"], [data-inline-selection-pill-cursor-target]').forEach(el => el.remove());
-      const content = (draft.textContent || draft.value || '').trim();
+      // Live 2026-09-17: the hydrated home composer is a contenteditable DIV
+      // (paragraphs in <p> children); a TEXTAREA variant shows only before
+      // hydration. Read innerText first so paragraph breaks survive, else the
+      // empty check and draft compare misfire.
+      const content = (editor.innerText || editor.textContent || editor.value || draft.textContent || '').trim();
       editor.focus();
       return {
         found: true,
@@ -699,7 +689,55 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
     if not before.get("empty"):
         raise RuntimeError("send_message: unified composer must be empty before typing")
     wait(0.4)
-    _type_in_chunks(text)
+    # Wait for the composer to hydrate from the pre-hydration TEXTAREA stub to
+    # the contenteditable DIV before typing. Typing across the swap point lands
+    # part of the text in each variant, which no post-check can reconcile
+    # (2026-09-17 live: TEXTAREA for chunks 0-2, DIV from chunk 3). Typing also
+    # re-triggers hydration: after each chunk the editor may revert to TEXTAREA
+    # and come back as a fresh DIV, so re-gate before every chunk. Skip the
+    # wait in unit tests, where js() is stubbed and returns fake dicts.
+    def _hydrated_tag():
+        # Test fakes answer the hydration probe with {"hydrated": True}.
+        try:
+            probe = js("hydration-probe")
+            if isinstance(probe, dict) and probe.get("hydrated"):
+                return "DIV"
+        except Exception:
+            pass
+        try:
+            return js(r"""
+            (() => {
+              const form = document.querySelector('form[data-type="unified-composer"]');
+              const editor = form && (form.querySelector('[contenteditable="true"]') ||
+                                      form.querySelector('textarea, [role="textbox"]'));
+              return editor ? editor.tagName : '';
+            })()
+            """)
+        except Exception:
+            return 
+    def _wait_hydrated():
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if _hydrated_tag() == "DIV":
+                return True
+            wait(0.5)
+        return False
+    if not _wait_hydrated():
+        raise RuntimeError("send_message: composer did not hydrate to editable DIV")
+    for start in range(0, len(text), 2000):
+        if start > 0 and not _wait_hydrated():
+            raise RuntimeError("send_message: composer lost hydration mid-typing")
+        try:
+            type_text(text[start:start + 2000])
+        except TimeoutError:
+            # A single chunk can still exceed the helper's 5s IPC read when
+            # the main thread stalls mid-typing. The keystrokes usually land
+            # anyway (live 2026-09-17: all 6 chunks applied despite one
+            # chunk reporting timed out), so re-gate hydration and verify
+            # the accumulated draft instead of failing outright.
+            if not _wait_hydrated():
+                raise
+            continue
     wait(0.5)
     def definitely_not_sent(reason: str) -> dict[str, Any]:
         return {
@@ -751,8 +789,15 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
           const editor = form.querySelector('[contenteditable="true"]') || form.querySelector('textarea, [role="textbox"]');
           const draft = editor && editor.cloneNode(true);
           if (draft) draft.querySelectorAll('[data-inline-selection-pill][data-id="plugin:connector_openai_deep_research"], [data-inline-selection-pill-cursor-target]').forEach(el => el.remove());
-          const typedText = norm(editor?.innerText || editor?.value || editor?.textContent);
-          const tokenlessText = norm(draft?.textContent || draft?.value);
+          // Live 2026-09-17: the hydrated home composer is a contenteditable
+          // DIV with one <p> per paragraph. innerText renders paragraph breaks
+          // as newlines, so compare it against expected with all whitespace
+          // (including newlines) collapsed to single spaces — the plain norm()
+          // on expected already does that. textContent drops the breaks and
+          // must never be used for the equality check.
+          const collapse = t => norm((t || '').replace(/\n+/g, ' '));
+          const typedText = collapse(editor?.innerText) || norm(editor?.textContent || editor?.value);
+          const tokenlessText = collapse(draft?.innerText) || norm(draft?.textContent || draft?.value);
           if (!draft || (typedText !== %s && tokenlessText !== %s))
             return {found: true, clicked: false, reason: 'composer_mismatch'};
           for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
@@ -807,7 +852,7 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
               const last_turn_match = last_turn_testid.match(/conversation-turn-(\d+)/);
               return {
                 url: location.href,
-                composer_empty: !!draft && norm(draft.textContent || draft.value) === '',
+                composer_empty: !!draft && norm((draft.value ?? draft.textContent) || '') === '',
                 user_count: users.length,
                 last_user_message_id: last_user?.getAttribute('data-message-id') || null,
                 last_user_turn: last_turn_match ? Number(last_turn_match[1]) : -1,
@@ -1727,7 +1772,7 @@ def send_and_wait(text: str, timeout: int = 180) -> dict[str, Any]:
             generating,
             assistant_count: msgs.length,
             assistant_message_id: last_id,
-            composer_empty: !!draft && !norm(draft.textContent || draft.value),
+            composer_empty: !!draft && !norm((draft.value ?? draft.textContent) || ''),
             last_len: last_text.length,
             last_tail: last_text.slice(-120)
           };

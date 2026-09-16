@@ -221,6 +221,8 @@ def test_set_reasoning_effort_tries_both_reasoning_labels():
             return {"found": False}
         if "const norm" in script and "return el ? norm" in script:
             return "中"
+        if script == "hydration-probe":
+            return {"hydrated": True}
         raise AssertionError(f"unexpected JS: {script[:120]}")
 
     ops = load_ops(fake_js)
@@ -252,6 +254,8 @@ def test_select_model_supports_live_direct_submenu_and_verifies_exact_radio():
             return {"found": True, "x": 30, "y": 30, "checked": True}
         if "const norm" in script and "return el ? norm" in script:
             return "中"
+        if script == "hydration-probe":
+            return {"hydrated": True}
         raise AssertionError(f"unexpected JS: {script[:120]}")
 
     ops = load_ops(fake_js)
@@ -275,6 +279,8 @@ def test_set_reasoning_effort_supports_live_top_level_radio_and_verifies_checked
             return {"found": True, "x": 30, "y": 30, "checked": True}
         if "const norm" in script and "return el ? norm" in script:
             return "中"
+        if script == "hydration-probe":
+            return {"hydrated": True}
         raise AssertionError(f"unexpected JS: {script[:120]}")
 
     ops = load_ops(fake_js)
@@ -338,11 +344,15 @@ def test_send_message_returns_definite_live_evidence_from_unified_composer():
                 "last_user_turn": 1,
                 "last_user_message": "hello from regression test",
             }
+        if script == "hydration-probe":
+            return {"hydrated": True}
         raise AssertionError(f"unexpected JS: {script[:120]}")
 
     ops = load_ops(fake_js, type_impl=typed.append)
 
     evidence = ops["send_message"]("hello from regression test")
+    # The hydration probe runs before typing; drop it from the DOM-access order check.
+    calls = [c for c in calls if c != "hydration-probe"]
 
     assert typed == ["hello from regression test"]
     assert evidence["status"] == "definitely_sent"
@@ -379,6 +389,8 @@ def test_send_message_accepts_current_chinese_send_prompt_label():
                 "last_user_turn": 1,
                 "last_user_message": "current label regression",
             }
+        if script == "hydration-probe":
+            return {"hydrated": True}
         raise AssertionError(f"unexpected JS: {script[:120]}")
 
     ops = load_ops(fake_js, type_impl=typed.append)
@@ -403,6 +415,8 @@ def test_send_message_classifies_post_type_send_preflight_failure_as_not_sent():
             }
         if "send_button" in script:
             return {"found": False}
+        if script == "hydration-probe":
+            return {"hydrated": True}
         raise AssertionError(f"unexpected JS: {script[:120]}")
 
     ops = load_ops(fake_js, type_impl=typed.append)
@@ -432,6 +446,8 @@ def test_send_message_stops_when_another_tab_pollutes_draft_after_typing():
             return {"found": True, "clicked": False, "reason": "composer_mismatch"}
         if "send_button" in script:
             return {"found": True}
+        if script == "hydration-probe":
+            return {"hydrated": True}
         raise AssertionError(f"unexpected JS: {script[:120]}")
 
     ops = load_ops(fake_js, type_impl=typed.append)
@@ -452,6 +468,8 @@ def test_send_message_types_long_prompt_in_chunks():
                 "found": True, "empty": True, "url": "https://chatgpt.com/",
                 "user_count": 0, "user_message_ids": [], "last_user_turn": -1,
             }
+        if script == "hydration-probe":
+            return {"hydrated": True}
         if "activate_send_button" in script:
             return {"found": True, "clicked": True}
         if "send_button" in script:
@@ -465,6 +483,8 @@ def test_send_message_types_long_prompt_in_chunks():
                 "last_user_turn": 1,
                 "last_user_message": message,
             }
+        if script == "hydration-probe":
+            return {"hydrated": True}
         raise AssertionError(f"unexpected JS: {script[:120]}")
 
     ops = load_ops(fake_js, type_impl=typed.append)
@@ -485,6 +505,8 @@ def test_send_message_types_short_prompt_in_one_call():
                 "found": True, "empty": True, "url": "https://chatgpt.com/",
                 "user_count": 0, "user_message_ids": [], "last_user_turn": -1,
             }
+        if script == "hydration-probe":
+            return {"hydrated": True}
         if "activate_send_button" in script:
             return {"found": True, "clicked": True}
         if "send_button" in script:
@@ -498,12 +520,55 @@ def test_send_message_types_short_prompt_in_one_call():
                 "last_user_turn": 1,
                 "last_user_message": "short prompt",
             }
+        if script == "hydration-probe":
+            return {"hydrated": True}
         raise AssertionError(f"unexpected JS: {script[:120]}")
 
     ops = load_ops(fake_js, type_impl=typed.append)
     evidence = ops["send_message"]("short prompt")
 
     assert typed == ["short prompt"]
+    assert evidence["status"] == "definitely_sent"
+
+
+def test_send_message_reads_inner_text_before_text_content():
+    typed = []
+
+    def fake_js(script):
+        if "existing_user_messages" in script:
+            return {
+                "found": True, "empty": True, "url": "https://chatgpt.com/",
+                "user_count": 0, "user_message_ids": [], "last_user_turn": -1,
+            }
+        if script == "hydration-probe":
+            return {"hydrated": True}
+        if "activate_send_button" in script:
+            # Live 2026-09-17: the hydrated home composer is a contenteditable
+            # DIV with text in <p> children. innerText preserves the paragraph
+            # breaks; textContent drops them, so innerText must be read first
+            # or the atomic draft check misfires as composer_mismatch.
+            assert "editor?.innerText" in script
+            assert script.index("editor?.innerText") < script.index("editor?.textContent")
+            return {"found": True, "clicked": True}
+        if "send_button" in script:
+            return {"found": True}
+        if "last_user_message" in script:
+            return {
+                "url": "https://chatgpt.com/c/div-composer-send-test",
+                "composer_empty": True,
+                "user_count": 1,
+                "last_user_message_id": "new-div-message",
+                "last_user_turn": 1,
+                "last_user_message": "div composer prompt",
+            }
+        if script == "hydration-probe":
+            return {"hydrated": True}
+        raise AssertionError(f"unexpected JS: {script[:120]}")
+
+    ops = load_ops(fake_js, type_impl=typed.append)
+    evidence = ops["send_message"]("div composer prompt")
+
+    assert typed == ["div composer prompt"]
     assert evidence["status"] == "definitely_sent"
 
 
@@ -535,6 +600,8 @@ def test_send_message_accepts_a_collapsed_long_message_prefix_as_evidence():
                 "last_user_turn": 1,
                 "last_user_message": rendered_prefix,
             }
+        if script == "hydration-probe":
+            return {"hydrated": True}
         raise AssertionError(f"unexpected JS: {script[:120]}")
 
     ops = load_ops(fake_js)
@@ -581,6 +648,8 @@ def test_send_message_waits_for_a_canonical_conversation_url():
             return {"found": True}
         if "last_user_message" in script:
             return next(post_send_states)
+        if script == "hydration-probe":
+            return {"hydrated": True}
         raise AssertionError(f"unexpected JS: {script[:120]}")
 
     ops = load_ops(fake_js)
@@ -615,6 +684,8 @@ def test_send_message_accepts_a_new_message_id_when_virtualized_count_is_fixed()
                 "last_user_turn": 9,
                 "last_user_message": "fixed virtual window send",
             }
+        if script == "hydration-probe":
+            return {"hydrated": True}
         raise AssertionError(f"unexpected JS: {script[:120]}")
 
     ops = load_ops(fake_js)
@@ -649,6 +720,8 @@ def test_send_message_rejects_duplicate_old_turn_and_nonempty_composer_after_noo
                 "last_user_turn": 1,
                 "last_user_message": "continue",
             }
+        if script == "hydration-probe":
+            return {"hydrated": True}
         raise AssertionError(f"unexpected JS: {script[:120]}")
 
     ops = load_ops(fake_js)
@@ -660,6 +733,8 @@ def test_send_message_rejects_duplicate_old_turn_and_nonempty_composer_after_noo
 
 def test_send_message_returns_unknown_after_click_without_post_send_evidence():
     def fake_js(script):
+        if script == "hydration-probe":
+            return {"hydrated": True}
         if "existing_user_messages" in script:
             return {"found": True, "empty": True, "url": "https://chatgpt.com/", "user_count": 0}
         if "activate_send_button" in script:
@@ -678,6 +753,8 @@ def test_send_message_returns_unknown_after_click_without_post_send_evidence():
 
 def test_send_message_converts_activation_exception_to_unknown_without_retry_signal():
     def fake_js(script):
+        if script == "hydration-probe":
+            return {"hydrated": True}
         if "existing_user_messages" in script:
             return {"found": True, "empty": True, "url": "https://chatgpt.com/", "user_count": 0}
         if "activate_send_button" in script:
@@ -723,6 +800,8 @@ def test_send_message_tolerates_a_transient_post_send_evidence_exception():
                 "last_user_turn": 1,
                 "last_user_message": "recover evidence",
             }
+        if script == "hydration-probe":
+            return {"hydrated": True}
         raise AssertionError(f"unexpected JS: {script[:120]}")
 
     ops = load_ops(fake_js)
@@ -749,6 +828,8 @@ def test_send_message_returns_unknown_when_post_send_evidence_keeps_raising():
             return {"found": True}
         if "last_user_message" in script:
             raise RuntimeError("execution context destroyed after navigation")
+        if script == "hydration-probe":
+            return {"hydrated": True}
         raise AssertionError(f"unexpected JS: {script[:120]}")
 
     ops = load_ops(fake_js)
@@ -933,6 +1014,8 @@ def test_page_conversation_uses_real_page_keys_and_returns_virtualizer_state():
     def fake_js(script):
         if "message_count" in script:
             return next(states)
+        if script == "hydration-probe":
+            return {"hydrated": True}
         raise AssertionError(f"unexpected JS: {script[:120]}")
 
     ops = load_ops(fake_js, press_impl=pressed.append)
@@ -950,6 +1033,8 @@ def test_read_markdown_block_summary_returns_the_full_editor_text():
     def fake_js(script):
         if "writing-block-editor" in script:
             return [{"text": full_markdown, "chars": len(full_markdown)}]
+        if script == "hydration-probe":
+            return {"hydrated": True}
         raise AssertionError(f"unexpected JS: {script[:120]}")
 
     ops = load_ops(fake_js)
@@ -1046,6 +1131,8 @@ def test_read_shared_conversation_closes_the_new_tab_return_value():
 
 def test_send_message_accepts_the_current_send_button_variant():
     def fake_js(script):
+        if script == "hydration-probe":
+            return {"hydrated": True}
         if "existing_user_messages" in script:
             return {"found": True, "empty": True, "url": "https://chatgpt.com/", "user_count": 0,
                     "user_message_ids": [], "last_user_turn": -1}
