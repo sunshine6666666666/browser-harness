@@ -690,12 +690,25 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
         raise RuntimeError("send_message: unified composer must be empty before typing")
     wait(0.4)
     # Wait for the composer to hydrate from the pre-hydration TEXTAREA stub to
-    # the contenteditable DIV before typing. Typing across the swap point lands
-    # part of the text in each variant, which no post-check can reconcile
-    # (2026-09-17 live: TEXTAREA for chunks 0-2, DIV from chunk 3). Typing also
-    # re-triggers hydration: after each chunk the editor may revert to TEXTAREA
-    # and come back as a fresh DIV, so re-gate before every chunk. Skip the
-    # wait in unit tests, where js() is stubbed and returns fake dicts.
+    # the contenteditable DIV before typing. Live 2026-09-17: text typed into
+    # the TEXTAREA stub does NOT migrate to the DIV — only text typed after
+    # hydration lands in the DIV, and leftover stub text can even duplicate
+    # into it. So clear-then-gate: if the stub already holds text, wipe it
+    # (select-all + backspace) before waiting for the DIV. Re-gate before
+    # every chunk; typing can revert the editor to TEXTAREA mid-stream.
+    def _clear_stub_text():
+        try:
+            cdp("Input.dispatchKeyEvent", type="rawKeyDown", key="a", code="KeyA",
+                modifiers=4 if sys.platform == "darwin" else 2,
+                windowsVirtualKeyCode=65, nativeVirtualKeyCode=65)
+            cdp("Input.dispatchKeyEvent", type="keyUp", key="a", code="KeyA",
+                windowsVirtualKeyCode=65, nativeVirtualKeyCode=65)
+            cdp("Input.dispatchKeyEvent", type="keyDown", key="Backspace", code="Backspace",
+                windowsVirtualKeyCode=8, nativeVirtualKeyCode=8)
+            cdp("Input.dispatchKeyEvent", type="keyUp", key="Backspace", code="Backspace",
+                windowsVirtualKeyCode=8, nativeVirtualKeyCode=8)
+        except Exception:
+            pass
     def _hydrated_tag():
         # Test fakes answer the hydration probe with {"hydrated": True}.
         try:
