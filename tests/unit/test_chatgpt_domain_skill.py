@@ -419,6 +419,94 @@ def test_send_message_classifies_post_type_send_preflight_failure_as_not_sent():
     }
 
 
+def test_send_message_stops_when_another_tab_pollutes_draft_after_typing():
+    typed = []
+
+    def fake_js(script):
+        if "existing_user_messages" in script:
+            return {"found": True, "empty": True, "url": "https://chatgpt.com/", "user_count": 0}
+        if "activate_send_button" in script:
+            assert script.count('"current prompt"') == 2
+            assert "editor?.innerText" in script
+            assert "composer_mismatch" in script
+            return {"found": True, "clicked": False, "reason": "composer_mismatch"}
+        if "send_button" in script:
+            return {"found": True}
+        raise AssertionError(f"unexpected JS: {script[:120]}")
+
+    ops = load_ops(fake_js, type_impl=typed.append)
+    evidence = ops["send_message"]("current prompt")
+
+    assert typed == ["current prompt"]
+    assert evidence["status"] == "definitely_not_sent"
+    assert evidence["reason"] == "composer_mismatch_after_typing"
+    assert evidence["click_performed"] is False
+
+def test_send_message_types_long_prompt_in_chunks():
+    typed = []
+    message = "x" * 4500
+
+    def fake_js(script):
+        if "existing_user_messages" in script:
+            return {
+                "found": True, "empty": True, "url": "https://chatgpt.com/",
+                "user_count": 0, "user_message_ids": [], "last_user_turn": -1,
+            }
+        if "activate_send_button" in script:
+            return {"found": True, "clicked": True}
+        if "send_button" in script:
+            return {"found": True}
+        if "last_user_message" in script:
+            return {
+                "url": "https://chatgpt.com/c/chunked-send-test",
+                "composer_empty": True,
+                "user_count": 1,
+                "last_user_message_id": "new-chunked-message",
+                "last_user_turn": 1,
+                "last_user_message": message,
+            }
+        raise AssertionError(f"unexpected JS: {script[:120]}")
+
+    ops = load_ops(fake_js, type_impl=typed.append)
+    evidence = ops["send_message"](message)
+
+    assert typed == ["x" * 2000, "x" * 2000, "x" * 500]
+    assert "".join(typed) == message
+    assert all(len(chunk) <= 2000 for chunk in typed)
+    assert evidence["status"] == "definitely_sent"
+
+
+def test_send_message_types_short_prompt_in_one_call():
+    typed = []
+
+    def fake_js(script):
+        if "existing_user_messages" in script:
+            return {
+                "found": True, "empty": True, "url": "https://chatgpt.com/",
+                "user_count": 0, "user_message_ids": [], "last_user_turn": -1,
+            }
+        if "activate_send_button" in script:
+            return {"found": True, "clicked": True}
+        if "send_button" in script:
+            return {"found": True}
+        if "last_user_message" in script:
+            return {
+                "url": "https://chatgpt.com/c/short-send-test",
+                "composer_empty": True,
+                "user_count": 1,
+                "last_user_message_id": "new-short-message",
+                "last_user_turn": 1,
+                "last_user_message": "short prompt",
+            }
+        raise AssertionError(f"unexpected JS: {script[:120]}")
+
+    ops = load_ops(fake_js, type_impl=typed.append)
+    evidence = ops["send_message"]("short prompt")
+
+    assert typed == ["short prompt"]
+    assert evidence["status"] == "definitely_sent"
+
+
 def test_send_message_accepts_a_collapsed_long_message_prefix_as_evidence():
     marker = "MAINTENANCE-LONG-SEND-2026-08-04"
     message = marker + " " + ("validated role artifact " * 300)

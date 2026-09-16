@@ -637,11 +637,30 @@ def set_reasoning_effort(level: str) -> dict[str, Any]:
     return _verify_radio_after_reopen(level, model=False, first_token=True)
 
 
+def _type_in_chunks(text: str, chunk_size: int = 2000) -> None:
+    """Type long text in chunks so no single CDP call nears the IPC timeout.
+
+    A single 14KB ``Input.insertText`` can stall the page main thread (e.g.
+    ChatGPT background session sync after login) past the harness helper's 5s
+    IPC read timeout. Small slices keep each CDP round-trip far under budget;
+    the editor accumulates plain text identically.
+    """
+    if len(text) <= chunk_size:
+        type_text(text)
+        return
+    for start in range(0, len(text), chunk_size):
+        type_text(text[start:start + chunk_size])
+
+
 def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
     """Send once from the unified composer and return non-retryable evidence.
 
     Preflight failures raise before any click. After the send click, callers get
     ``definitely_sent`` or ``unknown`` and must never resend an ``unknown`` result.
+
+    Long prompts are typed in ~2k-char chunks: one 14KB ``Input.insertText`` can
+    exceed the harness helper's 5s IPC read timeout when the page main thread
+    stalls (background session sync), while small slices stay far under it.
     """
     expected = _norm(text)
     if not expected:
@@ -680,7 +699,7 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
     if not before.get("empty"):
         raise RuntimeError("send_message: unified composer must be empty before typing")
     wait(0.4)
-    type_text(text)
+    _type_in_chunks(text)
     wait(0.5)
     def definitely_not_sent(reason: str) -> dict[str, Any]:
         return {
@@ -729,7 +748,13 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
                     label === '发送提示' || label === 'Send prompt') && el.offsetParent &&
                    !el.disabled && el.getAttribute('aria-disabled') !== 'true';
           });
-          if (!activate_send_button) return {found: false, clicked: false};
+          const editor = form.querySelector('[contenteditable="true"]') || form.querySelector('textarea, [role="textbox"]');
+          const draft = editor && editor.cloneNode(true);
+          if (draft) draft.querySelectorAll('[data-inline-selection-pill][data-id="plugin:connector_openai_deep_research"], [data-inline-selection-pill-cursor-target]').forEach(el => el.remove());
+          const typedText = norm(editor?.innerText || editor?.value || editor?.textContent);
+          const tokenlessText = norm(draft?.textContent || draft?.value);
+          if (!draft || (typedText !== %s && tokenlessText !== %s))
+            return {found: true, clicked: false, reason: 'composer_mismatch'};
           for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
             const event = type.startsWith('pointer')
               ? new PointerEvent(type, {bubbles: true, cancelable: true, pointerId: 1,
@@ -741,7 +766,7 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
           }
           return {found: true, clicked: true};
         })()
-        """) or {}
+        """ % (json.dumps(expected), json.dumps(expected))) or {}
     except Exception:
         return {
             "status": "unknown",
@@ -750,6 +775,8 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
             "composer_empty": False,
             "expected_user_message_found": False,
         }
+    if activated.get("reason") == "composer_mismatch":
+        return definitely_not_sent("composer_mismatch_after_typing")
     if not activated.get("found") or not activated.get("clicked"):
         return {
             "status": "unknown",
