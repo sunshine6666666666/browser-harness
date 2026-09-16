@@ -62,6 +62,8 @@ class FakePage:
         self.confirm_modal_will_open = False
         self.menu_result = {"found": 1, "clicked": True}
         self.popover_delete = True
+        self.replacement_input_ready_after = 0
+        self.replacement_input_checks = 0
         self.confirm_dialog_available = True
         self.page_url = "https://www.ximalaya.com/reform-upload/page/webCenter/upload"
         self._times_patched = False
@@ -264,6 +266,9 @@ class FakePage:
             return self.confirm_dialog_available
         if ".track-1Tfey3X4" in s:
             return json.dumps(self.menu_result)
+        if "item.querySelectorAll" in s and "webuploader-element-invisible" in s:
+            self.replacement_input_checks += 1
+            return self.replacement_input_checks > self.replacement_input_ready_after
         if "sound-more-popover" in s:
             return self.popover_delete
         if "取消|删除|撤销" in s:
@@ -1003,6 +1008,7 @@ def test_replace_sound_once_opens_exact_row_and_uploads_once(tmp_path):
     namespace, page = load_publishing()
     page.menu_result = {"found": 1, "clicked": True, "x": 99, "y": 55}
     page.popover_delete = False
+    page.replacement_input_ready_after = 2
     audio = tmp_path / "replacement.m4a"
     audio.write_bytes(b"x" * 2_000_000)
     before = _replacement_evidence()
@@ -1015,7 +1021,8 @@ def test_replace_sound_once_opens_exact_row_and_uploads_once(tmp_path):
     assert page.gotos == ["https://www.ximalaya.com/reform-upload/page/sound/manage/88294964"]
     assert len(page.upload_calls) == 1
     assert page.upload_calls[0][0] == namespace["REPLACEMENT_INPUT_SELECTOR"]
-    assert page.clicks == [(99, 55), (10, 20)]
+    assert page.replacement_input_checks == 3
+    assert page.clicks == [(99, 55)]
 
 
 def test_replace_sound_once_verifies_same_track_with_changed_audio(tmp_path):

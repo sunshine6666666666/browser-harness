@@ -1405,6 +1405,10 @@ def track_evidence(album_id: str, track_id: str,
         "category_id": item.get("categoryId") or item.get("albumCategoryId") or "",
         "visibility": detail.get("visibleStatus", status_info.get("isPublic", "")),
         "publish_state": detail.get("approveStatus") or status_info.get("trackStatus") or "",
+        "is_paid": detail.get("isPaid", album.get("isPaid")),
+        "is_own": bool(detail.get("isOwn")),
+        "price_type": detail.get("priceType", item.get("priceType")),
+        "can_delete": detail.get("canDelete", item.get("canDelete")),
         "record_id": str(item.get("recordId") or ""),
         "account_uid": str(detail.get("anchorUid") or item.get("anchorId") or ""),
         "source": "album_tracks+track_simple",
@@ -1506,7 +1510,13 @@ def replace_sound_once(track: dict[str, Any], replacement_file: str,
         raise RuntimeError("ximalaya replacement live track target mismatch")
     before = dict(live_before)
     _open_track_menu(title, track_id)
-    _click_track_menu_item("替换声音")
+    _wait_until(lambda: js("""(() => {
+      const item = [...document.querySelectorAll(
+        '.ant-popover.sound-more-popover .item-2RWRS8jo')]
+        .find(e => e.offsetParent && e.getAttribute('aria-label') === '替换声音');
+      return !!item && item.querySelectorAll(%s).length === 1;
+    })()""" % _json(REPLACEMENT_INPUT_SELECTOR)), 10,
+                "ximalaya replacement uploader input did not become ready")
     uploads = 1
     confirms = 0
     try:
@@ -1554,6 +1564,171 @@ def replace_sound_once(track: dict[str, Any], replacement_file: str,
             "replacement": {"path": str(path), "metadata": replacement},
             "diagnostics": "replacement result not verified before deadline" +
                            (": %s" % last_error if last_error else "")}
+
+
+def _successor_eligible(track: dict[str, Any]) -> bool:
+    """Require positive free/public/deletable evidence before keepalive writes."""
+    if track.get("is_paid") is not False:
+        return False
+    visibility = track.get("visibility")
+    if visibility not in (0, 2, True, "0", "2"):
+        return False
+    state = track.get("publish_state")
+    if state not in (1, 2, True, "1", "2"):
+        return False
+    return track.get("can_delete") in (None, True, "1", 1) and bool(track.get("track_id"))
+
+
+def prepare_successor_upload(old_track: dict[str, Any], audio_file: str,
+                             timeout: int = 900) -> dict[str, Any]:
+    """Prepare one same-title successor while allowing only one exact old target."""
+    if not isinstance(old_track, dict):
+        raise TypeError("ximalaya successor requires an old track evidence dict")
+    old_id = _decimal_id(old_track.get("track_id"), "old_track_id")
+    album_id = _decimal_id(old_track.get("album_id"), "album_id")
+    title = _normalized_text(old_track.get("title"))
+    if not title or _title_units(title) > TITLE_MAX:
+        raise ValueError("ximalaya successor title is empty or exceeds 40 UTF-16 units")
+    identity = require_identity()
+    fresh = track_evidence(album_id, old_id, title)
+    if not _same_track_identity(old_track, fresh) or not _successor_eligible(fresh):
+        raise RuntimeError("ximalaya successor old track is not a verified free public deletable target")
+    matches = [m for m in archive_matches(title) if m["album_id"] == album_id]
+    if len(matches) != 1 or matches[0]["content_id"] != old_id:
+        raise RuntimeError("ximalaya successor requires exactly one same-title old record in target album")
+    path = _validate_upload_file(audio_file)
+    probe = _probed_audio(path)
+    if page_info().get("url") != UPLOAD_URL:
+        raise RuntimeError("ximalaya successor requires the exact upload page")
+    upload_file("input[type=file].webuploader-element-invisible", str(path))
+    stem = path.stem
+    row = _wait_until(
+        lambda: next((r for r in (js(JS_ROWS_STATE) or [])
+                      if (r.get("title") or "").endswith(stem) and r.get("success")
+                      and "上传成功" in r.get("status", "")), None),
+        timeout, "ximalaya successor upload completion not observed for %s" % stem)
+    return {"identity": identity, "status": "prepared", "old": fresh,
+            "album_id": album_id, "title": title, "audio": str(path),
+            "probed": probe, "upload_completed": row, "retry": False}
+
+
+def submit_successor_once(old_track: dict[str, Any], run_marker: str = "",
+                          timeout: int = 600) -> dict[str, Any]:
+    """Publish one successor and identify it from the target album set difference."""
+    if not run_marker:
+        raise ValueError("ximalaya successor submit requires a nonempty run marker")
+    old_id = _decimal_id(old_track.get("track_id"), "old_track_id")
+    album_id = _decimal_id(old_track.get("album_id"), "album_id")
+    title = _normalized_text(old_track.get("title"))
+    identity = require_identity()
+    before = {item["track_id"] for item in list_album_tracks(album_id)}
+    if old_id not in before:
+        raise RuntimeError("ximalaya successor old track disappeared before submit")
+    first = submission_snapshot()
+    wait(2)
+    second = submission_snapshot()
+    if _snapshot_comparable(first) != _snapshot_comparable(second):
+        raise RuntimeError("ximalaya successor preflight was not stable")
+    problems = []
+    if second.get("title") != title:
+        problems.append("title_readback")
+    if not second.get("upload_ready") or not second.get("album"):
+        problems.append("upload_or_album_missing")
+    if second.get("scheduled"):
+        problems.append("mode_not_immediate")
+    submit = second.get("submit") or {}
+    if not second.get("submit") or submit.get("disabled") or submit.get("text") != "确认发布":
+        problems.append("submit_not_ready")
+    if second.get("validation_errors") or second.get("modal"):
+        problems.append("form_not_ready")
+    if problems:
+        raise RuntimeError("ximalaya successor preflight failed: %s" % ",".join(problems))
+    if not js("""(() => { const b=document.querySelector('button[aria-label="确认发布"]');
+      if (!b || b.disabled || !b.offsetParent) return false; b.click(); return true; })()"""):
+        raise RuntimeError("ximalaya successor submit control not activatable")
+    submit_clicks = 1
+    wait(1.0)
+    if js("""(() => { const m=document.querySelector('.ant-modal');
+      return m && m.offsetParent && (m.innerText || '').includes('确认') ? 'open' : null; })()"""):
+        if not _confirm_dialog_accept():
+            return {"identity": identity, "status": "submission_unverified",
+                    "submit_clicks": submit_clicks, "retry": False,
+                    "old_track_id": old_id, "album_id": album_id, "title": title,
+                    "run_marker": run_marker}
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            after_items = list_album_tracks(album_id)
+        except (RuntimeError, TimeoutError):
+            after_items = []
+        added = [item for item in after_items if item["track_id"] not in before]
+        if len(added) == 1:
+            new_id = added[0]["track_id"]
+            try:
+                successor = track_evidence(album_id, new_id, title)
+            except (RuntimeError, TimeoutError):
+                successor = None
+            if successor and _successor_eligible(successor):
+                return {"identity": identity, "status": "verified", "retry": False,
+                        "submit_clicks": submit_clicks, "old_track_id": old_id,
+                        "new_track_id": new_id, "album_id": album_id, "title": title,
+                        "successor": successor, "before_ids": sorted(before),
+                        "after_ids": sorted(item["track_id"] for item in after_items),
+                        "run_marker": run_marker}
+        wait(min(10, max(0.5, deadline - time.monotonic())))
+    return {"identity": identity, "status": "submission_unverified", "retry": False,
+            "submit_clicks": submit_clicks, "old_track_id": old_id,
+            "album_id": album_id, "title": title, "run_marker": run_marker}
+
+
+def delete_published_track_once(old_track: dict[str, Any], successor: dict[str, Any],
+                                confirm: bool = False, timeout: int = 180) -> dict[str, Any]:
+    """Delete exactly one old published track after its successor is verified."""
+    if confirm is not True:
+        raise ValueError("ximalaya delete_published_track_once requires confirm=True")
+    if not isinstance(old_track, dict) or not isinstance(successor, dict):
+        raise TypeError("ximalaya keepalive deletion requires two evidence dicts")
+    old_id = _decimal_id(old_track.get("track_id"), "old_track_id")
+    new_id = _decimal_id(successor.get("new_track_id") or successor.get("track_id"), "new_track_id")
+    album_id = _decimal_id(old_track.get("album_id"), "album_id")
+    title = _normalized_text(old_track.get("title"))
+    if successor.get("status") != "verified":
+        raise RuntimeError("ximalaya keepalive deletion requires a verified successor")
+    if old_id == new_id or str(successor.get("album_id")) != album_id:
+        raise RuntimeError("ximalaya keepalive old and successor identity mismatch")
+    backup = old_track.get("local_audio_path") or old_track.get("download_path")
+    if not backup or not Path(str(backup)).is_file():
+        raise RuntimeError("ximalaya keepalive requires a complete local old-audio backup")
+    fresh_old = track_evidence(album_id, old_id, title)
+    fresh_new = track_evidence(album_id, new_id, title)
+    if not _successor_eligible(fresh_old) or not _successor_eligible(fresh_new):
+        raise RuntimeError("ximalaya keepalive deletion target is not positively eligible")
+    current = [item["track_id"] for item in list_album_tracks(album_id)
+               if _normalized_text(item.get("title")) == title]
+    if sorted(current) != sorted({old_id, new_id}):
+        raise RuntimeError("ximalaya keepalive requires exactly the old and successor same-title IDs before delete")
+    try:
+        _api_post(TRACK_DELETE_API, {"trackId": int(old_id)}, "published track deletion")
+    except (RuntimeError, TimeoutError) as exc:
+        error = str(exc)
+    else:
+        error = ""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            ids = [item["track_id"] for item in list_album_tracks(album_id)
+                   if _normalized_text(item.get("title")) == title]
+        except (RuntimeError, TimeoutError):
+            ids = []
+        if old_id not in ids and ids.count(new_id) == 1:
+            return {"status": "deleted", "retry": False, "delete_activated": True,
+                    "old_track_id": old_id, "new_track_id": new_id, "album_id": album_id,
+                    "title": title, "verification_source": "album_track_id_lists"}
+        wait(min(3, max(0.2, deadline - time.monotonic())))
+    return {"status": "deletion_unverified", "retry": False,
+            "delete_activated": True, "old_track_id": old_id,
+            "new_track_id": new_id, "album_id": album_id, "title": title,
+            "diagnostics": error or "old track remains or successor is missing"}
 
 def _match_record(item: dict[str, Any], title: str, content_id: str | None,
                   mode: str) -> dict[str, Any] | None:

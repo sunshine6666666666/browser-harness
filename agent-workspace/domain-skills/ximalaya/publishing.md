@@ -30,7 +30,7 @@ cross-origin iframe; opening the iframe URL directly is the supported path.
 
 ## Required page-info order
 
-1. `new_tab(UPLOAD_URL)`; `protect_tab(target, owner=..., purpose=...)`.
+1. Normally `new_tab(UPLOAD_URL)`. If the attached managed window is `fullscreen`, leave it untouched: create a separate Target with `cdp("Target.createTarget", url="about:blank", newWindow=True, background=True, focus=False, windowState="minimized")`, then `switch_tab(target)` without activation and `goto_url(UPLOAD_URL)`. In either case `protect_tab(target, owner=..., purpose=...)`.
 2. `wait_for_load()`; print `page_info()`.
 3. If `domain_skill_files` is returned, read every listed Markdown file first.
 4. Verify only that the current session is logged in (`require_identity()`).
@@ -57,7 +57,10 @@ cross-origin iframe; opening the iframe URL directly is the supported path.
 | `submission_diagnostics()` | Bounded reason enum: `form_validation_failed`, `confirmation_required`, `platform_rejected`, `auth_required`, `result_delayed`, `click_not_accepted`, `submission_unverified`. |
 | `manager_evidence(title, content_id=None, expected_schedule=None, attempts=3)` | Read-only manager/API reconciliation (scheduled list + album tracks); requires exact title, and exact content ID once known. |
 | `submit_once(title, expected_uid=None, expected_name=None, expected_mode="scheduled", expected_schedule=None, run_marker="", timeout=600)` | Login-gated two stable snapshots, then ONE click on `确认发布` (plus at most one platform confirmation dialog click that is part of the same activation); read-only reconciliation afterwards. |
+| `prepare_successor_upload(old_track, audio_file, timeout=900)` | 保活窄路径：仅当目标专辑恰有指定旧同标题节目且旧节目明确免费、公开并可删除时，准备一次同标题上传；其他专辑同名只作观察，不比较账号身份字段。 |
+| `submit_successor_once(old_track, run_marker="", timeout=600)` | 保活窄路径：提交只激活一次，按目标专辑提交前后 track ID 集合差确认唯一 successor，再用 `track_evidence` 验证；未知结果 `retry=false`。 |
 | `delete_once(submission, expected_uid=None, expected_name=None, confirm=False, timeout=180)` | Login-gated deletion of only the verified record created by this module (`created_by="ximalaya_domain_skill"`, `submit_clicks=1`, run marker in exact title, live record with exact content ID). |
+| `delete_published_track_once(old_track, successor, confirm=False, timeout=180)` | 保活窄路径：要求 fresh 旧证据、已验证 successor、同专辑同标题、旧音频本地备份和 `confirm=True`；只删精确旧 ID 一次并双列表确认。 |
 | `track_evidence(album_id, track_id, expected_title=None)` | Read-only exact-track evidence from the album list plus `/revision/track/simple`; paginates the album list and rejects missing, cross-album, title-mismatch, or duplicate matches. |
 | `replace_sound_once(track, replacement_file, expected_uid=None, expected_name=None, confirm=False, timeout=900)` | Independent login-gated one-shot replacement of one exact track: requires a readable positive duration, one `替换声音` file attachment, optional one confirmation, then read-only same-track/media-change verification. |
 | `update_track_description_once(track, description, expected_uid=None, expected_name=None, confirm=False, timeout=180)` | Login-gated edit of one exact published track: saves one normalized KindEditor description, reopens the page, and verifies the text plus unchanged adjacent fields. |
@@ -95,6 +98,10 @@ visibility/category/publish-state evidence, and non-secret audio evidence such a
 album list endpoint is `GET /reform-upload/manage/album/tracks` with pages of 50;
 the detail endpoint is `GET /revision/track/simple?trackId={trackId}`. The detail
 API reports `ret=200`. No full media URL, headers, cookies, or tokens are stored.
+Keepalive callers must also use its positive `is_paid=false`, public
+`visibility`, published `publish_state` and (when exposed) `can_delete` fields;
+a missing free/public/deletable signal is not treated as permission. `is_own`,
+UID, display name and `account_uid` remain observational and are not gates.
 
 `replace_sound_once()` requires `confirm is True`, a logged-in session, an exact
 track evidence dict, and a fresh `track_evidence()` whose ID, album and title
@@ -106,10 +113,11 @@ match, and opens the menu by the verified `mouseover` trigger, falling back to
 a native coordinate click when the popover is not rendered. The menu is
 `.ant-popover.sound-more-popover`; the sound item is `.item-2RWRS8jo[aria-label="替换声音"]`
 with a `.webuploader-pick` child. The audio input is resolved as
-`input[type=file].webuploader-element-invisible[accept*=".M4A"]` after the
-sound uploader is attached; the accepted audio domain is the same 11-format
-domain used by the upload form. The historical discovery run did not activate
-that file chooser or attach a file to any historical sound.
+`input[type=file].webuploader-element-invisible[accept*=".M4A"]` inside the
+visible `替换声音` menu item. Wait until exactly one such input is mounted before
+CDP file attachment; menu visibility alone does not prove uploader readiness.
+Do not click the item to open a native file chooser. The accepted audio domain
+is the same 11-format domain used by the upload form.
 
 The method attaches at most once (`replacement_uploads=1`), records that fact
 before waiting for processing. The replacement modal keeps its confirmation
@@ -125,6 +133,29 @@ publish state. A timeout, changed target, duplicate, or unchanged audio is
 `status="replacement_unverified"`, `retry=False`; reconcile read-only and never
 attach the file again. Replacing historical content requires separate exact
 authorization and is not covered by the live test authorization.
+
+### Keepalive successor and deletion contract
+
+`prepare_successor_upload()` is the only path that may prepare a same-title
+successor. It requires fresh `track_evidence()` for the exact old ID, positive
+`isPaid=false`, public visibility and published state, and exactly one
+same-title record in the target album. `isOwn`, UID and account names are not
+compared. Other albums may contain the same title; they are observations only.
+The local audio is validated before the upload page is touched.
+
+`submit_successor_once()` keeps the immediate publish form stable and clicks
+`确认发布` at most once. It compares the complete target-album ID set before
+and after the click; `manager_evidence(title)` or the first same-title row is
+never used as the new ID. A non-unique set difference or uncertain response
+returns `submission_unverified` with `retry=false`, leaving the old record.
+
+`delete_published_track_once()` is separate from the test-record-only
+`delete_once()`. Before its single `POST /reform-upload/manage/album/track/delete`
+it rechecks both exact IDs, same album/title, free/public eligibility, and a
+complete local backup of the old audio. After activation it only reads the
+target album lists: success requires the old ID absent and the new ID still
+unique. Timeout or any uncertainty returns `deletion_unverified` with
+`retry=false`; never delete the new ID or issue a second POST.
 
 ### Published-track description and cover edits
 
@@ -253,10 +284,12 @@ submit enabled · no modal · no validation error.
 
 ## Browser/tab cleanup
 
-- Only close tabs your own `new_tab()` returned; close by exact target ID.
+- Only close Targets returned by your own `new_tab()` or the explicit fullscreen `Target.createTarget(newWindow=True)` exception; close by exact target ID.
 - `protect_tab` during work; `unprotect_tab` before closing.
-- `new_tab()` must create a background Target. Keep its Browser window
-  `minimized` when attaching; never call `activate_tab()`, pass
+- Keep the task Target's Browser window `minimized` when attaching. A fullscreen
+  original window must not be restored or directly minimized; use the separate
+  already-minimized window above and verify its state before any platform write.
+  Never call `activate_tab()`, pass
   `activate=True`, call `Target.activateTarget` or call `Page.bringToFront`.
 - Agent Pool serializes each browser; never bypass the pool with a raw CDP URL.
 
