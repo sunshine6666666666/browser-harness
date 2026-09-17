@@ -188,6 +188,86 @@ def require_identity(expected_uid: int | None = None,
     return account_identity()
 
 
+ALBUM_CREATE_URL = "https://www.ximalaya.com/anchor-activity-web/anchor/albumMgr#/album/createFree"
+ALBUM_TITLE_MAX = 25
+
+_ALBUM_MODEL_JS = """(() => {
+  const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+  const btn = [...document.querySelectorAll('button')].find(
+    e => e.offsetParent && norm(e.innerText) === '确认创建');
+  if (!btn) return '';
+  const fkey = Object.keys(btn).find(k => k.indexOf('__reactInternalInstance') === 0);
+  let f = btn[fkey];
+  for (let d = 0; d < 12 && f; d++) {
+    try {
+      if (f.stateNode && f.stateNode.refs && f.stateNode.refs.$form) {
+        const form = f.stateNode.refs.$form;
+        const m = form.getVaildModel ? form.getVaildModel() : form.props.model;
+        return JSON.stringify(m);
+      }
+    } catch (e) {}
+    f = f.return;
+  }
+  return '';
+})()"""
+
+
+def _album_model() -> dict[str, Any]:
+    """Read the album create form model (title, categoryId, image, tags...)."""
+    raw = js(_ALBUM_MODEL_JS)
+    if not raw:
+        raise RuntimeError("ximalaya album create page not ready: form model unreadable")
+    return json.loads(raw)
+
+
+def _album_react_set(selector: str, value: str) -> None:
+    """Set a React-controlled text input by invoking its onChange with the field name.
+
+    Discovered 2026-09-17: the album title/selling-point inputs ignore native
+    value setters and synthetic input events (model stays empty, submit
+    validation reports the field missing). Calling the React onChange prop
+    with ``{target: {name, value}}`` updates the model.
+    """
+    ok = js("((selector, value) => {\n"
+            "  const el = document.querySelector(selector);\n"
+            "  if (!el) return 'missing';\n"
+            "  const hkey = Object.keys(el).find(k => k.indexOf('__reactEventHandlers') === 0);\n"
+            "  const fn = hkey && el[hkey].onChange;\n"
+            "  if (typeof fn !== 'function') return 'no-handler';\n"
+            "  fn({target: {name: el.name, value: value}});\n"
+            "  return 'ok';\n"
+            "})(" + _json(selector) + ", " + _json(value) + ")")
+    if ok != "ok":
+        raise RuntimeError("ximalaya album react input not set: %s -> %s" % (selector, ok))
+
+
+def _album_validate_field(prop: str, timeout: float = 10) -> str | None:
+    """Run the form's per-field validator; return the error message or None."""
+    js("((prop) => {\n"
+       "  const norm = s => (s || '').replace(/\\\\s+/g, ' ').trim();\n"
+       "  const btn = [...document.querySelectorAll('button')].find(\n"
+       "    e => e.offsetParent && norm(e.innerText) === '确认创建');\n"
+       "  const fkey = Object.keys(btn).find(k => k.indexOf('__reactInternalInstance') === 0);\n"
+       "  let f = btn[fkey];\n"
+       "  for (let d = 0; d < 12 && f; d++) {\n"
+       "    try {\n"
+       "      if (f.stateNode && f.stateNode.refs && f.stateNode.refs.$form) {\n"
+       "        f.stateNode.refs.$form.validateField(prop, err => {\n"
+       "          window.__album_field_result = err ? JSON.stringify(err).slice(0, 200) : 'OK';\n"
+       "        });\n"
+       "        return 'validating:' + prop;\n"
+       "      }\n"
+       "    } catch (e) {}\n"
+       "    f = f.return;\n"
+       "  }\n"
+       "  window.__album_field_result = 'NO_FORM';\n"
+       "  return 'no-form';\n"
+       "})(" + _json(prop) + ")")
+    return _wait_until(lambda: (lambda v: v if v != "pending" else None)(
+        js("window.__album_field_result") or ""), timeout,
+        "ximalaya album field validation never resolved: %s" % prop)
+
+
 # ------------------------------------------------------------------ facts
 
 def publishing_constraints() -> dict[str, Any]:
@@ -587,6 +667,139 @@ def select_album(album_id: str, expected_name: str | None = None,
         js(JS_ALBUM_READBACK) or ""), timeout,
         "ximalaya album readback never matched %r" % wanted_title)
     return {"album_id": str(album_id), "album_title": readback, "readback": True}
+
+def create_album(title: str, category: str, cover_path: str, intro: str,
+                 selling_point: str, tags: list[str],
+                 expected_uid: int | None = None,
+                 expected_name: str | None = None,
+                 visibility: str = "public", timeout: float = 30) -> dict[str, Any]:
+    """Create one free album and return its album_id (verified via list_albums diff).
+
+    Live-verified 2026-09-17 (album 130150010). Page: ALBUM_CREATE_URL
+    (React; the studio shell embeds it in a cross-origin iframe, so navigate
+    to the albumMgr URL directly). Required: title (<=25 chars), category
+    (level-1 li.xui-select-options_item, e.g. 外语), square cover >=500px
+    (<10M, upload + crop confirm + wait for model.image), KindEditor intro
+    (+ editor.sync()), selling point (customTitle rule), full tag chain
+    (every is-require row needs a leaf, e.g. 内容分类 all three + leaves),
+    AI-cover radio, agreement checkbox. Submit fires
+    POST /anchor-activity-web/album/createFree; success returns albumId and
+    navigates to #/album/editFree/<id>. Creation success counts on submit;
+    platform review afterwards is out of scope.
+    """
+    wanted = _normalized_text(title)
+    if not 0 < len(wanted) <= ALBUM_TITLE_MAX:
+        raise ValueError("ximalaya album title must be 1..%s chars, got %s" %
+                         (ALBUM_TITLE_MAX, len(wanted)))
+    if visibility != "public":
+        raise ValueError("ximalaya create_album only supports public albums")
+    identity = require_identity(expected_uid, expected_name)
+    albums_before = {a["album_id"] for a in list_albums()}
+    _album_react_set('input[placeholder="请输入专辑名称"]', wanted)
+    _album_react_set('input[placeholder="请输入专辑卖点"]', _normalized_text(selling_point))
+    if not selling_point or not _normalized_text(selling_point):
+        raise ValueError("ximalaya album selling point (customTitle) is required")
+    picked = js("((name) => {\n"
+                "  const norm = s => (s || '').replace(/\\\\s+/g, ' ').trim();\n"
+                "  const items = [...document.querySelectorAll('li.xui-select-options_item')];\n"
+                "  for (const it of items) {\n"
+                "    if (norm(it.innerText) === name) { it.click(); return true; }\n"
+                "  }\n"
+                "  return false;\n"
+                "})(" + _json(category) + ")")
+    if not picked:
+        raise RuntimeError("ximalaya album category %r not found" % category)
+    wait(1.0)
+    image_path, width, height = _validate_cover_file(cover_path)
+    upload_file('input[type=file][accept*=".PNG"]', str(image_path))
+    _wait_until(lambda: js("""(() => {
+      const modals = [...document.querySelectorAll('h4')].filter(
+        e => e.offsetParent && (e.innerText || '').trim() === '裁剪封面');
+      return modals.length ? true : null;
+    })()"""), timeout, "ximalaya album crop modal did not open")
+    crop_ok = js("""(() => {
+      const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+      const btns = [...document.querySelectorAll('button')].filter(e => e.offsetParent);
+      const b = btns.find(e => norm(e.innerText) === '确定');
+      if (!b) return false;
+      const key = Object.keys(b).find(k => k.indexOf('__reactEventHandlers') === 0);
+      const fn = key && b[key].onClick;
+      if (typeof fn !== 'function') { b.click(); return 'dom-click'; }
+      fn({preventDefault() {}, stopPropagation() {}});
+      return 'react-click';
+    })()""")
+    if not crop_ok:
+        raise RuntimeError("ximalaya album crop confirm not found")
+    _wait_until(lambda: (lambda m: m.get("image") or None)(_album_model()),
+                timeout, "ximalaya album cover never reached the form model")
+    synced = js("((html) => {\n"
+                "  const ke = document.querySelector('iframe.ke-edit-iframe');\n"
+                "  if (!ke) return 'no-editor';\n"
+                "  const doc = ke.contentDocument;\n"
+                "  doc.body.focus();\n"
+                "  doc.execCommand('selectAll', false, null);\n"
+                "  if (!doc.execCommand('insertText', false, html)) return 'no-insert';\n"
+                "  const eds = window.KindEditor && window.KindEditor.instances || [];\n"
+                "  for (const ed of eds) { try { ed.sync(); } catch (e) {} }\n"
+                "  return 'ok';\n"
+                "})(" + _json(_normalized_text(intro)) + ")")
+    if synced != "ok":
+        raise RuntimeError("ximalaya album intro not set: %s" % synced)
+    tag_res = js("((names) => {\n"
+                 "  const norm = s => (s || '').replace(/\\\\s+/g, ' ').trim();\n"
+                 "  const wrap = document.querySelector('.album-tags1');\n"
+                 "  if (!wrap) return 'no-tags';\n"
+                 "  const out = {};\n"
+                 "  for (const name of names) {\n"
+                 "    const tags = wrap.querySelectorAll('.xui-tag1');\n"
+                 "    let hit = false;\n"
+                 "    for (const t of tags) {\n"
+                 "      if (norm(t.innerText) === name) { t.click(); hit = true; break; }\n"
+                 "    }\n"
+                 "    out[name] = hit;\n"
+                 "  }\n"
+                 "  return JSON.stringify(out);\n"
+                 "})(" + _json(list(tags)) + ")")
+    missing = [k for k, v in json.loads(tag_res or "{}").items() if not v]
+    if tag_res == "no-tags" or missing:
+        raise RuntimeError("ximalaya album tags missing: %s" % (missing or tag_res))
+    js("""(() => {
+      const radios = document.querySelectorAll('input[type=radio]');
+      if (radios[0] && !radios[0].checked) radios[0].click();
+      const cb = document.querySelector('input[type=checkbox]');
+      if (cb && !cb.checked) cb.click();
+    })()""")
+    wait(1.0)
+    for prop in ("title", "customTitle", "richIntro", "image", "categoryId", "tags"):
+        err = _album_validate_field(prop, timeout)
+        if err != "OK":
+            raise RuntimeError("ximalaya album field %s invalid: %s" % (prop, err))
+    clicked = js("""(() => {
+      const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+      const btns = [...document.querySelectorAll('button')].filter(e => e.offsetParent);
+      const b = btns.find(e => norm(e.innerText) === '确认创建' && !e.disabled);
+      if (!b) return false;
+      b.click();
+      return true;
+    })()""")
+    if not clicked:
+        raise RuntimeError("ximalaya album submit button not clickable")
+    deadline = time.monotonic() + 60
+    new_ids: list[str] = []
+    while time.monotonic() < deadline:
+        wait(3.0)
+        current = {a["album_id"] for a in list_albums()}
+        new_ids = sorted(current - albums_before)
+        if new_ids:
+            break
+    if not new_ids:
+        raise RuntimeError("ximalaya album creation unverified: no new album appeared")
+    if len(new_ids) != 1:
+        raise RuntimeError("ximalaya album creation ambiguous: %s" % new_ids)
+    album = next(a for a in list_albums() if a["album_id"] == new_ids[0])
+    return {"album_id": album["album_id"], "title": album["title"],
+            "category_id": album["category_id"], "cover": {"width": width, "height": height},
+            "account": {"uid": identity["uid"], "name": identity["name"]}}
 
 
 def set_title(title: str, timeout: float = 15) -> str:

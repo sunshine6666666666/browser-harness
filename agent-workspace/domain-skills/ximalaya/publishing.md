@@ -48,6 +48,7 @@ cross-origin iframe; opening the iframe URL directly is the supported path.
 | `archive_matches(title)` | Exact normalized-title matches across the scheduled list and every album's complete track list; fails closed if any album cannot be read. |
 | `prepare_upload(audio_file, title, expected_uid=None, expected_name=None, timeout=900)` | Exact-upload-page + login + duplicate + local-file gates, one upload, waits for row status `上传成功`. |
 | `select_album(album_id, expected_name=None, timeout=15)` | Selects one exact stable album ID; refuses ambiguous duplicate titles before the title-scoped DOM click; verifies readback on `button[aria-label="选择专辑"]`. |
+| `create_album(title, category, cover_path, intro, selling_point, tags, expected_uid=None, expected_name=None, visibility="public", timeout=30)` | Creates one free album on the albumMgr create page (React); title ≤25 chars, level-1 category click, square cover upload + crop + model readback, KindEditor intro + sync, selling point, full required tag chain, AI-cover 否, agreement check, per-field validation, ONE submit click; verifies via `list_albums` ID diff. Creation success counts on submit; platform review is out of scope. |
 | `set_title(title, timeout=15)` | Required 节目标题 setter (max 40 UTF-16 code units). |
 | `set_custom_cover(path, timeout=30)` | Local validation (square, ≥500×500, ≤10M, png/jpg/jpeg/bmp), uploads, confirms the crop modal once, returns server readback. |
 | `set_description(text, timeout=15)` | Writes 节目简介 through the KindEditor iframe (select-all + insertHTML + blur) and verifies the hidden textarea sync. |
@@ -203,6 +204,12 @@ the counters and last evidence; it never uploads or saves again.
 | Schedule display | `YYYY-MM-DD HH:MM:00` | accepted |
 | Required fields | 节目标题, 分类 (auto from album), 节目类型 | enforced (ant-form-item-required + defaults) |
 | Defaults | 免费, AI=否, 权限=公开, 知识产权承诺 checked | accepted |
+| Album title | max 25 chars, counter N/25 | enforced |
+| Album cover | same square domain as track cover (≥500×500, <10M); crop modal confirm; must reach form model `image` | enforced (live 2026-09-17: native upload alone leaves model empty until crop confirm) |
+| Album intro | KindEditor iframe + `editor.sync()` to `textarea[name=richIntro]` | enforced |
+| Album selling point | `customTitle` rule, React onChange required | enforced |
+| Album tags | every `is-require` row needs a leaf (外语: 内容分类 all three + per-row leaves); custom `#custom-input` suggestions unreliable | enforced |
+| Album text inputs | React-controlled: must call `onChange({target:{name,value}})`; native setters + input events leave model empty | enforced |
 
 ## Workflow example (scheduled)
 

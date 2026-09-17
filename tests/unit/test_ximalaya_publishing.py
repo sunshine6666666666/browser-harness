@@ -54,6 +54,17 @@ class FakePage:
         self.edit_track_data = None
         self.save_delay = 0
         self.readback_delay = 0
+        self.album_form_model = {"title": "", "categoryId": "", "image": "",
+                                   "customTitle": "", "richIntro": ""}
+        self.album_react_sets = {}
+        self.album_categories = {"外语"}
+        self.album_field_errors = {}
+        self.album_validated = []
+        self.album_field_result = "OK"
+        self.album_submitted = False
+        self.new_album = {"album_id": "130150010", "title": "英语口语天天练",
+                          "custom_title": "每天一句，口语天天进步",
+                          "category_id": 5, "price_type_id": 0, "uploadSource": 0}
         self.upload_calls = []
         self.clicks = []
         self.gotos = []
@@ -194,6 +205,41 @@ class FakePage:
             return self.description_html
         if "更换图片" in s:
             return json.dumps(self.cover_state) if self.cover_state else None
+        if "getVaildModel" in s and "确认创建" in s:
+            return json.dumps(self.album_form_model)
+        if "__reactEventHandlers" in s and "fn({target:" in s:
+            match = re.search(r"\}\)\(\s*\"(.*?)\"\s*,\s*\"(.*?)\"\s*\)\s*$", s, re.S)
+            if match:
+                self.album_react_sets[match.group(1)] = match.group(2)
+            return "ok"
+        if "li.xui-select-options_item" in s:
+            match = re.search(r"\}\)\(\s*(\".*?\")\s*\)\s*$", s, re.S)
+            try:
+                name = json.loads(match.group(1)) if match else ""
+            except ValueError:
+                name = ""
+            return name in self.album_categories
+        if "裁剪封面" in s:
+            return True if self.crop_modal_open else None
+        if "__reactEventHandlers" in s and "preventDefault" in s:
+            self.album_form_model["image"] = "storages/test/cover.jpeg"
+            return "react-click"
+        if "ke-edit-iframe" in s and "KindEditor" in s:
+            self.album_form_model["richIntro"] = "intro-set"
+            return "ok"
+        if "validateField(prop, err" in s:
+            match = re.search(r"\}\)\(\s*(\".*?\")\s*\)\s*$", s, re.S)
+            prop = json.loads(match.group(1)) if match else ""
+            err = self.album_field_errors.get(prop)
+            self.album_validated.append(prop)
+            self.album_field_result = "OK" if err is None else json.dumps(err)
+            return "validating:" + prop
+        if s.strip() == "window.__album_field_result":
+            return self.album_field_result
+        if "确认创建" in s and "!e.disabled" in s:
+            self.album_submitted = True
+            self.albums.append(dict(self.new_album))
+            return True
 
         if "保存" in s and "getBoundingClientRect" in s and "return {x:" in s:
             self.save_target = (30, 40)
@@ -528,6 +574,63 @@ def test_select_album_refuses_ambiguous_duplicate_titles():
     with pytest.raises(RuntimeError, match="title is not unique"):
         namespace["select_album"]("88294964")
     assert page.clicks == []
+
+
+def _album_page(page, field_errors=None):
+    page.album_form_model = {"title": "", "categoryId": "", "image": "",
+                             "customTitle": "", "richIntro": ""}
+    page.album_field_errors = dict(field_errors or {})
+    page.album_validated = []
+    page.album_field_result = "OK"
+    page.album_submitted = False
+    page.album_react_sets = {}
+    page.crop_modal_open = True
+    page.cover_state = None
+    return page
+
+
+def _album_kwargs(tmp_path):
+    from PIL import Image
+    cover = tmp_path / "album.png"
+    Image.new("RGB", (1080, 1080)).save(cover)
+    return {"title": "英语口语天天练", "category": "外语",
+            "cover_path": str(cover), "intro": "每天一句地道英语口语。",
+            "selling_point": "每天一句，口语天天进步",
+            "tags": ["外语分类", "语言", "英语"]}
+
+
+def test_create_album_rejects_bad_title_and_cover(tmp_path):
+    namespace, page = load_publishing()
+    _album_page(page)
+    with pytest.raises(ValueError, match="1..25"):
+        namespace["create_album"](**{**_album_kwargs(tmp_path), "title": "x" * 26})
+    small = tmp_path / "small.png"
+    from PIL import Image
+    Image.new("RGB", (400, 400)).save(small)
+    with pytest.raises(ValueError, match="square"):
+        namespace["create_album"](**{**_album_kwargs(tmp_path), "cover_path": str(small)})
+    assert page.album_submitted is False
+
+
+def test_create_album_blocks_on_field_error(tmp_path):
+    namespace, page = load_publishing()
+    _album_page(page, field_errors={"tags": [{"message": "要先选择标签", "field": "tags"}]})
+    with pytest.raises(RuntimeError, match="field tags invalid"):
+        namespace["create_album"](**_album_kwargs(tmp_path))
+    assert page.album_submitted is False
+
+
+def test_create_album_submits_once_and_verifies_new_id(tmp_path):
+    namespace, page = load_publishing()
+    _album_page(page)
+    result = namespace["create_album"](**_album_kwargs(tmp_path))
+    assert result["album_id"] == "130150010"
+    assert result["title"] == "英语口语天天练"
+    assert result["account"] == {"uid": TEST_UID, "name": TEST_NAME}
+    assert page.album_submitted is True
+    assert [a["album_id"] for a in page.albums].count("130150010") == 1
+    assert set(page.album_validated) == {"title", "customTitle", "richIntro",
+                                         "image", "categoryId", "tags"}
 
 
 def test_custom_cover_validates_file_and_returns_exact_metadata(tmp_path):
