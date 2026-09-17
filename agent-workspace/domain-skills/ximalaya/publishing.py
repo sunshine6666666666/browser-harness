@@ -268,6 +268,46 @@ def _album_validate_field(prop: str, timeout: float = 10) -> str | None:
         "ximalaya album field validation never resolved: %s" % prop)
 
 
+def _album_pick_tags(names: list[str], timeout: float = 10) -> dict[str, bool]:
+    """Stepwise tag picking: click one tag, settle, verify checked, retry.
+
+    The tag block is a React cascade (内容分类 -> 二级组 -> dynamic leaf rows):
+    dependent rows only render after the parent tag is checked, and a single
+    JS pass that clicks every tag back-to-back gets swallowed by re-renders.
+    Live-verified 2026-09-17: one click per tag + ~2s settle + checked-readback
+    is reliable; retry up to 4 attempts per tag before giving up.
+    """
+    out: dict[str, bool] = {}
+    for name in names:
+        wanted = _normalized_text(name)
+        ok = False
+        for _ in range(4):
+            js("((name) => {\n"
+               "  const norm = s => (s || '').replace(/\\\\s+/g, ' ').trim();\n"
+               "  const wrap = document.querySelector('.album-tags1');\n"
+               "  if (!wrap) return false;\n"
+               "  for (const t of wrap.querySelectorAll('.xui-tag1')) {\n"
+               "    if (norm(t.innerText) === name) { t.click(); return true; }\n"
+               "  }\n"
+               "  return false;\n"
+               "})(" + _json(wanted) + ")")
+            wait(2.0)
+            ok = bool(js("((name) => {\n"
+                         "  const norm = s => (s || '').replace(/\\\\s+/g, ' ').trim();\n"
+                         "  const wrap = document.querySelector('.album-tags1');\n"
+                         "  if (!wrap) return false;\n"
+                         "  for (const t of wrap.querySelectorAll('.xui-tag1')) {\n"
+                         "    if (norm(t.innerText) === name)"
+                         " return /checked/.test(t.className);\n"
+                         "  }\n"
+                         "  return false;\n"
+                         "})(" + _json(wanted) + ")"))
+            if ok:
+                break
+        out[wanted] = ok
+    return out
+
+
 # ------------------------------------------------------------------ facts
 
 def publishing_constraints() -> dict[str, Any]:
@@ -717,17 +757,27 @@ def create_album(title: str, category: str, cover_path: str, intro: str,
         e => e.offsetParent && (e.innerText || '').trim() === '裁剪封面');
       return modals.length ? true : null;
     })()"""), timeout, "ximalaya album crop modal did not open")
-    crop_ok = js("""(() => {
-      const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
-      const btns = [...document.querySelectorAll('button')].filter(e => e.offsetParent);
-      const b = btns.find(e => norm(e.innerText) === '确定');
-      if (!b) return false;
-      const key = Object.keys(b).find(k => k.indexOf('__reactEventHandlers') === 0);
-      const fn = key && b[key].onClick;
-      if (typeof fn !== 'function') { b.click(); return 'dom-click'; }
-      fn({preventDefault() {}, stopPropagation() {}});
-      return 'react-click';
-    })()""")
+    # The site's crop onClick goes through a canvas polyfill (toBlobHD) that is
+    # briefly unavailable right after the modal opens; retry until it works.
+    crop_ok = None
+    for _ in range(6):
+        try:
+            crop_ok = js("""(() => {
+              const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+              const btns = [...document.querySelectorAll('button')].filter(e => e.offsetParent);
+              const b = btns.find(e => norm(e.innerText) === '确定');
+              if (!b) return false;
+              const key = Object.keys(b).find(k => k.indexOf('__reactEventHandlers') === 0);
+              const fn = key && b[key].onClick;
+              if (typeof fn !== 'function') { b.click(); return 'dom-click'; }
+              fn({preventDefault() {}, stopPropagation() {}});
+              return 'react-click';
+            })()""")
+        except Exception:
+            crop_ok = None
+        if crop_ok:
+            break
+        wait(2.0)
     if not crop_ok:
         raise RuntimeError("ximalaya album crop confirm not found")
     _wait_until(lambda: (lambda m: m.get("image") or None)(_album_model()),
@@ -745,24 +795,10 @@ def create_album(title: str, category: str, cover_path: str, intro: str,
                 "})(" + _json(_normalized_text(intro)) + ")")
     if synced != "ok":
         raise RuntimeError("ximalaya album intro not set: %s" % synced)
-    tag_res = js("((names) => {\n"
-                 "  const norm = s => (s || '').replace(/\\\\s+/g, ' ').trim();\n"
-                 "  const wrap = document.querySelector('.album-tags1');\n"
-                 "  if (!wrap) return 'no-tags';\n"
-                 "  const out = {};\n"
-                 "  for (const name of names) {\n"
-                 "    const tags = wrap.querySelectorAll('.xui-tag1');\n"
-                 "    let hit = false;\n"
-                 "    for (const t of tags) {\n"
-                 "      if (norm(t.innerText) === name) { t.click(); hit = true; break; }\n"
-                 "    }\n"
-                 "    out[name] = hit;\n"
-                 "  }\n"
-                 "  return JSON.stringify(out);\n"
-                 "})(" + _json(list(tags)) + ")")
-    missing = [k for k, v in json.loads(tag_res or "{}").items() if not v]
-    if tag_res == "no-tags" or missing:
-        raise RuntimeError("ximalaya album tags missing: %s" % (missing or tag_res))
+    tag_out = _album_pick_tags(list(tags), timeout)
+    missing = [k for k, v in tag_out.items() if not v]
+    if missing:
+        raise RuntimeError("ximalaya album tags not checked: %s" % missing)
     js("""(() => {
       const radios = document.querySelectorAll('input[type=radio]');
       if (radios[0] && !radios[0].checked) radios[0].click();

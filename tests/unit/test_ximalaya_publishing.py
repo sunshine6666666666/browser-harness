@@ -62,6 +62,9 @@ class FakePage:
         self.album_validated = []
         self.album_field_result = "OK"
         self.album_submitted = False
+        self.album_tags_checked = set()
+        self.album_tag_check_failures = set()
+        self.crop_failures_remaining = 0
         self.new_album = {"album_id": "130150010", "title": "英语口语天天练",
                           "custom_title": "每天一句，口语天天进步",
                           "category_id": 5, "price_type_id": 0, "uploadSource": 0}
@@ -219,9 +222,30 @@ class FakePage:
             except ValueError:
                 name = ""
             return name in self.album_categories
+        if ".album-tags1" in s and "xui-tag1" in s and "t.click()" in s:
+            match = re.search(r"\}\)\(\s*(\".*?\")\s*\)\s*$", s, re.S)
+            try:
+                name = json.loads(match.group(1)) if match else ""
+            except ValueError:
+                name = ""
+            self.album_tags_checked.add(name)
+            return True
+        if ".album-tags1" in s and "xui-tag1" in s and "/checked/" in s:
+            match = re.search(r"\}\)\(\s*(\".*?\")\s*\)\s*$", s, re.S)
+            try:
+                name = json.loads(match.group(1)) if match else ""
+            except ValueError:
+                name = ""
+            return (name in self.album_tags_checked
+                    and name not in self.album_tag_check_failures)
         if "裁剪封面" in s:
             return True if self.crop_modal_open else None
         if "__reactEventHandlers" in s and "preventDefault" in s:
+            if self.crop_failures_remaining > 0:
+                self.crop_failures_remaining -= 1
+                raise RuntimeError(
+                    "JavaScript evaluation failed: TypeError: Cannot read "
+                    "properties of null (reading 'toBlobHD')")
             self.album_form_model["image"] = "storages/test/cover.jpeg"
             return "react-click"
         if "ke-edit-iframe" in s and "KindEditor" in s:
@@ -631,6 +655,31 @@ def test_create_album_submits_once_and_verifies_new_id(tmp_path):
     assert [a["album_id"] for a in page.albums].count("130150010") == 1
     assert set(page.album_validated) == {"title", "customTitle", "richIntro",
                                          "image", "categoryId", "tags"}
+
+
+def test_create_album_picks_tags_stepwise_until_checked(tmp_path):
+    namespace, page = load_publishing()
+    _album_page(page)
+    namespace["create_album"](**_album_kwargs(tmp_path))
+    assert page.album_tags_checked == {"外语分类", "语言", "英语"}
+
+
+def test_create_album_fails_when_tag_never_checks(tmp_path):
+    namespace, page = load_publishing()
+    _album_page(page)
+    page.album_tag_check_failures.add("英语")
+    with pytest.raises(RuntimeError, match="tags not checked"):
+        namespace["create_album"](**_album_kwargs(tmp_path))
+    assert page.album_submitted is False
+
+
+def test_create_album_retries_crop_confirm_on_toBlobHD(tmp_path):
+    namespace, page = load_publishing()
+    _album_page(page)
+    page.crop_failures_remaining = 2  # modal just opened, canvas polyfill not ready
+    result = namespace["create_album"](**_album_kwargs(tmp_path))
+    assert result["album_id"] == "130150010"
+    assert page.album_submitted is True
 
 
 def test_custom_cover_validates_file_and_returns_exact_metadata(tmp_path):
