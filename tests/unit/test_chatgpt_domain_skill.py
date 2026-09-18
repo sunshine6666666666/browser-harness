@@ -10,8 +10,13 @@ OPS_PATH = (
 
 
 def load_ops(js_impl, *, click_impl=None, type_impl=None, press_impl=None, goto_impl=None):
+    def dispatch_js(script):
+        if "editor.tagName === 'DIV'" in script:
+            return "DIV"
+        return js_impl(script)
+
     namespace = {
-        "js": js_impl,
+        "js": dispatch_js,
         "click_at_xy": click_impl or (lambda *args, **kwargs: None),
         "type_text": type_impl or (lambda text: None),
         "press_key": press_impl or (lambda *args, **kwargs: None),
@@ -458,6 +463,49 @@ def test_send_message_stops_when_another_tab_pollutes_draft_after_typing():
     assert evidence["reason"] == "composer_mismatch_after_typing"
     assert evidence["click_performed"] is False
 
+
+def test_send_message_stops_when_hydration_restores_a_draft():
+    preflights = 0
+    typed = []
+
+    def fake_js(script):
+        nonlocal preflights
+        if "existing_user_messages" in script:
+            preflights += 1
+            return {
+                "found": True, "empty": preflights == 1,
+                "url": "https://chatgpt.com/", "user_count": 0,
+            }
+        if script == "hydration-probe":
+            return {"hydrated": True}
+        raise AssertionError(f"unexpected JS: {script[:120]}")
+
+    ops = load_ops(fake_js, type_impl=typed.append)
+    with pytest.raises(RuntimeError, match="restored a draft"):
+        ops["send_message"]("current prompt")
+    assert preflights == 2
+    assert typed == []
+
+
+def test_send_message_does_not_append_after_a_chunk_timeout():
+    typed = []
+
+    def fake_js(script):
+        if "existing_user_messages" in script:
+            return {"found": True, "empty": True, "url": "https://chatgpt.com/c/existing-chat"}
+        if script == "hydration-probe":
+            return {"hydrated": True}
+        raise AssertionError(f"unexpected JS: {script[:120]}")
+
+    def fake_type(chunk):
+        typed.append(chunk)
+        raise TimeoutError("IPC timed out")
+
+    ops = load_ops(fake_js, type_impl=fake_type)
+    with pytest.raises(TimeoutError, match="IPC timed out"):
+        ops["send_message"]("x" * 4500)
+    assert typed == ["x" * 2000]
+
 def test_send_message_types_long_prompt_in_chunks():
     typed = []
     message = "x" * 4500
@@ -465,7 +513,7 @@ def test_send_message_types_long_prompt_in_chunks():
     def fake_js(script):
         if "existing_user_messages" in script:
             return {
-                "found": True, "empty": True, "url": "https://chatgpt.com/",
+                "found": True, "empty": True, "url": "https://chatgpt.com/c/chunked-chat",
                 "user_count": 0, "user_message_ids": [], "last_user_turn": -1,
             }
         if script == "hydration-probe":
@@ -494,6 +542,60 @@ def test_send_message_types_long_prompt_in_chunks():
     assert "".join(typed) == message
     assert all(len(chunk) <= 2000 for chunk in typed)
     assert evidence["status"] == "definitely_sent"
+
+def test_send_message_prefills_long_home_prompt_via_qparam():
+    message = "x" * 4500
+    navigated = []
+
+    def fake_js(script):
+        if "existing_user_messages" in script:
+            return {
+                "found": True, "empty": True, "url": "https://chatgpt.com/",
+                "user_count": 0, "user_message_ids": [], "last_user_turn": -1,
+            }
+        if "activate_send_button" in script:
+            return {"found": True, "clicked": True}
+        if "send_button" in script:
+            return {"found": True}
+        if "last_user_message" in script:
+            return {
+                "url": "https://chatgpt.com/c/prefill-send-test",
+                "composer_empty": True,
+                "user_count": 1,
+                "last_user_message_id": "new-prefill-message",
+                "last_user_turn": 1,
+                "last_user_message": message,
+            }
+        if "last_user_message" not in script and "replace(/\\s+/g, ' ')" in script:
+            return " ".join(message.split())
+        raise AssertionError(f"unexpected JS: {script[:120]}")
+
+    ops = load_ops(fake_js, type_impl=lambda text: (_ for _ in ()).throw(AssertionError("prefill must not type")),
+                   goto_impl=navigated.append)
+    evidence = ops["send_message"](message)
+
+    assert len(navigated) == 1 and navigated[0].startswith("https://chatgpt.com/?q=")
+    assert evidence["status"] == "definitely_sent"
+
+
+def test_send_message_aborts_when_prefill_does_not_match():
+    message = "x" * 4500
+
+    def fake_js(script):
+        if "existing_user_messages" in script:
+            return {
+                "found": True, "empty": True, "url": "https://chatgpt.com/",
+                "user_count": 0, "user_message_ids": [], "last_user_turn": -1,
+            }
+        if "replace(/\\s+/g, ' ')" in script:
+            return "polluted draft"
+        raise AssertionError(f"unexpected JS: {script[:120]}")
+
+    import pytest as _pytest
+    ops = load_ops(fake_js, type_impl=lambda text: (_ for _ in ()).throw(AssertionError("mismatch must not type")),
+                   goto_impl=lambda url: None)
+    with _pytest.raises(RuntimeError, match="prefill did not match"):
+        ops["send_message"](message)
 
 
 def test_send_message_types_short_prompt_in_one_call():
@@ -580,9 +682,7 @@ def test_send_message_accepts_a_collapsed_long_message_prefix_as_evidence():
     def fake_js(script):
         if "existing_user_messages" in script:
             return {
-                "found": True,
-                "empty": True,
-                "url": "https://chatgpt.com/",
+                "found": True, "empty": True, "url": "https://chatgpt.com/c/long-chat",
                 "user_count": 0,
                 "user_message_ids": [],
                 "last_user_turn": -1,

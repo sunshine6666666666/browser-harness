@@ -20,9 +20,8 @@ from __future__ import annotations
 import base64
 import json
 import re
-import sys
 import time
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -638,20 +637,47 @@ def set_reasoning_effort(level: str) -> dict[str, Any]:
     return _verify_radio_after_reopen(level, model=False, first_token=True)
 
 
+def _prefill_via_qparam(text: str, expected: str, timeout_s: float = 60.0) -> None:
+    """Navigate to ``?q=<text>`` so the app hydrates the composer itself.
+
+    Live 2026-09-18: lands on ``?prompt=`` with the full text prefilled and
+    nothing sent. Raises (pre-click, nothing typed by us) unless the composer
+    reads back exactly ``expected`` after whitespace normalization.
+    """
+    goto_url("https://chatgpt.com/?q=" + quote(text))
+    wait_for_load(timeout=30)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            cur = js(
+                r"(() => { const f = document.querySelector('form[data-type=\"unified-composer\"]');"
+                r" const e = f && (f.querySelector('[contenteditable=\"true\"]') || f.querySelector('textarea'));"
+                r" const t = e ? (e.innerText || e.value || '') : '';"
+                r" return t.replace(/\s+/g, ' ').trim(); })()"
+            ) or ""
+        except Exception:
+            cur = ""
+        if cur == expected and cur:
+            return
+        wait(1.0)
+    raise RuntimeError("send_message: q-param prefill did not match before clicking")
+
+
 def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
     """Send once from the unified composer and return non-retryable evidence.
 
     Preflight failures raise before any click. After the send click, callers get
     ``definitely_sent`` or ``unknown`` and must never resend an ``unknown`` result.
 
-    Long prompts are typed in ~2k-char chunks: one 14KB ``Input.insertText`` can
-    exceed the harness helper's 5s IPC read timeout when the page main thread
-    stalls (background session sync), while small slices stay far under it.
+    Prompts of 2k-30k chars on the home page ride the ``?q=`` prefill so the
+    app hydrates the composer text itself (no keystroke race); everything
+    else keeps the ~2k-char ``Input.insertText`` chunks, which stay far under
+    the harness helper's 5s IPC read timeout when the main thread stalls.
     """
     expected = _norm(text)
     if not expected:
         raise RuntimeError("send_message: message must not be empty")
-    before = js(r"""
+    preflight_script = r"""
     (() => {
       const form = document.querySelector('form[data-type="unified-composer"]');
       const editor = form && (form.querySelector('[contenteditable="true"]') ||
@@ -683,51 +709,26 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
         last_user_turn: last_turn_match ? Number(last_turn_match[1]) : -1
       };
     })()
-    """)
+    """
+    before = js(preflight_script)
     if not before or not before.get("found"):
         raise RuntimeError("send_message: visible unified composer not found")
     if not before.get("empty"):
         raise RuntimeError("send_message: unified composer must be empty before typing")
     wait(0.4)
-    # Wait for the composer to hydrate from the pre-hydration TEXTAREA stub to
-    # the contenteditable DIV before typing. Live 2026-09-17: text typed into
-    # the TEXTAREA stub does NOT migrate to the DIV — only text typed after
-    # hydration lands in the DIV, and leftover stub text can even duplicate
-    # into it. So clear-then-gate: if the stub already holds text, wipe it
-    # (select-all + backspace) before waiting for the DIV. Re-gate before
-    # every chunk; typing can revert the editor to TEXTAREA mid-stream.
-    def _clear_stub_text():
-        try:
-            cdp("Input.dispatchKeyEvent", type="rawKeyDown", key="a", code="KeyA",
-                modifiers=4 if sys.platform == "darwin" else 2,
-                windowsVirtualKeyCode=65, nativeVirtualKeyCode=65)
-            cdp("Input.dispatchKeyEvent", type="keyUp", key="a", code="KeyA",
-                windowsVirtualKeyCode=65, nativeVirtualKeyCode=65)
-            cdp("Input.dispatchKeyEvent", type="keyDown", key="Backspace", code="Backspace",
-                windowsVirtualKeyCode=8, nativeVirtualKeyCode=8)
-            cdp("Input.dispatchKeyEvent", type="keyUp", key="Backspace", code="Backspace",
-                windowsVirtualKeyCode=8, nativeVirtualKeyCode=8)
-        except Exception:
-            pass
+    # Hydration may restore a saved draft after the first empty check. Gate on
+    # the editable DIV and check the draft again before typing anything.
     def _hydrated_tag():
-        # Test fakes answer the hydration probe with {"hydrated": True}.
-        try:
-            probe = js("hydration-probe")
-            if isinstance(probe, dict) and probe.get("hydrated"):
-                return "DIV"
-        except Exception:
-            pass
         try:
             return js(r"""
             (() => {
               const form = document.querySelector('form[data-type="unified-composer"]');
-              const editor = form && (form.querySelector('[contenteditable="true"]') ||
-                                      form.querySelector('textarea, [role="textbox"]'));
-              return editor ? editor.tagName : '';
+              const editor = form && form.querySelector('[contenteditable="true"]');
+              return editor && editor.tagName === 'DIV' ? 'DIV' : '';
             })()
             """)
         except Exception:
-            return 
+            return ""
     def _wait_hydrated():
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
@@ -737,21 +738,22 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
         return False
     if not _wait_hydrated():
         raise RuntimeError("send_message: composer did not hydrate to editable DIV")
-    for start in range(0, len(text), 2000):
-        if start > 0 and not _wait_hydrated():
-            raise RuntimeError("send_message: composer lost hydration mid-typing")
-        try:
+    ready = js(preflight_script)
+    if not ready or not ready.get("found") or not ready.get("empty") or ready.get("url") != before.get("url"):
+        raise RuntimeError("send_message: composer changed or restored a draft during hydration")
+    # ponytail: long prompts ride the ?q= prefill so the app hydrates the
+    # exact composer text itself; short prompts keep the old chunked typing.
+    if len(text) >= 2000 and len(text) <= 30000 and ready.get("url") == "https://chatgpt.com/":
+        _prefill_via_qparam(text, expected)
+    else:
+        for start in range(0, len(text), 2000):
+            if start > 0 and not _wait_hydrated():
+                raise RuntimeError("send_message: composer lost hydration mid-typing")
+            # An IPC timeout does not establish how much text landed. Stop before
+            # appending another chunk; the final pre-click check cannot undo a
+            # polluted draft, even though it prevents sending it.
             type_text(text[start:start + 2000])
-        except TimeoutError:
-            # A single chunk can still exceed the helper's 5s IPC read when
-            # the main thread stalls mid-typing. The keystrokes usually land
-            # anyway (live 2026-09-17: all 6 chunks applied despite one
-            # chunk reporting timed out), so re-gate hydration and verify
-            # the accumulated draft instead of failing outright.
-            if not _wait_hydrated():
-                raise
-            continue
-    wait(0.5)
+        wait(0.5)
     def definitely_not_sent(reason: str) -> dict[str, Any]:
         return {
             "status": "definitely_not_sent",
