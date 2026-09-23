@@ -4,10 +4,10 @@ Loaded like every Domain Skill helper module:
 
     exec(open("/abs/path/agent-workspace/domain-skills/ximalaya/publishing.py").read())
 
-Browser Harness must be attached to a tab showing
-`https://www.ximalaya.com/reform-upload/page/webCenter/upload` (open this URL
-directly; the studio shell at https://studio.ximalaya.com/upload embeds the same
-flow inside a cross-origin iframe that direct navigation avoids).
+Upload-form functions require an attached tab showing
+`https://www.ximalaya.com/reform-upload/page/webCenter/upload` (open it directly;
+the Studio shell embeds that form in a cross-origin iframe). Rejected-track
+republishing requires the exact `/reform-upload/page/sound/edit/{trackId}` page.
 
 Safety model: login gates before every mutation, exact-target and exact-title
 duplicate prevention, local-file validation, stable
@@ -350,17 +350,26 @@ def publishing_constraints() -> dict[str, Any]:
     }
 
 
-def list_albums() -> list[dict[str, Any]]:
-    data = _api_get(ALBUMS_API + "?pageSize=50", "album list")
-    return [{
-        "album_id": str(item["albumId"]),
-        "title": item.get("title") or "",
-        "custom_title": item.get("customTitle") or "",
-        "category_id": item.get("categoryId"),
-        "price_type_id": item.get("priceTypeId"),
-        "can_add_audio": item.get("priceTypeId") in (0, None)
-                         and item.get("uploadSource") in (0, None),
-    } for item in data.get("infos") or []]
+def list_albums(page_size: int = 50) -> list[dict[str, Any]]:
+    albums: list[dict[str, Any]] = []
+    for page in range(1, TRACK_EVIDENCE_MAX_PAGES + 1):
+        data = _api_get("%s?page=%s&pageSize=%s" %
+                        (ALBUMS_API, page, page_size), "album list")
+        infos = data.get("infos") or []
+        albums.extend({
+            "album_id": str(item["albumId"]),
+            "title": item.get("title") or "",
+            "custom_title": item.get("customTitle") or "",
+            "category_id": item.get("categoryId"),
+            "price_type_id": item.get("priceTypeId"),
+            "can_add_audio": item.get("priceTypeId") in (0, None)
+                             and item.get("uploadSource") in (0, None),
+        } for item in infos)
+        total = int(data.get("totalSize") or 0)
+        if (not infos or (total and page * page_size >= total)
+                or (not total and len(infos) < page_size)):
+            break
+    return albums
 
 
 def _album_tracks(album_id: str, page_size: int = 50) -> list[dict[str, Any]]:
@@ -642,7 +651,8 @@ JS_ROWS_STATE = """(() => {
 
 
 def prepare_upload(audio_file: str, title: str, expected_uid: int | None = None,
-                   expected_name: str | None = None, timeout: int = 900) -> dict[str, Any]:
+                   expected_name: str | None = None, timeout: int = 900,
+                   existing_content_ids: tuple[str, ...] = ()) -> dict[str, Any]:
     identity = require_identity(expected_uid, expected_name)
     wanted_title = _normalized_text(title)
     units = _title_units(wanted_title)
@@ -652,8 +662,16 @@ def prepare_upload(audio_file: str, title: str, expected_uid: int | None = None,
     if page_info().get("url") != UPLOAD_URL:
         raise RuntimeError("ximalaya prepare_upload requires the exact upload page")
     already = archive_matches(wanted_title)
-    if already:
-        raise RuntimeError("ximalaya exact title already exists, refusing duplicate upload: %s" % already)
+    expected_existing = {str(content_id) for content_id in existing_content_ids}
+    if already and not expected_existing:
+        raise RuntimeError(
+            "ximalaya exact title already exists, refusing duplicate upload: %s" % already)
+    observed_existing = {str(match["content_id"]) for match in already
+                         if match.get("content_id")}
+    if len(observed_existing) != len(already) or observed_existing != expected_existing:
+        raise RuntimeError(
+            "ximalaya exact-title baseline mismatch: expected=%s observed=%s" %
+            (sorted(expected_existing), already))
     path = _validate_upload_file(audio_file)
     probe = _probed_audio(path)
     upload_file("input[type=file].webuploader-element-invisible", str(path))
@@ -664,8 +682,8 @@ def prepare_upload(audio_file: str, title: str, expected_uid: int | None = None,
                       and "上传成功" in r.get("status", "")), None),
         timeout, "ximalaya upload completion not observed for %s" % stem)
     return {"identity": identity, "audio": str(path), "probed": probe,
-            "title": wanted_title, "upload_completed":
-                {"status": row["status"], "row_title": row["title"]}}
+            "title": wanted_title, "existing_content_ids": sorted(expected_existing),
+            "upload_completed": {"status": row["status"], "row_title": row["title"]}}
 
 
 # ------------------------------------------------------------------ form setters
@@ -1142,6 +1160,7 @@ def _edit_track_evidence(album_id: str, track_id: str, title: str) -> dict[str, 
         "track_id": track_id,
         "album_id": album_id,
         "title": observed_title,
+        "duration_seconds": float(info.get("duration") or 0),
         "cover_path": _resource_path(info.get("coverPath") or info.get("fullCoverPath")),
         "description": _normalized_text(html.unescape(re.sub(r"<[^>]*>", " ",
                                                                str(description_html)))),
@@ -1290,6 +1309,116 @@ def replace_track_cover_once(track: dict[str, Any], image_file: str,
         "cover": {"path": str(image_path), "width": width, "height": height},
         "verification_source": "authenticated_edit_api",
     }
+
+
+def republish_rejected_once(track: dict[str, Any], confirm: bool = False,
+                            timeout: int = 60) -> dict[str, Any]:
+    """Submit the current rejected-track edit form once; verify the same track is live."""
+    if confirm is not True:
+        raise ValueError("ximalaya republish_rejected_once requires confirm=True")
+    if not isinstance(track, dict):
+        raise TypeError("ximalaya republish_rejected_once requires a track evidence dict")
+    track_id = _decimal_id(track.get("track_id"), "track_id")
+    album_id = _decimal_id(track.get("album_id"), "album_id")
+    original_title = _normalized_text(track.get("title"))
+    if not original_title:
+        raise ValueError("ximalaya republish requires an exact original title")
+    identity = require_identity()
+    edit_url = EDIT_URL.format(track_id)
+    if page_info().get("url") != edit_url:
+        raise RuntimeError("ximalaya republish requires the exact edit page")
+    before = _edit_track_evidence(album_id, track_id, original_title)
+    if str(before["status"]) != "2":
+        raise RuntimeError("ximalaya track is not rejected or taken down")
+    _wait_edit_form_ready(min(timeout, 30))
+
+    def form_state() -> dict[str, Any] | None:
+        return js("""(() => {
+          const root = document.querySelector('[class*="kindeditor-box"]');
+          const key = root && Object.keys(root).find(name =>
+            name.startsWith('__reactFiber') || name.startsWith('__reactInternalInstance'));
+          let fiber = key ? root[key] : null;
+          while (fiber) {
+            const form = fiber.memoizedProps && fiber.memoizedProps.form;
+            if (form && typeof form.getFieldsValue === 'function') {
+              const v = form.getFieldsValue();
+              const buttons = [...document.querySelectorAll('button')].filter(b =>
+                b.offsetParent && !b.disabled && (b.textContent || '').trim() === '重新发布');
+              return {track_id: String(v.trackId || ''), album_id: String(v.albumId || ''),
+                title: v.title || '', description_html: v.richIntro || '',
+                cover_id: v.coverId || 0, category_id: v.categoryId,
+                visibility: v.visibleCrowdType, submit_count: buttons.length};
+            }
+            fiber = fiber.return;
+          }
+          return null;
+        })()""")
+
+    _wait_edit_form_validation(min(timeout, 15))
+    form = form_state()
+    wait(0.5)
+    if not form or form != form_state():
+        raise RuntimeError("ximalaya rejected edit form is not stable")
+    title = _normalized_text(form["title"])
+    if (form["track_id"] != track_id or form["album_id"] != album_id
+            or not title or _title_units(title) > TITLE_MAX
+            or form["submit_count"] != 1
+            or str(form["category_id"]) != str(before["category_id"])
+            or str(form["visibility"]) != str(before["visibility"])):
+        raise RuntimeError("ximalaya rejected edit form target or fields mismatch")
+    description = _normalized_text(html.unescape(re.sub(r"<[^>]*>", " ",
+                                                     str(form["description_html"]))))
+    cover_path = before["cover_path"].lstrip("/")
+    if form["cover_id"]:
+        cover = json.loads(_cover_readback() or "{}")
+        cover_path = _resource_path(cover.get("src")).split("!", 1)[0].lstrip("/")
+        if not cover_path:
+            raise RuntimeError("ximalaya rejected edit cover readback missing")
+
+    clicks = 1  # ponytail: record the possible activation before waiting; never replay it.
+    try:
+        clicked = js("""(() => {
+          const buttons = [...document.querySelectorAll('button')].filter(b =>
+            b.offsetParent && !b.disabled && (b.textContent || '').trim() === '重新发布');
+          if (buttons.length !== 1) return false;
+          buttons[0].click();
+          return true;
+        })()""")
+    except (RuntimeError, TimeoutError) as exc:
+        clicked = False
+        last_error = str(exc)
+    else:
+        last_error = "" if clicked else "republish click was not accepted"
+
+    deadline = time.monotonic() + timeout
+    for _ in range(10):
+        if page_info().get("url") != edit_url:
+            break
+        wait(0.5)
+    after = None
+    while time.monotonic() < deadline:
+        try:
+            if page_info().get("url") != edit_url:
+                goto_url(edit_url)
+                wait(1)
+            after = _edit_track_evidence(album_id, track_id, title)
+            if str(after["status"]) == "1":
+                live = track_evidence(album_id, track_id, title)
+                if (str(live["status"]) == "1" and after["description"] == description
+                        and after["cover_path"].lstrip("/") == cover_path
+                        and all(after[key] == before[key] for key in
+                                ("audio_resource_id", "category_id", "visibility"))):
+                    return {"identity": identity, "status": "restored", "retry": False,
+                            "submit_clicks": clicks, "track_id": track_id,
+                            "album_id": album_id, "before": before, "after": after,
+                            "verification_source": "authenticated_edit_api+album_tracks"}
+                last_error = "ximalaya republish postcondition did not hold"
+        except (RuntimeError, TimeoutError) as exc:
+            last_error = str(exc)
+        wait(min(2, max(0.2, deadline - time.monotonic())))
+    return {"identity": identity, "status": "republish_unverified", "retry": False,
+            "submit_clicks": clicks, "track_id": track_id, "album_id": album_id,
+            "before": before, "after": after, "diagnostics": last_error}
 
 
 def _switch_checked() -> bool:
@@ -1754,7 +1883,28 @@ def replace_sound_once(track: dict[str, Any], replacement_file: str,
         raise ValueError("ximalaya replacement audio requires a readable positive duration")
     goto_url(SOUND_MANAGE_URL + album_id)
     wait(5)
-    live_before = track_evidence(album_id, track_id, title)
+    try:
+        live_before = track_evidence(album_id, track_id, title)
+    except RuntimeError:
+        live_before = _edit_track_evidence(album_id, track_id, title)
+        if str(live_before["status"]) != "2":
+            raise
+        selected = js("""(() => {
+          const tabs = [...document.querySelectorAll('[class*="statusItem"]')]
+            .filter(e => e.offsetParent && /^下架\\(\\d+\\)$/.test((e.textContent || '').trim()));
+          if (tabs.length !== 1) return false;
+          tabs[0].click();
+          return true;
+        })()""")
+        if not selected:
+            raise RuntimeError("ximalaya rejected-track manager tab not found")
+        _wait_until(lambda: js("""(() => [...document.querySelectorAll(
+          '.track-1Tfey3X4 a[href]')].some(a =>
+            a.getAttribute('href')?.endsWith('/%s')))()""" % track_id), 10,
+            "ximalaya rejected track row did not load")
+        rejected = True
+    else:
+        rejected = False
     if not _same_track_identity(track, live_before):
         raise RuntimeError("ximalaya replacement live track target mismatch")
     before = dict(live_before)
@@ -1793,7 +1943,8 @@ def replace_sound_once(track: dict[str, Any], replacement_file: str,
                         "diagnostics": "replacement confirmation control not activatable"}
             confirms = 1
         try:
-            last_after = track_evidence(album_id, track_id, title)
+            last_after = (_edit_track_evidence(album_id, track_id, title) if rejected
+                          else track_evidence(album_id, track_id, title))
         except (RuntimeError, TimeoutError) as exc:
             last_error = str(exc)
         else:
@@ -1804,7 +1955,8 @@ def replace_sound_once(track: dict[str, Any], replacement_file: str,
                         "retry": False, "track_id": track_id, "album_id": album_id,
                         "title": title, "before": before, "after": last_after,
                         "replacement": {"path": str(path), "metadata": replacement},
-                        "verification_source": "album_tracks+track_simple"}
+                        "verification_source": ("authenticated_edit_api" if rejected
+                                                else "album_tracks+track_simple")}
         wait(min(3.0, max(0.2, deadline - time.monotonic())))
     return {"identity": identity, "status": "replacement_unverified",
             "replacement_uploads": uploads, "replacement_confirms": confirms,
@@ -1999,9 +2151,10 @@ def _match_record(item: dict[str, Any], title: str, content_id: str | None,
 
 def manager_evidence(title: str, content_id: str | None = None,
                      expected_schedule: str | None = None,
-                     attempts: int = 3) -> dict[str, Any]:
+                     attempts: int = 3, album_id: str | None = None) -> dict[str, Any]:
     if attempts < 1:
         raise ValueError("manager evidence attempts must be at least one")
+    wanted_album_id = _decimal_id(album_id, "album_id") if album_id else None
     matches: list[dict[str, Any]] = []
     scheduled_state = ""
     immediate_state = ""
@@ -2010,9 +2163,11 @@ def manager_evidence(title: str, content_id: str | None = None,
         scheduled = _api_get(SCHEDULED_LIST_API + "?page=1&pageSize=50", "scheduled list")
         for item in scheduled.get("infos") or []:
             record = _match_record(item, title, content_id, "scheduled")
-            if record:
+            if record and (not wanted_album_id or record["album_id"] == wanted_album_id):
                 matches.append(record)
-        for album in list_albums():
+        albums = ([{"album_id": wanted_album_id, "title": ""}]
+                  if wanted_album_id else list_albums())
+        for album in albums:
             try:
                 tracks = _album_tracks(album["album_id"])
             except RuntimeError:
@@ -2056,15 +2211,24 @@ def _snapshot_comparable(snapshot: dict[str, Any]) -> dict[str, Any]:
 def submit_once(title: str, expected_uid: int | None = None,
                 expected_name: str | None = None,
                 expected_mode: str = "scheduled", expected_schedule: str | None = None,
-                run_marker: str = "", timeout: int = 600) -> dict[str, Any]:
+                run_marker: str = "", timeout: int = 600,
+                expected_album_id: str | None = None,
+                existing_content_ids: tuple[str, ...] = ()) -> dict[str, Any]:
     if not run_marker:
         raise ValueError("ximalaya submit_once requires a nonempty run marker")
     identity = require_identity(expected_uid, expected_name)
+    expected_existing = {str(content_id) for content_id in existing_content_ids}
     already = archive_matches(title)
-    if len(already) > 1:
-        raise RuntimeError("ximalaya exact title matched multiple records: %s" % already)
-    if already:
+    if already and not expected_existing:
+        if len(already) > 1:
+            raise RuntimeError("ximalaya exact title matched multiple records: %s" % already)
         raise RuntimeError("ximalaya exact title already exists; refusing duplicate submission")
+    observed_existing = {str(match["content_id"]) for match in already
+                         if match.get("content_id")}
+    if len(observed_existing) != len(already) or observed_existing != expected_existing:
+        raise RuntimeError(
+            "ximalaya exact-title baseline mismatch before submit: expected=%s observed=%s" %
+            (sorted(expected_existing), already))
     first = submission_snapshot()
     wait(2)
     snapshot = submission_snapshot()
@@ -2140,14 +2304,31 @@ def submit_once(title: str, expected_uid: int | None = None,
     last_error = ""
     while time.monotonic() < deadline:
         try:
-            evidence = manager_evidence(title, None, expected_schedule
-                                        if expected_mode == "scheduled" else None, attempts=1)
+            content_id = None
+            if expected_existing:
+                matches = archive_matches(title)
+                if expected_album_id is not None:
+                    matches = [match for match in matches
+                               if str(match.get("album_id")) == str(expected_album_id)]
+                new_matches = [match for match in matches
+                               if str(match.get("content_id")) not in expected_existing]
+                if len(new_matches) != 1:
+                    last_error = "expected one new same-title record, found %s" % len(new_matches)
+                    wait(min(10, max(0.5, deadline - time.monotonic())))
+                    continue
+                content_id = str(new_matches[0]["content_id"])
+            evidence = manager_evidence(
+                title, content_id=content_id,
+                expected_schedule=expected_schedule
+                if expected_mode == "scheduled" else None, attempts=1,
+                album_id=expected_album_id)
         except (RuntimeError, TimeoutError) as exc:
             last_error = str(exc)
             wait(min(10, max(0.5, deadline - time.monotonic())))
             continue
         if expected_mode == "immediate":
-            accepted = bool(evidence["state"])
+            # A baseline-external server ID proves acceptance even when status text lags.
+            accepted = bool(evidence["content_id"])
         else:
             accepted = True
         if accepted:

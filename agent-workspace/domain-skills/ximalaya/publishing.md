@@ -19,7 +19,8 @@ metadata, not authorization inputs or Domain Skill constants.
 - Read lease for read-only probes; `--mode write --account "$TARGET_ACCOUNT_ID"`
   for upload/publication/deletion, where `TARGET_ACCOUNT_ID` is set by the
   calling task rather than this Skill.
-- Attach to a tab and open the upload form URL directly:
+- For uploads, attach to a tab and open the upload form URL directly; rejected
+  sound recovery instead uses the exact edit URL described below:
 
 ```
 https://www.ximalaya.com/reform-upload/page/webCenter/upload
@@ -46,7 +47,7 @@ cross-origin iframe; opening the iframe URL directly is the supported path.
 | `list_album_tracks(album_id, expected_uid=None, expected_name=None, limit=None)` | Read-only newest-first track list with exact album/track guards and episode metadata. Optional account arguments are compatibility-only. |
 | `download_owned_track_once(track, output_dir, expected_uid=None, expected_name=None)` | Requires login, revalidates one exact track, downloads the best directly playable CDN resource to a `.part`, probes it, then atomically renames it. Optional account arguments are compatibility-only. |
 | `archive_matches(title)` | Exact normalized-title matches across the scheduled list and every album's complete track list; fails closed if any album cannot be read. |
-| `prepare_upload(audio_file, title, expected_uid=None, expected_name=None, timeout=900)` | Exact-upload-page + login + duplicate + local-file gates, one upload, waits for row status `上传成功`. |
+| `prepare_upload(audio_file, title, expected_uid=None, expected_name=None, timeout=900, existing_content_ids=())` | Exact-upload-page + login + local-file gates, one upload, waits for row status `上传成功`. Existing exact-title records remain blocked by default; a caller that intentionally permits a repeated display title must pass the complete preflight content-ID baseline, which must still match exactly before upload. |
 | `select_album(album_id, expected_name=None, timeout=15)` | Selects one exact stable album ID; refuses ambiguous duplicate titles before the title-scoped DOM click; verifies readback on `button[aria-label="选择专辑"]`. |
 | `create_album(title, category, cover_path, intro, selling_point, tags, expected_uid=None, expected_name=None, visibility="public", timeout=30)` | Creates one free album on the albumMgr create page (React); title ≤25 chars, level-1 category click, square cover upload + crop + model readback, KindEditor intro + sync, selling point, full required tag chain, AI-cover 否, agreement check, per-field validation, ONE submit click; verifies via `list_albums` ID diff. Creation success counts on submit; platform review is out of scope. |
 | `set_title(title, timeout=15)` | Required 节目标题 setter (max 40 UTF-16 code units). |
@@ -56,16 +57,17 @@ cross-origin iframe; opening the iframe URL directly is the supported path.
 | `set_schedule_datetime(value, timeout=20)` | `YYYY-MM-DD HH:MM` in Asia/Shanghai; enforces the 2-hour minimum lead; drives the antd calendar; readback `YYYY-MM-DD HH:MM:00`. |
 | `submission_snapshot()` | Read-only full form state (identity, upload rows, title, album, category, AI flag, cover, description, mode, schedule, submit state, modal, validation errors). |
 | `submission_diagnostics()` | Bounded reason enum: `form_validation_failed`, `confirmation_required`, `platform_rejected`, `auth_required`, `result_delayed`, `click_not_accepted`, `submission_unverified`. |
-| `manager_evidence(title, content_id=None, expected_schedule=None, attempts=3)` | Read-only manager/API reconciliation (scheduled list + album tracks); requires exact title, and exact content ID once known. |
-| `submit_once(title, expected_uid=None, expected_name=None, expected_mode="scheduled", expected_schedule=None, run_marker="", timeout=600)` | Login-gated two stable snapshots, then ONE click on `确认发布` (plus at most one platform confirmation dialog click that is part of the same activation); read-only reconciliation afterwards. |
+| `manager_evidence(title, content_id=None, expected_schedule=None, attempts=3, album_id=None)` | Read-only API reconciliation. When `album_id` is supplied, reads that exact album directly instead of enumerating every album; requires exact title, album, and exact content ID once known. |
+| `submit_once(title, expected_uid=None, expected_name=None, expected_mode="scheduled", expected_schedule=None, run_marker="", timeout=600, expected_album_id=None, existing_content_ids=())` | Login-gated two stable snapshots, then ONE click on `确认发布`. Existing exact-title records remain blocked unless their complete preflight IDs are passed; after submission, only one baseline-external content ID in the exact target album proves this run. |
 | `prepare_successor_upload(old_track, audio_file, timeout=900)` | 保活窄路径：仅当目标专辑恰有指定旧同标题节目且旧节目明确免费、公开并可删除时，准备一次同标题上传；其他专辑同名只作观察，不比较账号身份字段。 |
 | `submit_successor_once(old_track, run_marker="", timeout=600)` | 保活窄路径：提交只激活一次，按目标专辑提交前后 track ID 集合差确认唯一 successor，再用 `track_evidence` 验证；未知结果 `retry=false`。 |
 | `delete_once(submission, expected_uid=None, expected_name=None, confirm=False, timeout=180)` | Login-gated deletion of only the verified record created by this module (`created_by="ximalaya_domain_skill"`, `submit_clicks=1`, run marker in exact title, live record with exact content ID). |
 | `delete_published_track_once(old_track, successor, confirm=False, timeout=180)` | 保活窄路径：要求 fresh 旧证据、已验证 successor、同专辑同标题、旧音频本地备份和 `confirm=True`；只删精确旧 ID 一次并双列表确认。 |
 | `track_evidence(album_id, track_id, expected_title=None)` | Read-only exact-track evidence from the album list plus `/revision/track/simple`; paginates the album list and rejects missing, cross-album, title-mismatch, or duplicate matches. |
-| `replace_sound_once(track, replacement_file, expected_uid=None, expected_name=None, confirm=False, timeout=900)` | Independent login-gated one-shot replacement of one exact track: requires a readable positive duration, one `替换声音` file attachment, optional one confirmation, then read-only same-track/media-change verification. |
+| `replace_sound_once(track, replacement_file, expected_uid=None, expected_name=None, confirm=False, timeout=900)` | One-shot replacement of one exact track, including a rejected/taken-down sound in the manager's `下架` tab. Verifies the changed audio resource through the authenticated edit API when the public detail API rejects the track. Recheck status before any later republish: replacement itself may restore the sound asynchronously. |
 | `update_track_description_once(track, description, expected_uid=None, expected_name=None, confirm=False, timeout=180)` | Login-gated edit of one exact published track: saves one normalized KindEditor description, reopens the page, and verifies the text plus unchanged adjacent fields. |
 | `replace_track_cover_once(track, image_file, expected_uid=None, expected_name=None, confirm=False, timeout=180)` | Login-gated edit of one exact published track: validates and uploads one replacement cover, confirms one crop and one save, then verifies the changed cover path plus unchanged adjacent fields. |
+| `republish_rejected_once(track, confirm=False, timeout=60)` | Requires the exact rejected sound edit page and a stable, validated form; clicks `重新发布` at most once. Returns `restored` only when the same track has status `1` in the authenticated edit API and album list, with the intended title/description/cover and unchanged adjacent fields. Unknown results are non-retryable. |
 
 ### Read and download contract
 
@@ -186,6 +188,39 @@ publish state and status. A post-save timeout or mismatched readback returns a n
 `description_update_unverified` or `cover_replacement_unverified` result with
 the counters and last evidence; it never uploads or saves again.
 
+### Rejected sound recovery (verified 2026-09-23)
+
+The Studio `声音 → 未通过` list links each row to
+`https://www.ximalaya.com/reform-upload/page/sound/edit/{trackId}`. The edit
+page's final button is `重新发布`, not `保存`. The existing `set_title()`,
+`set_description()`, and `set_custom_cover()` setters work on this form; their
+field/model readbacks were verified live. The published-track
+`update_track_description_once()` and `replace_track_cover_once()` functions
+must not be used here because they submit through `保存`.
+
+Use the exact track ID, album ID, and original title from the authenticated
+`/reform-upload/anchorTrack/edit?trackId={trackId}` response. The public
+`/revision/track/simple` endpoint can reject taken-down tracks with an album
+error, so it is not a preflight gate for this flow. Open the exact edit URL,
+apply only requested field changes, then call `republish_rejected_once()` with
+`{"track_id": track_id, "album_id": album_id, "title": original_title}` and
+`confirm=True`. It reads the current React form before submitting; no field
+change is required when the user requests a direct restore. A successful
+return proves the same track is currently in status `1` and readable in the
+album list. A later moderation decision is outside that readback.
+
+For a rejected sound, `replace_sound_once()` selects the album manager's
+`下架` tab and otherwise reuses the existing one-upload/one-confirmation path.
+Live testing showed that replacing audio can leave status `2` on immediate
+readback and move the same track to status `1` shortly afterwards. Always
+re-read status before calling `republish_rejected_once()`; never click again
+when it has already changed. An old sound whose album has been deleted kept
+status `2` after a `重新发布` click. Treat that as an unknown or rejected outcome,
+not proof of restoration.
+
+Batch recovery remains Agent orchestration over exact single-track actions,
+with per-track results and no blind retry of an unknown submission.
+
 ## Verified limits (evidence levels, verified 2026-09-07)
 
 | Constraint | Value | Level |
@@ -216,8 +251,10 @@ the counters and last evidence; it never uploads or saves again.
 ```python
 exec(open("/Users/yelin/Developer/agent-tools/browser-harness/agent-workspace/domain-skills/ximalaya/publishing.py").read())
 require_identity()
-archive_matches(title)  # must be empty
-prepare_upload(audio_file, title)
+existing_content_ids = tuple(
+    match["content_id"] for match in archive_matches(title)
+)
+prepare_upload(audio_file, title, existing_content_ids=existing_content_ids)
 select_album(album_id, album_name)
 set_title(title)
 set_custom_cover(cover_file)
@@ -226,7 +263,9 @@ set_publish_mode("scheduled")
 set_schedule_datetime(schedule)
 submission_snapshot(); wait(2); submission_snapshot()   # must be identical
 submission = submit_once(title, expected_mode="scheduled",
-                         expected_schedule=schedule, run_marker=run_marker)
+                         expected_schedule=schedule, run_marker=run_marker,
+                         expected_album_id=album_id,
+                         existing_content_ids=existing_content_ids)
 delete_once(submission, confirm=True)
 ```
 
@@ -257,6 +296,7 @@ Immediate mode: same flow with `set_publish_mode("immediate")`, no schedule,
 | `status="replacement_unverified"` | File attachment occurred, but replacement result is not proven | READ-ONLY `track_evidence()` reconciliation; never call replacement again |
 | `status="description_update_unverified"` | Description save was activated, but reopen/readback or adjacent-field verification is not proven | READ-ONLY `track_evidence()`/edit-page reconciliation; never save again |
 | `status="cover_replacement_unverified"` | Cover upload/crop/save was activated, but changed cover or adjacent-field verification is not proven | READ-ONLY `track_evidence()` reconciliation; never upload, crop or save again |
+| `status="republish_unverified"` | `重新发布` may have been activated, but same-track published state is unproven | READ-ONLY edit API/album-list reconciliation; never click again |
 
 Replacement counters are part of the result: `replacement_uploads` must be `1`
 after attachment and `replacement_confirms` is `0` or `1`. An unknown result is

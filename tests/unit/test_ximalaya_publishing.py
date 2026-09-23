@@ -458,6 +458,19 @@ def test_prepare_upload_blocks_exact_title_duplicate_before_upload():
         namespace["prepare_upload"]("/tmp/any.mp3", "已有标题", TEST_UID)
     assert page.upload_calls == []
 
+def test_prepare_upload_allows_exact_declared_title_baseline(tmp_path):
+    namespace, page = load_publishing()
+    page.tracks = [{"albumId": 88294964, "trackId": 1, "title": "已有标题",
+                    "albumTitle": ALBUM["title"], "status": "已发布"}]
+    audio = tmp_path / "audio-new.mp3"
+    audio.write_bytes(b"x" * 2_000_000)
+
+    result = namespace["prepare_upload"](
+        str(audio), "已有标题", TEST_UID, existing_content_ids=("1",))
+
+    assert result["existing_content_ids"] == ["1"]
+    assert len(page.upload_calls) == 1
+
 
 def test_prepare_upload_waits_for_explicit_processing_completion(tmp_path):
     namespace, page = load_publishing()
@@ -808,8 +821,8 @@ def _configure_submit(namespace, page, schedule="2026-09-07 18:25:00",
         calls["n"] += 1
         return dict(snapshot)
     namespace["submission_snapshot"] = snapshot_fn
-    namespace["manager_evidence"] = lambda title, cid=None, sched=None, attempts=3: {
-        "content_id": "42", "title": title, "album_id": "88294964",
+    namespace["manager_evidence"] = lambda title, cid=None, sched=None, attempts=3, album_id=None, **kwargs: {
+        "content_id": "42", "title": title, "album_id": album_id or "88294964",
         "album_name": ALBUM["title"], "state": "审核中" if mode == "immediate" else "定时",
         "mode": mode, "schedule": schedule, "match_count": 1, "latest": True,
         "list_loads": 1, "source": "reform_upload_api", "schedule_match": True}
@@ -849,6 +862,52 @@ def test_submit_once_clicks_exactly_once_then_reconciles_read_only():
     assert result["created_by"] == "ximalaya_domain_skill"
     assert result["run_marker"] == "RUN"
     assert page.submit_js_clicks == 1  # single activation on the submit control
+
+def test_submit_once_accepts_exact_target_album_record_before_status_text():
+    namespace, page = load_publishing()
+    _configure_submit(namespace, page, mode="immediate")
+    namespace["manager_evidence"] = lambda *args, **kwargs: {
+        "content_id": "42", "title": "标题", "album_id": "88294964",
+        "album_name": ALBUM["title"], "state": "", "mode": "immediate",
+        "schedule": "", "match_count": 1, "latest": True, "list_loads": 1,
+        "source": "reform_upload_api", "schedule_match": True}
+
+    result = namespace["submit_once"](
+        "标题", TEST_UID, TEST_NAME, "immediate", None, "RUN",
+        timeout=1, expected_album_id="88294964")
+
+    assert result["status"] == "verified"
+    assert result["content_id"] == "42"
+    assert result["album_id"] == "88294964"
+    assert result["submit_clicks"] == 1
+
+def test_submit_once_allows_declared_same_title_baseline_and_requires_new_id():
+    namespace, page = load_publishing()
+    _configure_submit(namespace, page, mode="immediate")
+    old = {"content_id": "1", "album_id": "88294964", "title": "标题"}
+    new = {"content_id": "2", "album_id": "88294964", "title": "标题"}
+    archive_values = iter([[old], [old, new]])
+    namespace["archive_matches"] = lambda title: next(archive_values)
+    observed = {}
+
+    def manager(title, content_id=None, **kwargs):
+        observed["content_id"] = content_id
+        return {
+            "content_id": content_id, "title": title, "album_id": "88294964",
+            "album_name": ALBUM["title"], "state": "", "mode": "immediate",
+            "schedule": "", "match_count": 2, "latest": True, "list_loads": 1,
+            "source": "reform_upload_api", "schedule_match": True,
+        }
+
+    namespace["manager_evidence"] = manager
+    result = namespace["submit_once"](
+        "标题", TEST_UID, TEST_NAME, "immediate", None, "RUN",
+        timeout=1, expected_album_id="88294964", existing_content_ids=("1",))
+
+    assert observed["content_id"] == "2"
+    assert result["content_id"] == "2"
+    assert result["submit_clicks"] == 1
+
 
 
 def test_submit_once_returns_nonretryable_unknown_after_ambiguous_click():
@@ -892,6 +951,23 @@ def test_manager_evidence_requires_exact_title_and_content_id():
         namespace["manager_evidence"]("标题X", content_id="7",
                                       expected_schedule="2026-09-09 09:09",
                                       attempts=1)
+
+def test_manager_evidence_reads_expected_album_directly():
+    namespace, _ = load_publishing()
+    calls = []
+    namespace["list_albums"] = lambda: (_ for _ in ()).throw(
+        AssertionError("must not enumerate every album"))
+    namespace["_album_tracks"] = lambda album_id: calls.append(album_id) or [{
+        "trackId": 42, "albumId": 88294964, "albumTitle": ALBUM["title"],
+        "title": "标题X", "status": "审核中"}]
+
+    evidence = namespace["manager_evidence"](
+        "标题X", attempts=1, album_id="88294964")
+
+    assert calls == ["88294964"]
+    assert evidence["content_id"] == "42"
+    assert evidence["album_id"] == "88294964"
+    assert evidence["state"] == "审核中"
 
 
 def _track_fixture(duration=90, upload_id="upload-before", updated_at="2026-09-07 10:00:00"):
@@ -1090,6 +1166,43 @@ def test_replace_track_cover_once_returns_nonretryable_unknown(tmp_path):
     assert result["save_clicks"] == page.save_clicks == 1
     assert result["retry"] is False
     assert len(page.upload_calls) == 1
+
+
+def test_republish_rejected_once_clicks_once_and_verifies_same_track():
+    namespace, _ = load_publishing()
+    before = {"track_id": "42", "album_id": "88294964", "title": "原标题",
+              "status": 2, "description": "简介", "cover_path": "/cover-a.jpg",
+              "audio_resource_id": "audio-a", "category_id": 5, "visibility": 2}
+    after = dict(before, status=1)
+    states = iter((before, after))
+    clicks = []
+    namespace["require_identity"] = lambda: {"uid": TEST_UID, "logged_in": True}
+    namespace["page_info"] = lambda: {
+        "url": "https://www.ximalaya.com/reform-upload/page/sound/edit/42"}
+    namespace["_edit_track_evidence"] = lambda *args: next(states)
+    namespace["_wait_edit_form_ready"] = lambda *args: True
+    namespace["_wait_edit_form_validation"] = lambda *args: True
+    namespace["track_evidence"] = lambda *args: dict(after)
+    namespace["wait"] = lambda *_: None
+
+    def js(script):
+        if "form.getFieldsValue" in script:
+            return {"track_id": "42", "album_id": "88294964", "title": "原标题",
+                    "description_html": "<p>简介</p>", "cover_id": 0,
+                    "category_id": 5, "visibility": 2, "submit_count": 1}
+        if "buttons[0].click()" in script:
+            clicks.append(1)
+            return True
+        raise AssertionError("unexpected JS")
+
+    namespace["js"] = js
+    with pytest.raises(ValueError, match="confirm=True"):
+        namespace["republish_rejected_once"](before)
+    result = namespace["republish_rejected_once"](before, confirm=True, timeout=1)
+
+    assert result["status"] == "restored"
+    assert result["submit_clicks"] == len(clicks) == 1
+    assert result["retry"] is False
 
 
 def test_ximalaya_domain_skill_never_activates_or_brings_tab_to_front():
