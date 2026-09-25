@@ -84,7 +84,7 @@ def observe_chatgpt_state() -> dict[str, Any]:
                r.right <= innerWidth && r.bottom <= innerHeight;
       };
       const visibleText = el => visible(el) && norm(el.innerText || el.textContent || el.getAttribute('aria-label'));
-      const form = document.querySelector('form[data-type="unified-composer"]');
+      const form = (document.querySelector('form[data-type="unified-composer"]') || document.querySelector('form[data-chatgpt-composer]'));
       const editor = form && (form.querySelector('[contenteditable="true"]') ||
                               form.querySelector('textarea, [role="textbox"]'));
       const draft = editor && editor.cloneNode(true);
@@ -153,7 +153,7 @@ def _composer_state() -> str:
         if (!b.offsetParent) return false;
         const r = b.getBoundingClientRect();
         if (r.width < 20) return false;
-        const inComposer = !!b.closest('form[data-type="unified-composer"]');
+        const inComposer = !!b.closest('form[data-type="unified-composer"], form[data-chatgpt-composer]');
         const isPicker = (b.matches('[aria-haspopup="menu"]') || b.classList.contains('__composer-pill')) &&
                          b.getAttribute('data-testid') !== 'composer-plus-btn';
         if (inComposer && isPicker) return true;
@@ -171,7 +171,7 @@ def _find_composer_picker() -> dict[str, Any]:
     r = js(r"""
     (() => {
       const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-      const scoped = [...document.querySelectorAll('form[data-type="unified-composer"] button')].filter(b =>
+      const scoped = [...document.querySelectorAll('form[data-type="unified-composer"] button, form[data-chatgpt-composer] button')].filter(b =>
         b.offsetParent && b.getAttribute('data-testid') !== 'composer-plus-btn' &&
         (b.matches('[aria-haspopup="menu"]') || b.classList.contains('__composer-pill'))
       );
@@ -236,7 +236,7 @@ def new_chat() -> dict[str, Any]:
     wait(2.0)
     state = js(r"""
     (() => {
-      const form = document.querySelector('form[data-type="unified-composer"]');
+      const form = (document.querySelector('form[data-type="unified-composer"]') || document.querySelector('form[data-chatgpt-composer]'));
       const editor = form && (form.querySelector('[contenteditable="true"]') ||
                               form.querySelector('textarea, [role="textbox"]'));
       const visible = !!(editor && editor.offsetParent);
@@ -352,7 +352,7 @@ def _activate_composer_picker() -> dict[str, Any]:
     return js(r"""
     (() => {
       const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-      const form = document.querySelector('form[data-type="unified-composer"]');
+      const form = (document.querySelector('form[data-type="unified-composer"]') || document.querySelector('form[data-chatgpt-composer]'));
       const buttons = form ? [...form.querySelectorAll('button')] : [];
       const visible = buttons.filter(b => {
         if (!b.offsetParent || b.disabled) return false;
@@ -650,7 +650,7 @@ def _prefill_via_qparam(text: str, expected: str, timeout_s: float = 60.0) -> No
     while time.monotonic() < deadline:
         try:
             cur = js(
-                r"(() => { const f = document.querySelector('form[data-type=\"unified-composer\"]');"
+                r"(() => { const f = (document.querySelector('form[data-type=\"unified-composer\"]') || document.querySelector('form[data-chatgpt-composer]'));"
                 r" const e = f && (f.querySelector('[contenteditable=\"true\"]') || f.querySelector('textarea'));"
                 r" const t = e ? (e.innerText || e.value || '') : '';"
                 r" return t.replace(/\s+/g, ' ').trim(); })()"
@@ -658,9 +658,44 @@ def _prefill_via_qparam(text: str, expected: str, timeout_s: float = 60.0) -> No
         except Exception:
             cur = ""
         if cur == expected and cur:
+            _nudge_composer_after_prefill()
             return
         wait(1.0)
     raise RuntimeError("send_message: q-param prefill did not match before clicking")
+
+
+def _nudge_composer_after_prefill() -> None:
+    """2026-09-25 UI: after ``?q=`` hydration the prefilled text sits in
+    ProseMirror but the send button stays ``disabled`` until an input event
+    re-registers the draft. Focus + a synthetic input event enables it."""
+    try:
+        js(
+            r"(() => { const f = (document.querySelector('form[data-type=\"unified-composer\"]')"
+            r" || document.querySelector('form[data-chatgpt-composer]'));"
+            r" const e = f && f.querySelector('[contenteditable=\"true\"]');"
+            r" if (!e) return 'no-editor';"
+            r" e.focus();"
+            r" e.dispatchEvent(new InputEvent('input', {bubbles: true, cancelable: false, inputType: 'insertText', data: null}));"
+            r" return 'dispatched'; })()"
+        )
+    except Exception:
+        pass
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        try:
+            enabled = js(
+                r"(() => { const f = (document.querySelector('form[data-type=\"unified-composer\"]')"
+                r" || document.querySelector('form[data-chatgpt-composer]'));"
+                r" const btn = f && [...f.querySelectorAll('button')].find(b =>"
+                r"   b.getAttribute('data-testid') === 'send-button' || b.getAttribute('type') === 'submit');"
+                r" return !!(btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true'); })()"
+            )
+        except Exception:
+            enabled = False
+        if enabled:
+            return
+        wait(0.5)
+    raise RuntimeError("send_message: send button not enabled after q-param prefill")
 
 
 def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
@@ -679,7 +714,7 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
         raise RuntimeError("send_message: message must not be empty")
     preflight_script = r"""
     (() => {
-      const form = document.querySelector('form[data-type="unified-composer"]');
+      const form = (document.querySelector('form[data-type="unified-composer"]') || document.querySelector('form[data-chatgpt-composer]'));
       const editor = form && (form.querySelector('[contenteditable="true"]') ||
                               form.querySelector('textarea, [role="textbox"]'));
       const users = [...document.querySelectorAll('[data-message-author-role="user"]')];
@@ -722,7 +757,7 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
         try:
             return js(r"""
             (() => {
-              const form = document.querySelector('form[data-type="unified-composer"]');
+              const form = (document.querySelector('form[data-type="unified-composer"]') || document.querySelector('form[data-chatgpt-composer]'));
               const editor = form && form.querySelector('[contenteditable="true"]');
               return editor && editor.tagName === 'DIV' ? 'DIV' : '';
             })()
@@ -768,12 +803,13 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
         btn = js(r"""
         (() => {
           const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-          const form = document.querySelector('form[data-type="unified-composer"]');
+          const form = (document.querySelector('form[data-type="unified-composer"]') || document.querySelector('form[data-chatgpt-composer]'));
           const send_button = form && [...form.querySelectorAll('button')].find(el => {
             const label = norm(el.getAttribute('aria-label') || '');
             const testid = el.getAttribute('data-testid') || '';
             return (testid === 'send-button' ||
-                    ['发送提示', '发送提示词', 'Send prompt'].includes(label)) && el.offsetParent &&
+                    ['发送提示', '发送提示词', 'Send prompt'].includes(label) ||
+                    el.getAttribute('type') === 'submit') && el.offsetParent &&
                    !el.disabled && el.getAttribute('aria-disabled') !== 'true';
           });
           if (!send_button) return {found: false};
@@ -793,12 +829,13 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
         activated = js(r"""
         (() => {
           const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-          const form = document.querySelector('form[data-type="unified-composer"]');
+          const form = (document.querySelector('form[data-type="unified-composer"]') || document.querySelector('form[data-chatgpt-composer]'));
           const activate_send_button = form && [...form.querySelectorAll('button')].find(el => {
             const label = norm(el.getAttribute('aria-label') || '');
             const testid = el.getAttribute('data-testid') || '';
             return (testid === 'send-button' || label === '发送提示词' ||
-                    label === '发送提示' || label === 'Send prompt') && el.offsetParent &&
+                    label === '发送提示' || label === 'Send prompt' ||
+                    el.getAttribute('type') === 'submit') && el.offsetParent &&
                    !el.disabled && el.getAttribute('aria-disabled') !== 'true';
           });
           const editor = form.querySelector('[contenteditable="true"]') || form.querySelector('textarea, [role="textbox"]');
@@ -855,7 +892,7 @@ def send_message(text: str, evidence_timeout: float = 8.0) -> dict[str, Any]:
             latest = js(r"""
             (() => {
               const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-              const form = document.querySelector('form[data-type="unified-composer"]');
+              const form = (document.querySelector('form[data-type="unified-composer"]') || document.querySelector('form[data-chatgpt-composer]'));
               const editor = form && (form.querySelector('[contenteditable="true"]') ||
                                       form.querySelector('textarea, [role="textbox"]'));
               const draft = editor && editor.cloneNode(true);
@@ -1535,16 +1572,51 @@ def _open_exact_conversation_options(conversation_id: str) -> None:
       const suffix = '/c/' + %r;
       const matches = [...document.querySelectorAll('a[href*="/c/"]')].filter(a =>
         a.offsetParent && new URL(a.href, location.href).pathname === suffix);
-      if (matches.length !== 1) return {found: false, count: matches.length};
-      const a = matches[0];
-      for (const type of ['mouseover', 'mouseenter', 'mousemove', 'pointerover']) {
-        a.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true}));
+      if (matches.length === 1) {
+        const a = matches[0];
+        for (const type of ['mouseover', 'mouseenter', 'mousemove', 'pointerover']) {
+          a.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true}));
+        }
+        const item = a.closest('li') || a.parentElement;
+        const btn = [...item.querySelectorAll('button')].find(b =>
+          /history-item-\d+-options/i.test(b.getAttribute('data-testid') || ''));
+        if (btn) {
+          btn.click();
+          return {found: true};
+        }
+        return {found: false, count: 1};
       }
-      const item = a.closest('li') || a.parentElement;
-      const btn = [...item.querySelectorAll('button')].find(b =>
-        /history-item-\d+-options/i.test(b.getAttribute('data-testid') || ''));
+      // 2026-09-25 UI: sidebar rows are div[role=button] without hrefs; the
+      // open conversation's row carries aria-current="page" and its actions
+      // button has aria-label 聊天操作. Requires the conversation page itself.
+      if (location.pathname !== suffix) return {found: false, count: matches.length};
+      const row = document.querySelector('div[role="button"][aria-current="page"]');
+      if (!row || !row.querySelector('[data-thread-title]')) return {found: false, count: 0};
+      const r = row.getBoundingClientRect();
+      for (const type of ['mouseover', 'mouseenter', 'mousemove', 'pointerover', 'pointermove']) {
+        const ev = type.startsWith('pointer')
+          ? new PointerEvent(type, {bubbles: true, cancelable: true, pointerId: 1,
+              pointerType: 'mouse', isPrimary: true, clientX: r.x + r.width / 2,
+              clientY: r.y + r.height / 2})
+          : new MouseEvent(type, {bubbles: true, cancelable: true, clientX: r.x + r.width / 2,
+              clientY: r.y + r.height / 2});
+        row.dispatchEvent(ev);
+      }
+      const btn = [...row.querySelectorAll('button')].find(b =>
+        ['聊天操作', 'Chat options'].includes((b.getAttribute('aria-label') || '').trim()));
       if (!btn) return {found: false, count: 1};
-      btn.click();
+      const br = btn.getBoundingClientRect();
+      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+        const event = type.startsWith('pointer')
+          ? new PointerEvent(type, {bubbles: true, cancelable: true, pointerId: 1,
+              pointerType: 'mouse', isPrimary: true, button: 0,
+              buttons: type.endsWith('down') ? 1 : 0,
+              clientX: br.x + br.width / 2, clientY: br.y + br.height / 2})
+          : new MouseEvent(type, {bubbles: true, cancelable: true, button: 0,
+              buttons: type.endsWith('down') ? 1 : 0,
+              clientX: br.x + br.width / 2, clientY: br.y + br.height / 2});
+        btn.dispatchEvent(event);
+      }
       return {found: true};
     })()
     """ % conversation_id) or {"found": False}
@@ -1574,8 +1646,17 @@ def _read_exact_conversation_row(conversation_id: str) -> dict[str, Any]:
         x.offsetParent && new URL(x.href, location.href).pathname === suffix);
       const inputGone = ![...document.querySelectorAll('input[aria-label="聊天标题"], input[aria-label="Chat title"]')]
         .some(x => x.offsetParent);
-      const title = a ? norm(a.innerText || a.textContent).split('\n')[0] : null;
-      return {found: !!a, input_gone: inputGone, title: title};
+      if (a) {
+        const title = norm(a.innerText || a.textContent).split('\n')[0];
+        return {found: true, input_gone: inputGone, title: title};
+      }
+      // 2026-09-25 UI: anchor-less rows; trust the aria-current row only on
+      // the exact conversation page.
+      if (location.pathname !== suffix) return {found: false, input_gone: inputGone, title: null};
+      const row = document.querySelector('div[role="button"][aria-current="page"]');
+      const titleEl = row && row.querySelector('[data-thread-title]');
+      if (!titleEl) return {found: false, input_gone: inputGone, title: null};
+      return {found: true, input_gone: inputGone, title: norm(titleEl.textContent)};
     })()
     """ % conversation_id) or {}
 
@@ -1598,33 +1679,47 @@ def _rename_chat_once(conversation_id: str, new_title: str) -> dict[str, Any]:
     if not ren or not ren.get("found"):
         raise RuntimeError("rename_chat: rename menu item not found")
     wait(1.2)
-    edited = js(r"""
+    focused = js(r"""
     (() => {
-      const title = %r;
       const el = [...document.querySelectorAll('input[aria-label="聊天标题"], input[aria-label="Chat title"]')]
         .find(x => x.offsetParent);
       if (!el) return {found: false};
-      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-      setter.call(el, title);
-      el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: title}));
-      el.dispatchEvent(new Event('change', {bubbles: true}));
-      el.blur();
-      const form = document.querySelector('form[data-type="unified-composer"]');
-      if (!form || !form.offsetParent) return {found: false, blurred: document.activeElement !== el};
+      el.focus();
+      return {found: true};
+    })()
+    """)
+    if not focused or not focused.get("found"):
+        raise RuntimeError("rename_chat: title input not found")
+    press_key("a", 4)
+    wait(0.3)
+    type_text(new_title)
+    wait(0.5)
+    committed = js(r"""
+    (() => {
+      const el = [...document.querySelectorAll('input[aria-label="聊天标题"], input[aria-label="Chat title"]')]
+        .find(x => x.offsetParent);
+      if (!el) return {found: false};
+      const form = el.closest('form');
+      if (!form) return {found: true, commit_dispatched: false};
+      const submit = form.querySelector('button[type="submit"]');
+      if (!submit) return {found: true, commit_dispatched: false};
+      const r = submit.getBoundingClientRect();
       for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
         const event = type.startsWith('pointer')
           ? new PointerEvent(type, {bubbles: true, cancelable: true, pointerId: 1,
               pointerType: 'mouse', isPrimary: true, button: 0,
-              buttons: type.endsWith('down') ? 1 : 0})
+              buttons: type.endsWith('down') ? 1 : 0,
+              clientX: r.x + r.width / 2, clientY: r.y + r.height / 2})
           : new MouseEvent(type, {bubbles: true, cancelable: true, button: 0,
-              buttons: type.endsWith('down') ? 1 : 0});
-        form.dispatchEvent(event);
+              buttons: type.endsWith('down') ? 1 : 0,
+              clientX: r.x + r.width / 2, clientY: r.y + r.height / 2});
+        submit.dispatchEvent(event);
       }
-      return {found: true, blurred: document.activeElement !== el, commit_dispatched: true};
+      return {found: true, commit_dispatched: true};
     })()
-    """ % new_title)
-    if (not edited or not edited.get("found") or not edited.get("blurred") or
-            not edited.get("commit_dispatched")):
+    """)
+    if (not committed or not committed.get("found") or
+            not committed.get("commit_dispatched")):
         raise RuntimeError("rename_chat: title input commit sequence could not be dispatched")
 
     wait(1.5)
@@ -1766,13 +1861,14 @@ def send_and_wait(text: str, timeout: int = 180) -> dict[str, Any]:
           const send_btn = [...document.querySelectorAll('button')].some(el => {
             const label = norm(el.getAttribute('aria-label') || '');
             return el.getAttribute('data-testid') === 'send-button' ||
-              label === '发送提示词' || label === '发送提示' || label === 'Send prompt';
+              label === '发送提示词' || label === '发送提示' || label === 'Send prompt' ||
+              el.getAttribute('type') === 'submit';
           });
           const msgs = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
           const last = msgs.length ? msgs[msgs.length - 1] : null;
           const last_text = last ? norm(last.innerText || '') : '';
           const last_id = last?.getAttribute('data-message-id') || null;
-          const form = document.querySelector('form[data-type="unified-composer"]');
+          const form = (document.querySelector('form[data-type="unified-composer"]') || document.querySelector('form[data-chatgpt-composer]'));
           const editor = form && (form.querySelector('[contenteditable="true"]') ||
                                   form.querySelector('textarea, [role="textbox"]'));
           const draft = editor && editor.cloneNode(true);
