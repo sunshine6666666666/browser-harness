@@ -24,6 +24,16 @@
 6. `_rename_chat_once` 重写为上述「聚焦 → 全选 → 键入 → form submit」序列。
 7. 兼容策略：全部为「旧选择器优先、新选择器兜底」，未删除旧路径；若 ChatGPT 再回滚 UI，旧逻辑仍可用。
 
+## 2026-09-26 追加：侧边栏行回退为 `<a href>`，但行内结构混合
+
+English Shadowing 09-26 轮实测：侧边栏会话行**恢复为 `<a href="/c/<id>">`**（`[data-thread-title]` 在行内 `<span>` 上），但与旧版不同：
+
+1. 行内操作按钮**没有** `history-item-\d+-options` testid，只有 `aria-label="聊天操作"/Chat options`；
+2. 该按钮不是 `<a>` 的子节点，而是 `<a>` 的**兄弟节点**（行容器 `div` 下 `<a>` + `<button>` 并列），`a.closest('li')` 内找不到按钮；
+3. 合成 `btn.click()` 打不开菜单，必须像 aria-current 分支一样派发带坐标的完整 pointer/mouse 序列。
+
+修复（同日，仍收敛在 `_open_exact_conversation_options` 的 `<a>` 分支）：`<a>` 唯一命中后，从锚点向上最多爬 4 层找 `aria-label=聊天操作` 按钮，并改用完整指针事件序列点击。`rename_chat` 内部流程（菜单→重命名→聚焦→全选→键入→form submit）与行读回校验未改，实测通过。另注意：`full_conversation()` 返回值**不含 `title` 键**，调用方校验重命名结果应使用 `_read_exact_conversation_row()`，不要用 `conv.get("title")`。
+
 ## 验证
 
 - `python3 -m py_compile` 通过。

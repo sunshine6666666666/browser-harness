@@ -1578,10 +1578,43 @@ def _open_exact_conversation_options(conversation_id: str) -> None:
           a.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true}));
         }
         const item = a.closest('li') || a.parentElement;
-        const btn = [...item.querySelectorAll('button')].find(b =>
+        let btn = [...item.querySelectorAll('button')].find(b =>
           /history-item-\d+-options/i.test(b.getAttribute('data-testid') || ''));
+        // 2026-09-26 UI: rows are <a href> again; the options button is a
+        // sibling of the anchor inside the row container (no testid, only
+        // aria-label 聊天操作). Climb a few parents to find it.
+        if (!btn) {
+          let el = a.parentElement;
+          for (let i = 0; i < 4 && el && el !== document.body && !btn; i++) {
+            btn = [...el.querySelectorAll('button')].find(b =>
+              ['聊天操作', 'Chat options'].includes((b.getAttribute('aria-label') || '').trim()));
+            el = el.parentElement;
+          }
+        }
         if (btn) {
-          btn.click();
+          // 2026-09-26 UI: synthetic .click() no longer opens the menu;
+          // dispatch the full pointer/mouse sequence with coordinates.
+          const br = btn.getBoundingClientRect();
+          for (const type of ['mouseover', 'mouseenter', 'mousemove', 'pointerover', 'pointermove']) {
+            const ev = type.startsWith('pointer')
+              ? new PointerEvent(type, {bubbles: true, cancelable: true, pointerId: 1,
+                  pointerType: 'mouse', isPrimary: true, clientX: br.x + br.width / 2,
+                  clientY: br.y + br.height / 2})
+              : new MouseEvent(type, {bubbles: true, cancelable: true, clientX: br.x + br.width / 2,
+                  clientY: br.y + br.height / 2});
+            btn.dispatchEvent(ev);
+          }
+          for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+            const event = type.startsWith('pointer')
+              ? new PointerEvent(type, {bubbles: true, cancelable: true, pointerId: 1,
+                  pointerType: 'mouse', isPrimary: true, button: 0,
+                  buttons: type.endsWith('down') ? 1 : 0,
+                  clientX: br.x + br.width / 2, clientY: br.y + br.height / 2})
+              : new MouseEvent(type, {bubbles: true, cancelable: true, button: 0,
+                  buttons: type.endsWith('down') ? 1 : 0,
+                  clientX: br.x + br.width / 2, clientY: br.y + br.height / 2});
+            btn.dispatchEvent(event);
+          }
           return {found: true};
         }
         return {found: false, count: 1};
