@@ -123,7 +123,7 @@ def test_open_model_picker_uses_dom_click_instead_of_cdp_coordinates():
             return next(menu_counts)
         if "const scoped =" in script:
             return {"found": True, "x": 100, "y": 100, "expanded": False, "text": "中"}
-        if "const form = document.querySelector('form[data-type=\"unified-composer\"]')" in script:
+        if "const form = (document.querySelector('form[data-type=\"unified-composer\"]')" in script:
             return {"found": True, "expanded": False, "clicked": True, "text": "中"}
         if "!!document.querySelector('[role=\"menu\"]')" in script:
             return True
@@ -555,6 +555,10 @@ def test_send_message_prefills_long_home_prompt_via_qparam():
             }
         if "activate_send_button" in script:
             return {"found": True, "clicked": True}
+        if "new InputEvent('input'" in script:
+            return "dispatched"
+        if "const btn = f && [...f.querySelectorAll('button')]" in script:
+            return True
         if "send_button" in script:
             return {"found": True}
         if "last_user_message" in script:
@@ -1039,10 +1043,11 @@ def test_rename_chat_targets_exact_url_and_verifies_persisted_title():
             return {"found": True}
         if "t === '重命名'" in script:
             return {"found": True}
-        if "HTMLInputElement.prototype" in script:
-            assert "el.blur()" in script
+        if "el.focus();" in script:
+            return {"found": True}
+        if "commit_dispatched: true" in script:
             assert "pointerdown" in script
-            return {"found": True, "blurred": True, "commit_dispatched": True}
+            return {"found": True, "commit_dispatched": True}
         if "inputGone" in script:
             return {"found": True, "input_gone": True, "title": new_title}
         raise AssertionError(f"unexpected JS: {script[:100]}")
@@ -1074,8 +1079,10 @@ def test_rename_chat_retries_once_when_exact_row_still_has_generated_title():
             return {"found": True}
         if "t === '重命名'" in script:
             return {"found": True}
-        if "HTMLInputElement.prototype" in script:
-            return {"found": True, "blurred": True, "commit_dispatched": True}
+        if "el.focus();" in script:
+            return {"found": True}
+        if "commit_dispatched: true" in script:
+            return {"found": True, "commit_dispatched": True}
         if "inputGone" in script:
             row_reads["n"] += 1
             # First transaction: the in-place check sees the new title, but

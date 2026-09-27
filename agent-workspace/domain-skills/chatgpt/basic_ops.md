@@ -7,6 +7,9 @@ Review follow-up: 2026-09-05. Ordinary lifecycle results below remain 2026-09-04
 evidence. The new share-reader boundary algorithm has local regression coverage;
 the old public URL now redirects, so it cannot provide a fresh live full-thread
 read. A user-authorized minimal DR submission completed on 2026-09-05.
+Read-only check on 2026-09-27 found the hydrated home composer and one
+`role="group"` per sidebar conversation; the row's `聊天操作` button is a
+sibling of its exact `/c/<id>` anchor.
 
 This skill covers the conversation lifecycle, model/reasoning controls, header
 tabs, sharing, virtualized conversation reads, and the companion
@@ -15,7 +18,7 @@ credentials, and existing conversation content are out of scope.
 
 ## Invocation
 
-Run from `/Users/yelin/orca/workspaces/browser-harness/main` through the managed
+Run from `/Users/yelin/Developer/agent-tools/browser-harness` through the managed
 pool. The pool owns browser selection, serialization, and cleanup; do not set a
 CDP URL or use a global harness binary.
 
@@ -30,7 +33,7 @@ try:
     except Exception:
         wait_for_load(timeout=20)
         print(page_info())
-    exec(open("/Users/yelin/orca/workspaces/browser-harness/main/agent-workspace/domain-skills/chatgpt/basic_ops.py").read())
+    exec(open("agent-workspace/domain-skills/chatgpt/basic_ops.py").read())
     print(observe_chatgpt_state())
 finally:
     close_tab(tid)
@@ -82,7 +85,7 @@ Stable error prefixes are: `precondition`, `not_found`, `ambiguous`,
 | `open_chatgpt(url)` | Accepts home or exact URL/path/ID, opens a task-owned tab, observes a non-unknown final state, and returns `target_id` plus state. |
 | `new_chat()` | Clicks the visible new-chat link and requires exact `/` plus an empty composer. No message is sent. |
 | `switch_chat(conversation)` | Accepts only an exact canonical URL, `/c/<id>` path, or ID; navigates to that exact URL and requires the same ID in the final state. Title fragments are rejected before browser access. |
-| `delete_chat(conversation, confirm=False)` | Requires explicit `confirm=True`, resolves one exact sidebar pathname and its nested options button, clicks delete once, and requires that exact row to disappear. Missing/ambiguous rows never click. |
+| `delete_chat(conversation, confirm=False)` | Requires explicit `confirm=True`, resolves one exact sidebar pathname and its row-scoped options button, clicks delete once, and requires that exact row to disappear. Missing/ambiguous rows never click. |
 | `select_model(name)` | Opens the current model picker, selects one exact visible `menuitemradio`, reopens, and requires `aria-checked="true"`. The picker excludes `composer-plus-btn`. |
 | `set_reasoning_effort(level)` | Uses the exact visible reasoning radio and reopens to verify `aria-checked="true"`. It is unavailable in the audited home Variant when no safe effort radio is exposed. |
 | `send_message(text)` | Requires visible empty unified composer and atomically checks that the typed draft matches `text` after whitespace normalization before activating the send button. A mismatched draft returns pre-click `definitely_not_sent` (reason `composer_mismatch_after_typing`); otherwise it activates at most once and returns `definitely_sent` or non-retryable post-click `unknown`. |
@@ -100,7 +103,7 @@ Stable error prefixes are: `precondition`, `not_found`, `ambiguous`,
 | `close_extra_tab(target_id)` | Accepts only a target in this module's task-owned set. Unknown or another owner's protected targets fail with `destructive_scope_violation`; no tab scan or URL ordering is used. |
 | `export_share_link(conversation=None)` | Requires the current or supplied exact canonical conversation, clicks the conversation-level `share-chat-button` once using a fresh DOM rect, and verifies a new share URL in the clipboard or a visible copy confirmation. Results are cached: a second call returns the same URL with `created=False`; unknown results are never reactivated. |
 | `read_shared_conversation(url)` | Opens its own official share target, verifies the URL, pages to a stable top boundary, then collects down to a stable bottom boundary using turn/message IDs. Missing IDs, redirects or timeout fail instead of returning a partial transcript or error-page body. Closes only its own target in `finally`. Returns `{target_id, url, text}`. |
-| `rename_chat(conversation, new_title)` | Requires exact ID/URL, mutates only the exact row's native title input, blurs and verifies persistence after leaving/reopening. One bounded full transaction retry is allowed only when the exact row remains present with a different title. |
+| `rename_chat(conversation, new_title)` | Requires exact ID/URL, types into the visible title input, submits its own form, and verifies persistence after leaving/reopening. One bounded full transaction retry is allowed only when the exact row remains present with a different title. |
 | `switch_header_tab(tab)` | Accepts only `聊天`/`chat` or `工作`/`work`, clicks the exact header radio once when needed, and verifies its checked state. |
 
 ## Parameterized conversation analysis
@@ -289,12 +292,8 @@ DOM target are acceptable; fixed coordinates are not.
 For this checkout launcher, run:
 
 ```bash
-python3 scripts/verify_domain_skills.py --runtime-workspace "/Users/yelin/orca/workspaces/browser-harness/main/agent-workspace"
+python3 scripts/verify_domain_skills.py
 ```
 
-The launcher explicitly sets `BH_AGENT_WORKSPACE` to this checkout, verified
-by live `page_info()` discovery. The user-level default symlink points to the
-canonical shared skill tree in `/Users/yelin/Developer/agent-tools/browser-harness`;
-it is not used by this invocation and must not be redirected into a development
-checkout. Calling the verifier without the explicit argument still checks that
-global link strictly; no global runtime migration is claimed here.
+The default runtime symlink resolves to this checkout, verified by live
+`page_info()` discovery and the registry verifier on 2026-09-27.

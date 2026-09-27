@@ -1577,19 +1577,16 @@ def _open_exact_conversation_options(conversation_id: str) -> None:
         for (const type of ['mouseover', 'mouseenter', 'mousemove', 'pointerover']) {
           a.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true}));
         }
-        const item = a.closest('li') || a.parentElement;
+        const item = a.closest('li') || a.closest('[role="group"]');
+        if (!item || item.querySelectorAll('a[href*="/c/"]').length !== 1)
+          return {found: false, count: matches.length};
         let btn = [...item.querySelectorAll('button')].find(b =>
           /history-item-\d+-options/i.test(b.getAttribute('data-testid') || ''));
         // 2026-09-26 UI: rows are <a href> again; the options button is a
-        // sibling of the anchor inside the row container (no testid, only
-        // aria-label 聊天操作). Climb a few parents to find it.
+        // sibling of the anchor inside its role=group row.
         if (!btn) {
-          let el = a.parentElement;
-          for (let i = 0; i < 4 && el && el !== document.body && !btn; i++) {
-            btn = [...el.querySelectorAll('button')].find(b =>
-              ['聊天操作', 'Chat options'].includes((b.getAttribute('aria-label') || '').trim()));
-            el = el.parentElement;
-          }
+          btn = [...item.querySelectorAll('button')].find(b =>
+            ['聊天操作', 'Chat options'].includes((b.getAttribute('aria-label') || '').trim()));
         }
         if (btn) {
           // 2026-09-26 UI: synthetic .click() no longer opens the menu;
