@@ -587,10 +587,37 @@ def js(expression, target_id=None):
     """
     sid = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"] if target_id else None
     try:
+        result = _js_evaluate(expression, sid)
+    except BaseException:
+        # Preserve the evaluation failure if releasing the iframe session also fails.
+        if sid:
+            try:
+                _detach_iframe_session(sid)
+            except BaseException:
+                pass
+        raise
+    if sid:
+        _detach_iframe_session(sid)
+    return result
+
+
+def _js_evaluate(expression, sid):
+    try:
         return _runtime_evaluate(expression, session_id=sid, await_promise=True)
     except RuntimeError as e:
         if _is_illegal_return_error(e):
             return _runtime_evaluate(_wrap_js_function(expression), session_id=sid, await_promise=True)
+        raise
+
+
+def _detach_iframe_session(sid):
+    # ponytail: each targeted evaluation attaches once; release it after use.
+    try:
+        cdp("Target.detachFromTarget", sessionId=sid)
+    except Exception as e:
+        message = str(e).lower()
+        if "no session with given id" in message or "session with given id not found" in message:
+            return
         raise
 
 

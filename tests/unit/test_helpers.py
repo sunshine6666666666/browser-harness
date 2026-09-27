@@ -609,3 +609,51 @@ def test_new_tab_creates_and_attaches_in_background(monkeypatch):
     assert helpers.new_tab() == "target-new"
     assert ("Target.createTarget", {"url": "about:blank", "background": True}) in calls
     assert not any(method == "Target.activateTarget" for method, _ in calls)
+
+
+def test_targeted_js_releases_only_its_iframe_session(monkeypatch):
+    calls = []
+
+    def fake_cdp(method, **kwargs):
+        calls.append((method, kwargs))
+        if method == "Target.attachToTarget":
+            return {"sessionId": "iframe-session"}
+        if method == "Runtime.evaluate":
+            return {"result": {"type": "number", "value": 7}}
+        return {}
+
+    monkeypatch.setattr(helpers, "cdp", fake_cdp)
+    assert helpers.js("7", target_id="iframe-target") == 7
+    assert [method for method, _ in calls] == [
+        "Target.attachToTarget", "Runtime.evaluate", "Target.detachFromTarget"]
+    assert calls[-1][1] == {"sessionId": "iframe-session"}
+
+    calls.clear()
+    assert helpers.js("7") == 7
+    assert [method for method, _ in calls] == ["Runtime.evaluate"]
+
+
+def test_targeted_js_preserves_evaluation_error_when_detach_fails(monkeypatch):
+    def fake_cdp(method, **kwargs):
+        if method == "Target.attachToTarget":
+            return {"sessionId": "iframe-session"}
+        if method == "Runtime.evaluate":
+            raise RuntimeError("evaluation failed")
+        raise RuntimeError("session broker unreachable")
+
+    monkeypatch.setattr(helpers, "cdp", fake_cdp)
+    with pytest.raises(RuntimeError, match="evaluation failed"):
+        helpers.js("7", target_id="iframe-target")
+
+
+def test_targeted_js_surfaces_unexpected_detach_failure(monkeypatch):
+    def fake_cdp(method, **kwargs):
+        if method == "Target.attachToTarget":
+            return {"sessionId": "iframe-session"}
+        if method == "Runtime.evaluate":
+            return {"result": {"type": "number", "value": 7}}
+        raise RuntimeError("session broker unreachable")
+
+    monkeypatch.setattr(helpers, "cdp", fake_cdp)
+    with pytest.raises(RuntimeError, match="session broker unreachable"):
+        helpers.js("7", target_id="iframe-target")
