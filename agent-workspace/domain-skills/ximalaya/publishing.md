@@ -43,10 +43,10 @@ cross-origin iframe; opening the iframe URL directly is the supported path.
 | `account_identity()` | Read-only identity from `/anchor-works-web/common/getCurrentUser` → `{"uid", "name", "logged_in"}`; raises `auth_required` when logged out. |
 | `require_identity(expected_uid=None, expected_name=None)` | Login gate for compatibility with older callers. Optional account arguments are ignored; logged-out sessions raise `auth_required`. |
 | `publishing_constraints()` | Copy of verified constraints (see table below). |
-| `list_albums()` | Stable album IDs/titles from `/reform-upload/album/choose`; read-only. |
+| `list_albums()` | Complete paginated album IDs/titles from `/reform-upload/album/choose`; read-only and fails if pagination is incomplete. |
 | `list_album_tracks(album_id, expected_uid=None, expected_name=None, limit=None)` | Read-only newest-first track list with exact album/track guards and episode metadata. Optional account arguments are compatibility-only. |
 | `download_owned_track_once(track, output_dir, expected_uid=None, expected_name=None)` | Requires login, revalidates one exact track, downloads the best directly playable CDN resource to a `.part`, probes it, then atomically renames it. Optional account arguments are compatibility-only. |
-| `archive_matches(title)` | Exact normalized-title matches across the scheduled list and every album's complete track list; fails closed if any album cannot be read. |
+| `archive_matches(title)` | Exact normalized-title matches across every scheduled page and every album's complete track list; fails closed if any page cannot be read. |
 | `prepare_upload(audio_file, title, expected_uid=None, expected_name=None, timeout=900, existing_content_ids=())` | Exact-upload-page + login + local-file gates, one upload, waits for row status `上传成功`. Existing exact-title records remain blocked by default; a caller that intentionally permits a repeated display title must pass the complete preflight content-ID baseline, which must still match exactly before upload. |
 | `select_album(album_id, expected_name=None, timeout=15)` | Selects one exact stable album ID; refuses ambiguous duplicate titles before the title-scoped DOM click; verifies readback on `button[aria-label="选择专辑"]`. |
 | `create_album(title, category, cover_path, intro, selling_point, tags, expected_uid=None, expected_name=None, visibility="public", timeout=30)` | Creates one free album on the albumMgr create page (React); title ≤25 chars, level-1 category click, square cover upload + crop + model readback, KindEditor intro + sync, selling point, full required tag chain, AI-cover 否, agreement check, per-field validation, ONE submit click; verifies via `list_albums` ID diff. Creation success counts on submit; platform review is out of scope. |
@@ -58,7 +58,7 @@ cross-origin iframe; opening the iframe URL directly is the supported path.
 | `submission_snapshot()` | Read-only full form state (identity, upload rows, title, album, category, AI flag, cover, description, mode, schedule, submit state, modal, validation errors). |
 | `submission_diagnostics()` | Bounded reason enum: `form_validation_failed`, `confirmation_required`, `platform_rejected`, `auth_required`, `result_delayed`, `click_not_accepted`, `submission_unverified`. |
 | `manager_evidence(title, content_id=None, expected_schedule=None, attempts=3, album_id=None)` | Read-only API reconciliation. When `album_id` is supplied, reads that exact album directly instead of enumerating every album; requires exact title, album, and exact content ID once known. |
-| `submit_once(title, expected_uid=None, expected_name=None, expected_mode="scheduled", expected_schedule=None, run_marker="", timeout=600, expected_album_id=None, existing_content_ids=())` | Login-gated two stable snapshots, then ONE click on `确认发布`. Existing exact-title records remain blocked unless their complete preflight IDs are passed; after submission, only one baseline-external content ID in the exact target album proves this run. |
+| `submit_once(title, expected_uid=None, expected_name=None, expected_mode="scheduled", expected_schedule=None, run_marker="", timeout=600, expected_album_id=None, existing_content_ids=())` | Login-gated two stable snapshots, verifies the selected album against `expected_album_id` when supplied, then ONE click on `确认发布`. Existing exact-title records remain blocked unless their complete preflight IDs are passed; after submission, only one baseline-external content ID in the exact target album proves this run. |
 | `prepare_successor_upload(old_track, audio_file, timeout=900)` | 保活窄路径：仅当目标专辑恰有指定旧同标题节目且旧节目明确免费、公开并可删除时，准备一次同标题上传；其他专辑同名只作观察，不比较账号身份字段。 |
 | `submit_successor_once(old_track, run_marker="", timeout=600)` | 保活窄路径：提交只激活一次，按目标专辑提交前后 track ID 集合差确认唯一 successor，再用 `track_evidence` 验证；未知结果 `retry=false`。 |
 | `delete_once(submission, expected_uid=None, expected_name=None, confirm=False, timeout=180)` | Login-gated deletion of only the verified record created by this module (`created_by="ximalaya_domain_skill"`, `submit_clicks=1`, run marker in exact title, live record with exact content ID). |
@@ -146,7 +146,8 @@ same-title record in the target album. `isOwn`, UID and account names are not
 compared. Other albums may contain the same title; they are observations only.
 The local audio is validated before the upload page is touched.
 
-`submit_successor_once()` keeps the immediate publish form stable and clicks
+`submit_successor_once()` keeps the immediate publish form stable, verifies the
+selected album's unique title against the old stable album ID, and clicks
 `确认发布` at most once. It compares the complete target-album ID set before
 and after the click; `manager_evidence(title)` or the first same-title row is
 never used as the new ID. A non-unique set difference or uncertain response
@@ -159,6 +160,31 @@ complete local backup of the old audio. After activation it only reads the
 target album lists: success requires the old ID absent and the new ID still
 unique. Timeout or any uncertainty returns `deletion_unverified` with
 `retry=false`; never delete the new ID or issue a second POST.
+
+### Delete one truly empty album (verified 2026-09-23)
+
+Studio's `空专辑` banner and `0集` mean **no approved sounds**, not necessarily
+no sounds. Before deleting, require one exact album ID/title in `list_albums()`,
+`statInfo.trackCount == 0` in `/reform-upload/album/choose`, an empty complete
+`_album_tracks(album_id)` result, no matching album ID in the complete scheduled
+list, and `在架(0)` / `下架(0)` on the exact album's sound manager page. Stop if
+any source disagrees or cannot be read.
+
+The album cards live at `https://studio.ximalaya.com/gatekeeper/anchor-opus/opus`
+(direct URL for the Studio iframe). Search by exact title through
+`input[aria-label="输入专辑名称"]` and `.ant-input-search-button`. Live testing found
+that `fill_input()` left this React input empty; use the native
+`HTMLInputElement.value` setter followed by bubbling `input` and `change`
+events, then check the value before searching. Require exactly one visible
+`section[class*=AlbumItem_listItem]` with the exact title, `0集`, and the exact
+`albumId` in its own metadata. In that card, open the small `aria-label=""`
+more control, choose the visible `删除` item in `.ant-popover-inner-content`,
+then require `.xmDeleteModal` to say `删除专辑` and `确定要删除该专辑吗？`.
+Activate its single `[role=button][aria-label="删除"]` at most once. The old
+card may remain on screen immediately afterward; verify success by reading
+`list_albums()` again and requiring the exact ID to be absent. If the result
+is unknown, reconcile read-only and never click deletion again. This is a
+single-album Markdown recipe; bulk cleanup stays with the calling Agent.
 
 ### Published-track description and cover edits
 
@@ -266,7 +292,6 @@ submission = submit_once(title, expected_mode="scheduled",
                          expected_schedule=schedule, run_marker=run_marker,
                          expected_album_id=album_id,
                          existing_content_ids=existing_content_ids)
-delete_once(submission, confirm=True)
 ```
 
 Immediate mode: same flow with `set_publish_mode("immediate")`, no schedule,

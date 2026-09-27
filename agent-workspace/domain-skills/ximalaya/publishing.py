@@ -350,13 +350,43 @@ def publishing_constraints() -> dict[str, Any]:
     }
 
 
-def list_albums(page_size: int = 50) -> list[dict[str, Any]]:
-    albums: list[dict[str, Any]] = []
+def _paged_infos(url: str, context: str, page_size: int = 50) -> list[dict[str, Any]]:
+    if page_size < 1:
+        raise ValueError("ximalaya page_size must be positive")
+    items: list[dict[str, Any]] = []
+    expected_total: int | None = None
+    has_total: bool | None = None
+    separator = "&" if "?" in url else "?"
     for page in range(1, TRACK_EVIDENCE_MAX_PAGES + 1):
-        data = _api_get("%s?page=%s&pageSize=%s" %
-                        (ALBUMS_API, page, page_size), "album list")
-        infos = data.get("infos") or []
-        albums.extend({
+        data = _api_get("%s%spage=%s&pageSize=%s" %
+                        (url, separator, page, page_size), context)
+        infos = data.get("infos")
+        total = data.get("totalSize")
+        if not isinstance(infos, list):
+            raise RuntimeError("ximalaya %s returned invalid pagination" % context)
+        if has_total is None:
+            has_total = total is not None
+        elif has_total != (total is not None):
+            raise RuntimeError("ximalaya %s pagination changed" % context)
+        if has_total:
+            total = int(total)
+            if expected_total is None:
+                expected_total = total
+            if total != expected_total or len(items) + len(infos) > total:
+                raise RuntimeError("ximalaya %s pagination changed or duplicated" % context)
+        items.extend(infos)
+        if has_total and len(items) == total:
+            return items
+        if len(infos) < page_size:
+            if has_total:
+                raise RuntimeError("ximalaya %s pagination incomplete" % context)
+            return items
+    # ponytail: a bounded scan must fail closed instead of claiming a partial archive is complete.
+    raise RuntimeError("ximalaya %s exceeded %s pages" % (context, TRACK_EVIDENCE_MAX_PAGES))
+
+
+def list_albums(page_size: int = 50) -> list[dict[str, Any]]:
+    return [{
             "album_id": str(item["albumId"]),
             "title": item.get("title") or "",
             "custom_title": item.get("customTitle") or "",
@@ -364,26 +394,16 @@ def list_albums(page_size: int = 50) -> list[dict[str, Any]]:
             "price_type_id": item.get("priceTypeId"),
             "can_add_audio": item.get("priceTypeId") in (0, None)
                              and item.get("uploadSource") in (0, None),
-        } for item in infos)
-        total = int(data.get("totalSize") or 0)
-        if (not infos or (total and page * page_size >= total)
-                or (not total and len(infos) < page_size)):
-            break
-    return albums
+        } for item in _paged_infos(ALBUMS_API, "album list", page_size)]
 
 
 def _album_tracks(album_id: str, page_size: int = 50) -> list[dict[str, Any]]:
-    tracks: list[dict[str, Any]] = []
-    for page in range(1, TRACK_EVIDENCE_MAX_PAGES + 1):
-        data = _api_get("%s?albumId=%s&page=%s&pageSize=%s&order=DESC&state=1" %
-                        (TRACKS_LIST_API, album_id, page, page_size), "album tracks")
-        infos = data.get("infos") or []
-        tracks.extend(infos)
-        total = int(data.get("totalSize") or 0)
-        if (not infos or (total and page * page_size >= total)
-                or (not total and len(infos) < page_size)):
-            break
-    return tracks
+    return _paged_infos("%s?albumId=%s&order=DESC&state=1" %
+                        (TRACKS_LIST_API, album_id), "album tracks", page_size)
+
+
+def _scheduled_records() -> list[dict[str, Any]]:
+    return _paged_infos(SCHEDULED_LIST_API, "scheduled list")
 
 
 def list_album_tracks(album_id: str, expected_uid: int | None = None,
@@ -462,8 +482,7 @@ def _normalize_schedule_time(value: Any) -> str:
 def archive_matches(title: str) -> list[dict[str, Any]]:
     wanted = _normalized_text(title)
     matches: list[dict[str, Any]] = []
-    scheduled = _api_get(SCHEDULED_LIST_API + "?page=1&pageSize=50", "scheduled list")
-    for item in scheduled.get("infos") or []:
+    for item in _scheduled_records():
         if _normalized_text(str(item.get("title") or item.get("trackTitle") or "")) == wanted:
             matches.append({
                 "content_id": str(item.get("trackId") or item.get("taskId") or item.get("id") or ""),
@@ -725,6 +744,13 @@ def select_album(album_id: str, expected_name: str | None = None,
         js(JS_ALBUM_READBACK) or ""), timeout,
         "ximalaya album readback never matched %r" % wanted_title)
     return {"album_id": str(album_id), "album_title": readback, "readback": True}
+
+
+def _selected_album_is(album_id: str, title: str) -> bool:
+    albums = list_albums()
+    matches = [album for album in albums if album["album_id"] == album_id]
+    return (len(matches) == 1 and matches[0]["title"] == title and
+            sum(album["title"] == title for album in albums) == 1)
 
 def create_album(title: str, category: str, cover_path: str, intro: str,
                  selling_point: str, tags: list[str],
@@ -2035,6 +2061,8 @@ def submit_successor_once(old_track: dict[str, Any], run_marker: str = "",
         problems.append("title_readback")
     if not second.get("upload_ready") or not second.get("album"):
         problems.append("upload_or_album_missing")
+    elif not _selected_album_is(album_id, second["album"]):
+        problems.append("album_target_mismatch")
     if second.get("scheduled"):
         problems.append("mode_not_immediate")
     submit = second.get("submit") or {}
@@ -2160,8 +2188,7 @@ def manager_evidence(title: str, content_id: str | None = None,
     immediate_state = ""
     for load in range(1, attempts + 1):
         matches = []
-        scheduled = _api_get(SCHEDULED_LIST_API + "?page=1&pageSize=50", "scheduled list")
-        for item in scheduled.get("infos") or []:
+        for item in _scheduled_records():
             record = _match_record(item, title, content_id, "scheduled")
             if record and (not wanted_album_id or record["album_id"] == wanted_album_id):
                 matches.append(record)
@@ -2242,6 +2269,9 @@ def submit_once(title: str, expected_uid: int | None = None,
         problems.append("upload_not_complete")
     if not snapshot["album"]:
         problems.append("album_missing")
+    elif expected_album_id and not _selected_album_is(
+            _decimal_id(expected_album_id, "expected_album_id"), snapshot["album"]):
+        problems.append("album_target_mismatch")
     if expected_mode == "scheduled" and not snapshot["scheduled"]:
         problems.append("mode_not_scheduled")
     if expected_mode == "immediate" and snapshot["scheduled"]:

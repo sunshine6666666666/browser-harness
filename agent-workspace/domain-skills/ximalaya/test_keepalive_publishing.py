@@ -23,7 +23,10 @@ def evidence(track_id, album_id="88294964", title="保活标题"):
 
 
 def load():
-    return base.load_publishing()
+    namespace, page = base.load_publishing()
+    page.albums[0]["title"] = "测试专辑"
+    page.album_readback = "测试专辑"
+    return namespace, page
 
 
 def test_successor_preflight_ignores_other_album_same_title(tmp_path):

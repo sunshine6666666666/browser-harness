@@ -589,6 +589,38 @@ def test_archive_matches_fails_closed_when_an_album_cannot_be_read():
         namespace["archive_matches"]("标题")
 
 
+def test_archive_matches_reads_later_scheduled_pages_and_rejects_partial_lists():
+    namespace, _ = load_publishing()
+    original_get = namespace["_api_get"]
+    pages = []
+
+    def api_get(url, context):
+        if context != "scheduled list":
+            return original_get(url, context)
+        page = int(re.search(r"[?&]page=(\d+)", url).group(1))
+        pages.append(page)
+        infos = ([{"trackId": i, "title": "其他"} for i in range(1, 51)]
+                 if page == 1 else [{"trackId": 51, "title": "目标"}])
+        return {"totalSize": 51, "infos": infos}
+
+    namespace["_api_get"] = api_get
+    assert [item["content_id"] for item in namespace["archive_matches"]("目标")] == ["51"]
+    assert pages == [1, 2]
+
+    namespace["_api_get"] = lambda url, context: (
+        {"totalSize": 51, "infos": []} if context == "scheduled list"
+        else original_get(url, context))
+    with pytest.raises(RuntimeError, match="pagination incomplete"):
+        namespace["archive_matches"]("目标")
+
+    namespace["_api_get"] = lambda url, context: (
+        {"totalSize": 51 if "page=1" in url else 52,
+         "infos": [{"trackId": i} for i in range(50 if "page=1" in url else 1)]}
+        if context == "scheduled list" else original_get(url, context))
+    with pytest.raises(RuntimeError, match="pagination changed"):
+        namespace["archive_matches"]("目标")
+
+
 # ---------------------------------------------------------------- album / cover
 
 def test_select_album_requires_exact_stable_id_and_readback():
@@ -880,6 +912,16 @@ def test_submit_once_accepts_exact_target_album_record_before_status_text():
     assert result["content_id"] == "42"
     assert result["album_id"] == "88294964"
     assert result["submit_clicks"] == 1
+
+
+def test_submit_once_rejects_wrong_album_before_click():
+    namespace, page = load_publishing()
+    _configure_submit(namespace, page, mode="immediate")
+    with pytest.raises(RuntimeError, match="album_target_mismatch"):
+        namespace["submit_once"](
+            "标题", TEST_UID, TEST_NAME, "immediate", None, "RUN",
+            timeout=0, expected_album_id="999")
+    assert getattr(page, "submit_js_clicks", 0) == 0
 
 def test_submit_once_allows_declared_same_title_baseline_and_requires_new_id():
     namespace, page = load_publishing()
